@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
 use rune::tok::motion;
-use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, el, icon, row, text};
+use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::Placement;
 use rune_kit::{Kit, Select, SelectAppearance, TextInput};
-use workploy::model::{self, Run, RunStatus};
+use workploy::model::{self, PlatformTarget, RepoBinding, Run, RunStatus, TriggerMode};
 
-use crate::state::{AppState, ModalState, StatusFilter};
+use crate::gfx::MARK_PULSE_RADAR;
+use crate::state::{AppState, ModalState, SettingsTab, StatusFilter, platform_compat_warning};
 use crate::ui::components::{
     btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card, pill_badge,
     primary_button, run_status_icon, status_pill,
@@ -19,14 +20,15 @@ pub fn view(
     t: UiTheme,
     k: &Kit,
     wf_filter: Option<&str>,
+    main_w: f32,
     layer: &mut Vec<El>,
 ) -> El {
     let wf = wf_filter.and_then(|id| s.snapshot.workflows.iter().find(|w| w.id == id));
 
     let wf_word = if s.snapshot.workflows.len() == 1 {
-        "fluxo configurado"
+        "receita configurada"
     } else {
-        "fluxos configurados"
+        "receitas configuradas"
     };
     let run_word = if s.snapshot.runs.len() == 1 {
         "execução registrada"
@@ -36,16 +38,14 @@ pub fn view(
 
     // Header card
     let (title, subtitle) = if let Some(w) = wf {
-        let srv_info = match w.runner {
-            model::RunnerKind::Local => "Local (Esta máquina)".to_string(),
-            model::RunnerKind::Ssh => match w.server_id.as_deref() {
-                Some(sid) => s.server_label(Some(sid)),
-                None => w.runner.label().to_string(),
-            },
-        };
+        let step_word = if w.steps.len() == 1 { "passo" } else { "passos" };
         (
             w.name.clone(),
-            format!("Gatilho: {}  ·  Servidor: {}", w.trigger.label(), srv_info),
+            format!(
+                "Gatilho: {}  ·  Receita reutilizável ({} {step_word})",
+                w.trigger.label(),
+                w.steps.len()
+            ),
         )
     } else {
         (
@@ -75,7 +75,7 @@ pub fn view(
                     34.0,
                     move |s: &mut AppState, tx| s.start_workflow(&wid_run, "manual", tx),
                 )
-                .help("Dispara imediatamente uma execução manual deste fluxo de trabalho."),
+                .help("Dispara imediatamente uma execução manual desta receita de fluxo."),
             )
             .child(
                 btn_neutral(
@@ -86,7 +86,7 @@ pub fn view(
                     34.0,
                     move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
                 )
-                .help("Abre o editor para alterar gatilho, runner, VPS de destino, repositório e passos."),
+                .help("Abre o editor para alterar nome, gatilho, pasta de trabalho, encadeamento e passos."),
             )
             .child(
                 btn_neutral(
@@ -477,12 +477,20 @@ pub fn view(
 
     if let Some(w) = wf {
         page = page.child(workflow_pipeline_summary(s, t, w));
-        if let Some(warn) = local_vps_warning(s, t, w) {
-            page = page.child(warn);
-        }
+        return page.child(filter_bar).child(
+            col()
+                .key("runs-scroll")
+                .grow(1.0)
+                .min_h(0.0)
+                .w_full()
+                .scroll(ScrollSpec { stick_bottom: false })
+                .scroll_edge_fade(16.0)
+                .pb(16.0)
+                .child(list_body),
+        );
     }
 
-    page.child(filter_bar).child(
+    page.child(
         col()
             .key("runs-scroll")
             .grow(1.0)
@@ -490,8 +498,506 @@ pub fn view(
             .w_full()
             .scroll(ScrollSpec { stick_bottom: false })
             .scroll_edge_fade(16.0)
+            .gap(16.0)
             .pb(16.0)
-            .child(list_body),
+            .child(projects_section(s, t, main_w))
+            .child(
+                col()
+                    .key("runs-history-section")
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(10.0)
+                    .child(
+                        text("Histórico de execuções")
+                            .font(ty::SMALL_MED)
+                            .color(t.text_secondary),
+                    )
+                    .child(filter_bar)
+                    .child(list_body),
+            ),
+    )
+}
+
+fn projects_section(s: &AppState, t: UiTheme, main_w: f32) -> El {
+    let active_bindings: Vec<&RepoBinding> = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .filter(|b| b.enabled)
+        .collect();
+
+    let count_label = if active_bindings.is_empty() {
+        "Nenhum ativo".to_string()
+    } else if active_bindings.len() == 1 {
+        "1 ativo".to_string()
+    } else {
+        format!("{} ativos", active_bindings.len())
+    };
+
+    let hdr = row()
+        .w_full()
+        .min_w(0.0)
+        .justify_between()
+        .center_y()
+        .flex_wrap()
+        .gap(8.0)
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(
+                    text("Projetos & Repositórios configurados")
+                        .font(ty::H3)
+                        .color(t.text_primary),
+                )
+                .child(pill_badge(
+                    t,
+                    &count_label,
+                    if active_bindings.is_empty() {
+                        t.text_muted
+                    } else {
+                        t.accent
+                    },
+                    if active_bindings.is_empty() {
+                        t.surface_2
+                    } else {
+                        t.accent_soft
+                    },
+                )),
+        )
+        .child(
+            btn_ghost(
+                t,
+                "btn-projects-manage",
+                "Gerenciar vínculos",
+                Some(&icons::SLIDERS),
+                28.0,
+                |s: &mut AppState, _| s.open_settings(SettingsTab::GitHub),
+            )
+            .help("Abre Configurações → GitHub para adicionar, pausar ou editar vínculos."),
+        );
+
+    let body = if active_bindings.is_empty() {
+        let title = if s.snapshot.settings.repo_bindings.is_empty() {
+            "Nenhum repositório vinculado ainda"
+        } else {
+            "Todos os vínculos configurados estão pausados"
+        };
+        row()
+            .key("projects-empty")
+            .w_full()
+            .min_w(0.0)
+            .px(16.0)
+            .py(14.0)
+            .gap(12.0)
+            .center_y()
+            .justify_between()
+            .flex_wrap()
+            .radius(10.0)
+            .fill(t.surface_1)
+            .border(1.0, t.border_subtle)
+            .child(
+                row()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(180.0)
+                    .gap(10.0)
+                    .center_y()
+                    .child(icon(&icons::BRANCH, 16.0).color(t.text_muted).a11y_hidden())
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .gap(2.0)
+                            .child(
+                                text(title)
+                                    .font(ty::BODY_MED)
+                                    .color(t.text_primary)
+                                    .wrap(),
+                            )
+                            .child(
+                                text("Configure em Configurações → GitHub qual repositório, branch, destino (VPS ou Local) e receita executar.")
+                                    .font(ty::CAPTION)
+                                    .color(t.text_muted)
+                                    .wrap(),
+                            ),
+                    ),
+            )
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-projects-goto-github",
+                    "Configurações → GitHub",
+                    Some(&icons::BRANCH),
+                    30.0,
+                    |s: &mut AppState, _| s.open_settings(SettingsTab::GitHub),
+                )
+                .help("Ir para Configurações → GitHub e vincular seu primeiro repositório."),
+            )
+    } else if main_w < 760.0 {
+        let mut list = col().key("projects-grid").w_full().min_w(0.0).gap(10.0);
+        for b in active_bindings {
+            list = list.child(project_card(s, t, b, main_w));
+        }
+        list
+    } else {
+        let mut grid = col().key("projects-grid").w_full().min_w(0.0).gap(10.0);
+        for pair in active_bindings.chunks(2) {
+            let mut r = row().w_full().min_w(0.0).gap(10.0).items_stretch();
+            r = r.child(project_card(s, t, pair[0], main_w).grow(1.0).shrink().min_w(0.0));
+            if let Some(second) = pair.get(1) {
+                r = r.child(project_card(s, t, second, main_w).grow(1.0).shrink().min_w(0.0));
+            } else {
+                r = r.child(el().grow(1.0).shrink().min_w(0.0));
+            }
+            grid = grid.child(r);
+        }
+        grid
+    };
+
+    col()
+        .key("projects-section")
+        .w_full()
+        .min_w(0.0)
+        .gap(10.0)
+        .child(hdr)
+        .child(body)
+}
+
+fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
+    let repo_trim = b.full_name.trim();
+    let repo_matches = |r: &Run| -> bool {
+        r.repo_name
+            .as_deref()
+            .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
+            || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+    };
+
+    let running_run = s
+        .snapshot
+        .runs
+        .iter()
+        .find(|r| repo_matches(r) && matches!(r.status, RunStatus::Queued | RunStatus::Running));
+    let approval_run = if running_run.is_none() {
+        s.snapshot
+            .runs
+            .iter()
+            .find(|r| repo_matches(r) && r.status == RunStatus::AwaitingApproval)
+    } else {
+        None
+    };
+    let last_finished = s
+        .snapshot
+        .runs
+        .iter()
+        .find(|r| repo_matches(r) && !r.status.active());
+
+    let border_col = if running_run.is_some() {
+        t.info.alpha(0.42)
+    } else if approval_run.is_some() {
+        t.warning.alpha(0.45)
+    } else {
+        t.border_subtle
+    };
+
+    let status_badge = if running_run.is_some() {
+        let pulse_dot = el()
+            .size(8.0, 8.0)
+            .center()
+            .child(
+                effect(MARK_PULSE_RADAR)
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .radius(4.0)
+                    .effect_bleed(7.0)
+                    .effect_data([4.0, 7.0, 1.8, 0.7]),
+            )
+            .child(el().size(7.0, 7.0).radius(3.5).fill(t.info));
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(6.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.info_bg)
+            .border(1.0, t.info.alpha(0.32))
+            .child(pulse_dot)
+            .child(text("Rodando").font(ty::CAPTION).color(t.info))
+    } else if approval_run.is_some() {
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(5.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.warning_bg)
+            .border(1.0, t.warning.alpha(0.38))
+            .child(icon(&icons::BOLT, 11.5).color(t.warning))
+            .child(
+                text("Aguardando aprovação")
+                    .font(ty::CAPTION)
+                    .color(t.warning),
+            )
+    } else {
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(6.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.success_bg)
+            .border(1.0, t.success.alpha(0.28))
+            .child(el().size(6.0, 6.0).radius(3.0).fill(t.success))
+            .child(
+                text("Em standby · aguardando push")
+                    .font(ty::CAPTION)
+                    .color(t.success),
+            )
+    };
+
+    let target_label = match b.target_server_id.as_deref() {
+        None => "Local".to_string(),
+        Some(sid) => s
+            .snapshot
+            .settings
+            .servers
+            .iter()
+            .find(|v| v.id == sid)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| "VPS removida".into()),
+    };
+    let mode_label = match b.trigger_mode {
+        TriggerMode::WebhookOnVps => "Webhook 24/7",
+        TriggerMode::PollOnVps => "Sondagem 24/7",
+        TriggerMode::PollOnDesktop => "Desktop",
+    };
+    let recipe_label = b
+        .workflow_id
+        .as_deref()
+        .and_then(|wid| s.snapshot.workflows.iter().find(|w| w.id == wid))
+        .map(|w| w.name.as_str())
+        .unwrap_or("Automático");
+
+    let branch_label = if b.branch.trim().is_empty() {
+        "main"
+    } else {
+        b.branch.trim()
+    };
+
+    let footer_left = if let Some(active) = running_run.or(approval_run) {
+        text(format!("#{} · {}", active.number, active.workflow_name))
+            .font(ty::CAPTION)
+            .color(t.text_secondary)
+            .truncate()
+    } else if let Some(last) = last_finished {
+        let (lbl, col) = match last.status {
+            RunStatus::Success => ("Última: Sucesso", t.success),
+            RunStatus::Failed => ("Última: Falhou", t.danger),
+            RunStatus::Cancelled => ("Última: Cancelada", t.text_muted),
+            _ => ("Última: Concluída", t.text_secondary),
+        };
+        let age = last
+            .started_ts
+            .map(model::stamp_age)
+            .unwrap_or_default();
+        let mut r = row().gap(6.0).center_y().flex_wrap().child(
+            text(lbl).font(ty::CAPTION).color(col),
+        );
+        if !age.is_empty() {
+            r = r.child(text(format!("· {age}")).font(ty::CAPTION).color(t.text_muted));
+        }
+        r
+    } else {
+        let hint = if b.last_sha.is_empty() {
+            "Aguardando primeiro push".to_string()
+        } else {
+            let short = &b.last_sha[..7.min(b.last_sha.len())];
+            format!("Commit atual: {short}")
+        };
+        text(hint).font(ty::CAPTION).color(t.text_muted).truncate()
+    };
+
+    let bid_run = b.id.clone();
+    let bid_cfg = b.id.clone();
+    let bid_commits = b.id.clone();
+
+    let mut badges_row = row()
+        .w_full()
+        .min_w(0.0)
+        .gap(6.0)
+        .center_y()
+        .flex_wrap()
+        .child(pill_badge(
+            t,
+            &format!("Destino: {target_label}"),
+            t.accent,
+            t.accent_soft,
+        ))
+        .child(pill_badge(
+            t,
+            &format!("Modo: {mode_label}"),
+            t.text_secondary,
+            t.surface_2,
+        ))
+        .child(pill_badge(
+            t,
+            &format!("Receita: {recipe_label}"),
+            t.text_secondary,
+            t.surface_2,
+        ));
+    if b.platform != PlatformTarget::CrossPlatform {
+        badges_row = badges_row.child(
+            pill_badge(t, b.platform.label(), t.text_secondary, t.surface_2)
+                .key(format!("project-platform-{}", b.id)),
+        );
+    }
+
+    let mut card = col()
+        .key(format!("project-card-{}", b.id))
+        .w_full()
+        .min_w(0.0)
+        .padding(14.0)
+        .gap(10.0)
+        .radius(10.0)
+        .fill(t.surface_1)
+        .border(1.0, border_col)
+        .child(
+            row()
+                .w_full()
+                .min_w(0.0)
+                .justify_between()
+                .center_y()
+                .flex_wrap()
+                .gap(8.0)
+                .child(
+                    row()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(140.0)
+                        .gap(7.0)
+                        .center_y()
+                        .child(icon(&icons::BRANCH, 14.0).color(t.accent).a11y_hidden())
+                        .child(
+                            text(b.full_name.clone())
+                                .font(ty::BODY_MED)
+                                .color(t.text_primary)
+                                .shrink()
+                                .min_w(0.0)
+                                .truncate(),
+                        )
+                        .child(
+                            row()
+                                .h(20.0)
+                                .px(6.0)
+                                .center_y()
+                                .radius(5.0)
+                                .fill(t.surface_2)
+                                .child(
+                                    text(branch_label.to_string())
+                                        .font(ty::MONO_SM)
+                                        .color(t.text_secondary),
+                                ),
+                        ),
+                )
+                .child(status_badge),
+        )
+        .child(badges_row);
+
+    if let Some(warn_msg) = platform_compat_warning(b.platform, b.target_server_id.as_deref()) {
+        card = card.child(
+            row()
+                .key(format!("project-platform-warn-{}", b.id))
+                .w_full()
+                .min_w(0.0)
+                .px(10.0)
+                .py(7.0)
+                .gap(7.0)
+                .center_y()
+                .radius(7.0)
+                .fill(t.warning_bg)
+                .border(1.0, t.warning.alpha(0.38))
+                .child(icon(&icons::BOLT, 13.0).color(t.warning).a11y_hidden())
+                .child(
+                    text(warn_msg)
+                        .font(ty::CAPTION)
+                        .color(t.warning)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .wrap(),
+                ),
+        );
+    }
+
+    let mut actions_row = row()
+        .min_w(0.0)
+        .shrink()
+        .gap(6.0)
+        .center_y()
+        .flex_wrap()
+        .child(
+            btn_ghost(
+                t,
+                format!("cfg-binding-{}", b.id),
+                "Configurar",
+                Some(&icons::SLIDERS),
+                28.0,
+                move |s: &mut AppState, _| s.open_edit_binding_modal(&bid_cfg),
+            )
+            .help("Abre as configurações deste vínculo (branch, destino, modo e receita)."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("commits-binding-{}", b.id),
+                "Ver commits",
+                Some(&icons::COMMIT),
+                28.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.open_repo_commits_modal(&bid_commits, tx);
+                },
+            )
+            .help("Lista os últimos commits da branch e permite disparar o fluxo para um commit específico."),
+        )
+        .child(
+            primary_button(
+                t,
+                format!("run-binding-{}", b.id),
+                "Executar agora",
+                Some(&icons::PLAY),
+                28.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.run_binding_now(&bid_run, tx);
+                },
+            )
+            .help("Dispara imediatamente uma execução para este projeto usando a receita e o destino configurados."),
+        );
+    if main_w < 600.0 {
+        actions_row = actions_row.w_full();
+    }
+
+    card.child(
+        row()
+            .w_full()
+            .min_w(0.0)
+            .justify_between()
+            .center_y()
+            .flex_wrap()
+            .gap(8.0)
+            .child(
+                row()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(120.0)
+                    .center_y()
+                    .child(footer_left),
+            )
+            .child(actions_row),
     )
 }
 
@@ -650,66 +1156,6 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         .child(triggers_row)
 }
 
-fn local_vps_warning(s: &AppState, t: UiTheme, w: &model::Workflow) -> Option<El> {
-    if w.runner != model::RunnerKind::Local || w.trigger != model::Trigger::Push {
-        return None;
-    }
-    let has_vps_binding = s.snapshot.settings.repo_bindings.iter().any(|b| {
-        b.enabled
-            && b.target_server_id.is_some()
-            && (b.workflow_id.is_none() || b.workflow_id.as_deref() == Some(w.id.as_str()))
-    });
-    if !has_vps_binding {
-        return None;
-    }
-
-    let wid_edit = w.id.clone();
-    Some(
-        row()
-            .key("wf-local-vps-warning")
-            .w_full()
-            .min_w(0.0)
-            .px(14.0)
-            .py(10.0)
-            .gap(10.0)
-            .center_y()
-            .justify_between()
-            .flex_wrap()
-            .radius(10.0)
-            .fill(t.warning_bg)
-            .border(1.0, t.warning.alpha(0.38))
-            .child(
-                row()
-                    .grow(1.0)
-                    .shrink()
-                    .min_w(190.0)
-                    .gap(8.0)
-                    .center_y()
-                    .child(icon(&icons::BOLT, 14.0).color(t.warning))
-                    .child(
-                        text("Este fluxo está configurado para rodar nesta máquina (Local). Para rodar 24/7 na VPS, edite o fluxo e selecione 'VPS via SSH' + a VPS de destino.")
-                            .font(ty::SMALL)
-                            .color(t.text_primary)
-                            .grow(1.0)
-                            .shrink()
-                            .min_w(0.0)
-                            .wrap(),
-                    ),
-            )
-            .child(
-                btn_neutral(
-                    t,
-                    "btn-warn-edit-wf",
-                    "Editar fluxo",
-                    Some(&icons::EDIT),
-                    28.0,
-                    move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
-                )
-                .help("Abre o editor do fluxo para trocar o runner para 'VPS via SSH' e escolher a VPS de destino."),
-            ),
-    )
-}
-
 fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
     let rid_open = r.id.clone();
     let rid_logs = r.id.clone();
@@ -737,6 +1183,15 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
             text(r.workflow_name.clone())
                 .font(ty::CAPTION)
                 .color(t.accent),
+        );
+    }
+    if let Some(repo) = &r.repo_name
+        && !repo.trim().is_empty()
+    {
+        meta = meta.child(
+            text(repo.clone())
+                .font(ty::CAPTION)
+                .color(t.text_secondary),
         );
     }
     meta = meta.child(

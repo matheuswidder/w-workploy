@@ -205,4 +205,16 @@ mod tests {
             assert_eq!(imported.repo_id, wf.repo_id);
         }
     }
+
+    #[test]
+    fn repo_root_workploy_yml_imports_cleanly() {
+        let raw = include_str!("../../.workploy.yml");
+        let wf = import_yaml(raw, "wf-self".into()).expect(".workploy.yml deve importar");
+        assert_eq!(wf.name, "Workploy Windows CI & Release");
+        assert_eq!(wf.trigger, Trigger::Push);
+        assert_eq!(wf.runner, RunnerKind::Local);
+        assert_eq!(wf.steps.len(), 4);
+        assert!(!wf.steps[0].approval);
+        assert!(wf.steps[3].approval);
+    }
 }

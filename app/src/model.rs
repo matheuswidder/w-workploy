@@ -172,6 +172,8 @@ pub struct Run {
     #[serde(default)]
     pub actor: String,
     #[serde(default)]
+    pub repo_name: Option<String>,
+    #[serde(default)]
     pub branch: String,
     #[serde(default)]
     pub summary: String,
@@ -389,6 +391,36 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PlatformTarget {
+    #[default]
+    CrossPlatform,
+    Windows,
+    Linux,
+    MacOS,
+}
+
+impl PlatformTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlatformTarget::CrossPlatform => "Multiplataforma",
+            PlatformTarget::Windows => "Windows",
+            PlatformTarget::Linux => "Linux",
+            PlatformTarget::MacOS => "macOS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCommitItem {
+    pub sha: String,
+    pub short_sha: String,
+    pub message: String,
+    pub author: String,
+    pub date: String,
+    pub branch: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct RepoBinding {
     pub id: String,
@@ -407,6 +439,8 @@ pub struct RepoBinding {
     pub last_sha: String,
     #[serde(default)]
     pub last_status: String,
+    #[serde(default)]
+    pub platform: PlatformTarget,
 }
 
 impl Default for RepoBinding {
@@ -421,6 +455,7 @@ impl Default for RepoBinding {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         }
     }
 }
@@ -613,6 +648,18 @@ pub struct Shared {
     pub repo_workflows: Vec<DetectedWorkflow>,
     #[serde(skip)]
     pub repo_workflows_status: String,
+    #[serde(skip)]
+    pub repo_commits_loading: bool,
+    #[serde(skip)]
+    pub repo_commits_repo: String,
+    #[serde(skip)]
+    pub repo_commits_branch: String,
+    #[serde(skip)]
+    pub repo_commits: Vec<RepoCommitItem>,
+    #[serde(skip)]
+    pub repo_commits_status: String,
+    #[serde(skip)]
+    pub detected_platform: Option<(String, PlatformTarget)>,
     #[serde(skip)]
     pub wake: Option<WakeFn>,
 }
@@ -987,6 +1034,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
         cancel_requested: false,
         secs: 884.0,
         actor: actor.into(),
+        repo_name: None,
         branch: "main".into(),
         summary: String::new(),
         annotations: vec![
@@ -1034,6 +1082,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
         cancel_requested: false,
         secs: 4.0,
         actor: actor.into(),
+        repo_name: None,
         branch: "main".into(),
         summary: String::new(),
         annotations: vec![
@@ -1067,6 +1116,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
         cancel_requested: false,
         secs: 593.0,
         actor: actor.into(),
+        repo_name: None,
         branch: "main".into(),
         summary: "# Deploy VPS concluído (0915e2faa46aaee78c3f7c82ba72c87ec01c07d0)\n- Serviços atualizados: api=true | web=true | worker=true\n```\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        96G   56G   41G  59%\nTYPE            TOTAL   ACTIVE   SIZE     RECLAIMABLE\nImages          27      27       18.55GB  0B (0%)\nContainers      31      31       74.63MB  0B (0%)\nLocal Volumes   18      14       3.201GB  254kB (0%)\nBuild Cache     89      0        4.731GB  4.117GB\n```".into(),
         annotations: vec![
@@ -1126,6 +1176,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             cancel_requested: false,
             secs: [4.0, 4.0, 5.0, 4.0, 4.0, 4.0, 5.0, 4.0][i],
             actor: actor.into(),
+            repo_name: None,
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
@@ -1165,6 +1216,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             cancel_requested: false,
             secs: 862.0,
             actor: actor.into(),
+            repo_name: None,
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
@@ -1209,6 +1261,7 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             cancel_requested: false,
             secs: if i == 1 { 2.0 } else { 1.0 },
             actor: actor.into(),
+            repo_name: None,
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
@@ -1362,6 +1415,7 @@ mod duration_tests {
             enabled: true,
             last_sha: "abc1234".into(),
             last_status: "Monitorando".into(),
+            platform: PlatformTarget::CrossPlatform,
         };
         let wf = Workflow {
             id: "wf-ci".into(),

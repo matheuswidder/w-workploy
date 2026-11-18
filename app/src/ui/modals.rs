@@ -1,11 +1,12 @@
 use rune::tok::motion;
 use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::{Kit, Progress, Switch, TextArea, TextInput};
-use workploy::model::{RunnerKind, Trigger, TriggerMode};
+use workploy::model::{PlatformTarget, Trigger, TriggerMode};
 
 use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{
     AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind, WorkflowPreset,
+    platform_compat_warning,
 };
 use crate::ui::components::{btn_danger, btn_icon, btn_neutral, chip, pill_badge, primary_button};
 use crate::ui::icons;
@@ -120,111 +121,27 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     .help("Dispara automaticamente quando o vigia de pasta local detectar alterações na pasta monitorada."),
                 );
 
-            let runners = row()
-                .gap(6.0)
-                .flex_wrap()
+            let binding_hint = row()
+                .key("ed-binding-hint")
+                .w_full()
+                .min_w(0.0)
+                .px(12.0)
+                .py(9.0)
+                .gap(8.0)
+                .center_y()
+                .radius(8.0)
+                .fill(t.surface_2)
+                .border(1.0, t.border_subtle)
+                .child(icon(&icons::INFO, 14.0).color(t.accent).a11y_hidden())
                 .child(
-                    chip(
-                        t,
-                        "ed-run-local",
-                        "Esta máquina",
-                        draft.runner == RunnerKind::Local,
-                        |s: &mut AppState, _| {
-                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                                d.runner = RunnerKind::Local;
-                            }
-                        },
-                    )
-                    .help("Executa os comandos diretamente nesta máquina Windows."),
-                )
-                .child(
-                    chip(
-                        t,
-                        "ed-run-ssh",
-                        "VPS via SSH",
-                        draft.runner == RunnerKind::Ssh,
-                        |s: &mut AppState, _| {
-                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                                d.runner = RunnerKind::Ssh;
-                            }
-                        },
-                    )
-                    .help("Executa os comandos remotamente via SSH ou pelo agente workploy-runner 24/7 na VPS de destino."),
+                    text("Onde e quando este fluxo roda (qual VPS, branch e modo Webhook/Sondagem) é definido nos Vínculos em Configurações → GitHub.")
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .wrap(),
                 );
-
-            let mut server_row = row().gap(6.0).flex_wrap().child(
-                chip(
-                    t,
-                    "ed-srv-default",
-                    "Qualquer VPS",
-                    draft.server_id.is_none(),
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.server_id = None;
-                        }
-                    },
-                )
-                .help("Usa o alias SSH global ou qualquer VPS compatível configurada no vínculo do repositório."),
-            );
-            for srv in &s.snapshot.settings.servers {
-                let sid = srv.id.clone();
-                let active = draft.server_id.as_deref() == Some(srv.id.as_str());
-                let tip = format!(
-                    "Executa este fluxo especificamente na VPS '{}' ({}:{}).",
-                    srv.name, srv.host, srv.port
-                );
-                server_row = server_row.child(
-                    chip(
-                        t,
-                        format!("ed-srv-{}", srv.id),
-                        srv.name.clone(),
-                        active,
-                        move |s: &mut AppState, _| {
-                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                                d.server_id = Some(sid.clone());
-                            }
-                        },
-                    )
-                    .help(tip),
-                );
-            }
-
-            let mut repo_row = row().gap(6.0).flex_wrap().child(
-                chip(
-                    t,
-                    "ed-repo-all",
-                    "Todos",
-                    draft.repo_id.is_none(),
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.repo_id = None;
-                        }
-                    },
-                )
-                .help("Permite que qualquer vínculo de repositório compatível acione este fluxo."),
-            );
-            for b in &s.snapshot.settings.repo_bindings {
-                let bid = b.id.clone();
-                let active = draft.repo_id.as_deref() == Some(b.id.as_str());
-                let tip = format!(
-                    "Associa este fluxo ao vínculo '{}' (branch {}).",
-                    b.full_name, b.branch
-                );
-                repo_row = repo_row.child(
-                    chip(
-                        t,
-                        format!("ed-repo-{}", b.id),
-                        format!("{} ({})", b.full_name, b.branch),
-                        active,
-                        move |s: &mut AppState, _| {
-                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                                d.repo_id = Some(bid.clone());
-                            }
-                        },
-                    )
-                    .help(tip),
-                );
-            }
 
             let mut chain_row = row().gap(6.0).flex_wrap().child(
                 chip(
@@ -404,23 +321,9 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .gap(12.0)
                 .child(labeled(t, "Presets rápidos", presets_row))
                 .child(labeled(t, "Nome do fluxo", name_input))
-                .child(
-                    row()
-                        .w_full()
-                        .gap(16.0)
-                        .flex_wrap()
-                        .child(labeled(t, "Gatilho", triggers))
-                        .child(labeled(t, "Runner de execução", runners)),
-                );
-
-            if draft.runner == RunnerKind::Ssh {
-                form = form
-                    .child(labeled(t, "VPS de destino", server_row))
-                    .child(labeled(t, "Repositório vinculado (opcional)", repo_row));
-            }
-
-            form = form
-                .child(labeled(t, "Pasta de trabalho", workdir_input))
+                .child(labeled(t, "Gatilho", triggers))
+                .child(binding_hint)
+                .child(labeled(t, "Pasta de trabalho (opcional)", workdir_input))
                 .child(labeled(t, "Encadear ao concluir com sucesso", chain_row))
                 .child(
                     row()
@@ -1161,6 +1064,68 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 );
             }
 
+            let platform_chips = row()
+                .w_full()
+                .min_w(0.0)
+                .gap(6.0)
+                .flex_wrap()
+                .child(
+                    chip(
+                        t,
+                        "bind-plat-auto",
+                        "Multi / Auto",
+                        draft.platform == PlatformTarget::CrossPlatform,
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.platform = PlatformTarget::CrossPlatform;
+                            }
+                        },
+                    )
+                    .help("Projeto multiplataforma (Node/Web/Python/etc.) que pode rodar tanto no Windows Local quanto em VPS Linux."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "bind-plat-windows",
+                        "Windows",
+                        draft.platform == PlatformTarget::Windows,
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.platform = PlatformTarget::Windows;
+                            }
+                        },
+                    )
+                    .help("Repositório que exige toolchain Windows (.exe, MSI, PowerShell, Win32)."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "bind-plat-linux",
+                        "Linux",
+                        draft.platform == PlatformTarget::Linux,
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.platform = PlatformTarget::Linux;
+                            }
+                        },
+                    )
+                    .help("Repositório que exige ambiente Linux (Docker, Compose, systemd ou shell Unix)."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "bind-plat-macos",
+                        "macOS",
+                        draft.platform == PlatformTarget::MacOS,
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.platform = PlatformTarget::MacOS;
+                            }
+                        },
+                    )
+                    .help("Repositório Apple/Xcode que exige runner macOS."),
+                );
+
             let mode_chips = row()
                 .gap(6.0)
                 .flex_wrap()
@@ -1349,10 +1314,20 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
 
             let mut form = col()
                 .w_full()
+                .min_w(0.0)
                 .gap(12.0)
                 .child(labeled(t, "Repositório GitHub (dono/nome)", repo_in))
                 .child(labeled(t, "Branch monitorada", branch_section))
                 .child(labeled(t, "Servidor de destino", target_chips))
+                .child(labeled(t, "Plataforma exigida", platform_chips));
+
+            if let Some(warn) =
+                platform_compat_warning(draft.platform, draft.target_server_id.as_deref())
+            {
+                form = form.child(warning_banner(t, warn).key("bind-platform-warning"));
+            }
+
+            form = form
                 .child(labeled(t, "Modo de disparo", mode_chips))
                 .child(labeled(t, "Fluxo disparado", wf_section))
                 .child(
@@ -1394,6 +1369,278 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 ));
 
             mount_shell_dialog(t, "binding", title, 640.0, form, footer, layer);
+        }
+        ModalState::RepoCommits {
+            binding_id,
+            full_name,
+            branch_input,
+        } => {
+            let commits_loading = s.snapshot.repo_commits_loading;
+            let branch_in = TextInput::new(branch_input)
+                .label("Branch")
+                .placeholder("main")
+                .width(Some(220.0))
+                .on_edit(|s: &mut AppState| match &mut s.modal {
+                    ModalState::RepoCommits { branch_input, .. } => branch_input,
+                    _ => unreachable!(),
+                })
+                .build(k)
+                .key("commits-branch-input")
+                .cursor(Cursor::Text);
+
+            let top_controls = row()
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(branch_in)
+                .child(
+                    btn_neutral(
+                        t,
+                        "commits-fetch-btn",
+                        if commits_loading {
+                            "Buscando..."
+                        } else {
+                            "Buscar commits"
+                        },
+                        Some(&icons::REFRESH),
+                        32.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            if !commits_loading {
+                                s.fetch_repo_commits_for_modal(tx);
+                            }
+                        },
+                    )
+                    .disabled(commits_loading)
+                    .help("Consulta os últimos commits da branch informada no GitHub."),
+                );
+
+            let mut body = col()
+                .w_full()
+                .min_w(0.0)
+                .gap(10.0)
+                .child(
+                    text("Escolha um commit abaixo para executar imediatamente o fluxo deste projeto na versão exata selecionada.")
+                        .font(ty::SMALL)
+                        .color(t.text_muted)
+                        .wrap(),
+                )
+                .child(top_controls);
+
+            if commits_loading {
+                body = body.child(
+                    col()
+                        .key("commits-loading")
+                        .w_full()
+                        .min_w(0.0)
+                        .gap(6.0)
+                        .child(
+                            text(if s.snapshot.repo_commits_status.is_empty() {
+                                "Buscando commits no GitHub...".to_string()
+                            } else {
+                                s.snapshot.repo_commits_status.clone()
+                            })
+                            .font(ty::CAPTION)
+                            .color(t.info)
+                            .wrap(),
+                        )
+                        .child(Progress::new(None).build(k)),
+                );
+            } else if !s.snapshot.repo_commits_status.trim().is_empty() {
+                let st_lower = s.snapshot.repo_commits_status.to_lowercase();
+                let st_err = st_lower.contains("erro")
+                    || st_lower.contains("falha")
+                    || st_lower.contains("não encontrado")
+                    || st_lower.contains("inválido")
+                    || st_lower.contains("expirado");
+                body = body.child(
+                    text(s.snapshot.repo_commits_status.clone())
+                        .key("commits-status-line")
+                        .font(ty::CAPTION)
+                        .color(if st_err { t.danger } else { t.text_muted })
+                        .wrap(),
+                );
+            }
+
+            let list_content = if s.snapshot.repo_commits.is_empty() {
+                row()
+                    .key("commits-empty")
+                    .w_full()
+                    .min_w(0.0)
+                    .px(14.0)
+                    .py(18.0)
+                    .center()
+                    .radius(8.0)
+                    .fill(t.surface_2)
+                    .border(1.0, t.border_subtle)
+                    .child(
+                        text(if commits_loading {
+                            "Carregando histórico de commits..."
+                        } else {
+                            "Nenhum commit encontrado para esta branch."
+                        })
+                        .font(ty::SMALL)
+                        .color(t.text_muted)
+                        .wrap(),
+                    )
+            } else {
+                let mut rows_col = col().w_full().min_w(0.0).gap(8.0);
+                for (idx, c) in s.snapshot.repo_commits.iter().enumerate() {
+                    let already_ran = s
+                        .snapshot
+                        .runs
+                        .iter()
+                        .any(|r| r.commit.as_deref() == Some(c.sha.as_str()));
+                    let status_badge = if already_ran {
+                        pill_badge(t, "Já rodou", t.success, t.success_bg)
+                    } else {
+                        pill_badge(t, "Pendente", t.text_muted, t.surface_3)
+                    };
+                    let bid_run = binding_id.clone();
+                    let sha_run = c.sha.clone();
+                    let msg_run = c.message.clone();
+                    let br_run = if c.branch.trim().is_empty() {
+                        branch_input.text.trim().to_string()
+                    } else {
+                        c.branch.clone()
+                    };
+                    let date_label = fmt_commit_date(&c.date);
+
+                    let br_help = br_run.clone();
+                    rows_col = rows_col.child(
+                        row()
+                            .key(format!("commit-row-{idx}"))
+                            .w_full()
+                            .min_w(0.0)
+                            .px(12.0)
+                            .py(10.0)
+                            .gap(10.0)
+                            .center_y()
+                            .justify_between()
+                            .flex_wrap()
+                            .radius(8.0)
+                            .fill(t.surface_2)
+                            .border(
+                                1.0,
+                                if already_ran {
+                                    t.success.alpha(0.32)
+                                } else {
+                                    t.border_subtle
+                                },
+                            )
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .shrink()
+                                    .min_w(160.0)
+                                    .gap(4.0)
+                                    .child(
+                                        row()
+                                            .w_full()
+                                            .min_w(0.0)
+                                            .gap(6.0)
+                                            .center_y()
+                                            .flex_wrap()
+                                            .child(
+                                                row()
+                                                    .h(20.0)
+                                                    .px(6.0)
+                                                    .gap(4.0)
+                                                    .center_y()
+                                                    .radius(5.0)
+                                                    .fill(t.surface_3)
+                                                    .child(
+                                                        icon(&icons::COMMIT, 11.0)
+                                                            .color(t.accent)
+                                                            .a11y_hidden(),
+                                                    )
+                                                    .child(
+                                                        text(c.short_sha.clone())
+                                                            .font(ty::MONO_SM)
+                                                            .color(t.text_primary),
+                                                    ),
+                                            )
+                                            .child(status_badge.key(format!("commit-badge-{idx}"))),
+                                    )
+                                    .child(
+                                        text(c.message.clone())
+                                            .font(ty::BODY_MED)
+                                            .color(t.text_primary)
+                                            .w_full()
+                                            .min_w(0.0)
+                                            .wrap(),
+                                    )
+                                    .child(
+                                        text(if date_label.is_empty() {
+                                            format!("por {}", c.author)
+                                        } else {
+                                            format!("por {} · {}", c.author, date_label)
+                                        })
+                                        .font(ty::CAPTION)
+                                        .color(t.text_muted)
+                                        .wrap(),
+                                    ),
+                            )
+                            .child(
+                                primary_button(
+                                    t,
+                                    format!("commit-run-{idx}"),
+                                    "Rodar fluxo",
+                                    Some(&icons::PLAY),
+                                    30.0,
+                                    move |s: &mut AppState, tx: &mut Tx| {
+                                        s.run_binding_commit_now(
+                                            &bid_run, &sha_run, &msg_run, &br_run, tx,
+                                        );
+                                    },
+                                )
+                                .help(format!(
+                                    "Dispara o fluxo deste projeto para o commit {} ({}).",
+                                    c.short_sha, br_help
+                                )),
+                            ),
+                    );
+                }
+                rows_col
+            };
+
+            body = body.child(
+                col()
+                    .key("commits-list-scroll")
+                    .w_full()
+                    .min_w(0.0)
+                    .max_h(360.0)
+                    .min_h(0.0)
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .scroll_edge_fade(10.0)
+                    .child(list_content),
+            );
+
+            let footer = row()
+                .w_full()
+                .min_w(0.0)
+                .justify_end()
+                .child(btn_neutral(
+                    t,
+                    "commits-close",
+                    "Fechar",
+                    None,
+                    34.0,
+                    |s: &mut AppState, _| s.modal = ModalState::None,
+                ));
+
+            mount_shell_dialog(
+                t,
+                "commits",
+                &format!("Commits — {full_name}"),
+                680.0,
+                body,
+                footer,
+                layer,
+            );
         }
         ModalState::ProvisionModal(draft) => {
             let is_provisioning =
@@ -2020,6 +2267,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
 fn error_banner(t: UiTheme, msg: &str) -> El {
     row()
         .w_full()
+        .min_w(0.0)
         .px(12.0)
         .py(8.0)
         .radius(8.0)
@@ -2029,8 +2277,48 @@ fn error_banner(t: UiTheme, msg: &str) -> El {
             text(msg.to_string())
                 .font(ty::SMALL)
                 .color(t.danger)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
                 .wrap(),
         )
+}
+
+fn warning_banner(t: UiTheme, msg: &str) -> El {
+    row()
+        .w_full()
+        .min_w(0.0)
+        .px(12.0)
+        .py(8.0)
+        .gap(8.0)
+        .center_y()
+        .radius(8.0)
+        .fill(t.warning_bg)
+        .border(1.0, t.warning.alpha(0.45))
+        .child(icon(&icons::BOLT, 14.5).color(t.warning).a11y_hidden())
+        .child(
+            text(msg.to_string())
+                .font(ty::SMALL)
+                .color(t.warning)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .wrap(),
+        )
+}
+
+fn fmt_commit_date(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return dt
+            .with_timezone(&chrono::Local)
+            .format("%d/%m/%Y %H:%M")
+            .to_string();
+    }
+    trimmed.to_string()
 }
 
 fn labeled(t: UiTheme, label: &str, child: El) -> El {

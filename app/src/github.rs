@@ -224,6 +224,248 @@ pub fn fetch_repo_branches(sh: &SharedHandle, full_name: String) {
     });
 }
 
+pub fn detect_platform_from_paths(paths: &[String]) -> PlatformTarget {
+    let norm: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().replace('\\', "/").to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if norm.iter().any(|p| {
+        p.contains(".xcodeproj")
+            || p.contains(".xcworkspace")
+            || p == "info.plist"
+            || p.ends_with("/info.plist")
+            || p.contains("macos")
+    }) {
+        return PlatformTarget::MacOS;
+    }
+
+    if norm.iter().any(|p| {
+        p == "installer"
+            || p.starts_with("installer/")
+            || p.contains("/installer/")
+            || p.ends_with("/installer")
+            || p.ends_with(".ps1")
+            || p.contains("winresource")
+            || p.contains("windows-sys")
+            || p.ends_with(".sln")
+            || p.ends_with(".vcxproj")
+    }) {
+        return PlatformTarget::Windows;
+    }
+
+    if norm.iter().any(|p| {
+        p == "dockerfile"
+            || p.ends_with("/dockerfile")
+            || p.contains("dockerfile.")
+            || p == "docker-compose.yml"
+            || p.ends_with("/docker-compose.yml")
+            || p == "docker-compose.yaml"
+            || p.ends_with("/docker-compose.yaml")
+            || p.ends_with(".service")
+            || p == "install.sh"
+            || p.ends_with("/install.sh")
+    }) {
+        return PlatformTarget::Linux;
+    }
+
+    PlatformTarget::CrossPlatform
+}
+
+fn collect_content_paths(v: &serde_json::Value) -> Vec<String> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let kind_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("file");
+        let path = item
+            .get("path")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.get("name").and_then(|x| x.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(p) = path {
+            if kind_type == "dir" && !p.ends_with('/') {
+                out.push(format!("{p}/"));
+            } else {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn apply_detected_platform(s: &mut Shared, repo: &str, platform: PlatformTarget) {
+    s.detected_platform = Some((repo.to_string(), platform));
+    if platform == PlatformTarget::CrossPlatform {
+        return;
+    }
+    let mut changed = false;
+    for b in &mut s.settings.repo_bindings {
+        if b.full_name.trim().eq_ignore_ascii_case(repo)
+            && b.platform == PlatformTarget::CrossPlatform
+        {
+            b.platform = platform;
+            changed = true;
+        }
+    }
+    if changed {
+        save_settings(s);
+    }
+}
+
+pub fn parse_repo_commits_json(
+    v: &serde_json::Value,
+    branch: &str,
+) -> Result<Vec<RepoCommitItem>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "Resposta inesperada ao listar commits do GitHub.".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(sha) = item
+            .get("sha")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let short_sha: String = sha.chars().take(7).collect();
+        let message = item
+            .pointer("/commit/message")
+            .and_then(|x| x.as_str())
+            .and_then(|m| m.lines().next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("commit")
+            .to_string();
+        let author = item
+            .pointer("/author/login")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                item.pointer("/commit/author/name")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("desconhecido")
+            .to_string();
+        let date = item
+            .pointer("/commit/author/date")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        out.push(RepoCommitItem {
+            sha: sha.to_string(),
+            short_sha,
+            message,
+            author,
+            date,
+            branch: branch.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn encode_query_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub fn fetch_repo_commits(sh: &SharedHandle, full_name: String, branch: String) {
+    let repo = full_name.trim().to_string();
+    let br = {
+        let trimmed = branch.trim();
+        if trimmed.is_empty() {
+            "main".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if repo.is_empty() {
+        let mut s = sh.lock().unwrap();
+        s.repo_commits_loading = false;
+        s.repo_commits_repo.clear();
+        s.repo_commits_branch.clear();
+        s.repo_commits.clear();
+        s.repo_commits_status = "Informe o repositório (dono/repo) para buscar commits.".into();
+        drop(s);
+        engine::notify(sh);
+        return;
+    }
+    {
+        let mut s = sh.lock().unwrap();
+        if s.repo_commits_loading && s.repo_commits_repo == repo && s.repo_commits_branch == br {
+            return;
+        }
+        s.repo_commits_loading = true;
+        s.repo_commits_repo = repo.clone();
+        s.repo_commits_branch = br.clone();
+        s.repo_commits_status = format!("Buscando commits de {repo} ({br})...");
+    }
+    engine::notify(sh);
+
+    let sh2 = sh.clone();
+    std::thread::spawn(move || {
+        let token = resolve_github_token(&sh2, None);
+        let encoded_br = encode_query_component(&br);
+        let url = format!("https://api.github.com/repos/{repo}/commits?sha={encoded_br}&per_page=8");
+        let result = match github_get_request(&url, token.as_deref()).call() {
+            Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                Ok(v) => parse_repo_commits_json(&v, &br),
+                Err(_) => Err("Não foi possível ler a lista de commits do GitHub.".into()),
+            },
+            Err(ureq::Error::Status(404, _)) => Err(format!(
+                "Repositório '{repo}' ou branch '{br}' não encontrado."
+            )),
+            Err(ureq::Error::Status(401, _)) => {
+                Err("Token do GitHub inválido ou expirado (HTTP 401).".into())
+            }
+            Err(ureq::Error::Status(code, _)) => Err(format!(
+                "GitHub retornou erro HTTP {code} ao buscar commits."
+            )),
+            Err(ureq::Error::Transport(t)) => {
+                Err(format!("Falha de rede ao buscar commits: {t}"))
+            }
+        };
+
+        {
+            let mut s = sh2.lock().unwrap();
+            if s.repo_commits_repo == repo && s.repo_commits_branch == br {
+                s.repo_commits_loading = false;
+                match result {
+                    Ok(commits) => {
+                        s.repo_commits_status = if commits.is_empty() {
+                            format!("Nenhum commit encontrado em {repo} ({br}).")
+                        } else {
+                            format!("{} commit(s) recente(s) em {repo} ({br}).", commits.len())
+                        };
+                        s.repo_commits = commits;
+                    }
+                    Err(err) => {
+                        s.repo_commits_status = err;
+                    }
+                }
+            }
+        }
+        engine::notify(&sh2);
+    });
+}
+
 pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
     let repo = full_name.trim().to_string();
     if repo.is_empty() {
@@ -253,10 +495,12 @@ pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
 
         let wf_url = format!("https://api.github.com/repos/{repo}/contents/.github/workflows");
         let mut gh_workflows = Vec::new();
+        let mut all_paths = Vec::new();
         let mut wf_err: Option<String> = None;
         match github_get_request(&wf_url, token.as_deref()).call() {
             Ok(resp) => {
                 if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    all_paths.extend(collect_content_paths(&v));
                     gh_workflows = parse_github_workflows_dir_json(&v);
                 }
             }
@@ -275,6 +519,7 @@ pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
         match github_get_request(&root_url, token.as_deref()).call() {
             Ok(resp) => {
                 if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    all_paths.extend(collect_content_paths(&v));
                     root_items = parse_repo_root_manifests_json(&v);
                 }
             }
@@ -293,6 +538,7 @@ pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
         let root_count = root_items.len();
         let mut all = gh_workflows;
         all.extend(root_items);
+        let detected_platform = detect_platform_from_paths(&all_paths);
 
         {
             let mut s = sh2.lock().unwrap();
@@ -305,6 +551,7 @@ pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
                         .unwrap_or_else(|| "Não foi possível analisar o repositório.".into());
                 } else {
                     s.repo_workflows = all;
+                    apply_detected_platform(&mut s, &repo, detected_platform);
                     s.repo_workflows_status = match (gh_count, root_count) {
                         (0, 0) => "Nenhum fluxo automatizado encontrado no repositório.".into(),
                         (g, 0) => format!("{g} fluxo(s) encontrado(s) em .github/workflows"),
@@ -563,8 +810,8 @@ pub fn build_runner_config_json(settings: &Settings, workflows: &[Workflow], ser
 
     let mut needed_wf_ids: HashSet<String> = HashSet::new();
     for b in &bindings {
-        if let Some(wid) = &b.workflow_id {
-            needed_wf_ids.insert(wid.clone());
+        for wid in engine::matching_workflows_for_binding(workflows, b) {
+            needed_wf_ids.insert(wid);
         }
     }
     for wf in workflows {
@@ -1350,6 +1597,7 @@ mod tests {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
         settings.repo_bindings.push(RepoBinding {
             id: "rb-2".into(),
@@ -1361,6 +1609,7 @@ mod tests {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
 
         let workflows = vec![
@@ -1438,6 +1687,7 @@ mod tests {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
         settings.repo_bindings.push(RepoBinding {
             id: "rb-poll".into(),
@@ -1449,6 +1699,7 @@ mod tests {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
         settings.repo_bindings.push(RepoBinding {
             id: "rb-disabled".into(),
@@ -1460,6 +1711,7 @@ mod tests {
             enabled: false,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
         settings.repo_bindings.push(RepoBinding {
             id: "rb-desk".into(),
@@ -1471,6 +1723,7 @@ mod tests {
             enabled: true,
             last_sha: String::new(),
             last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
         });
 
         assert!(server_needs_github_token(&settings, "vps-wh"));
@@ -1849,5 +2102,203 @@ mod tests {
         assert_eq!(s.settings.repo_bindings[2].last_status, "Monitorando");
         assert_eq!(s.runner_sync_status, err_msg);
         assert_eq!(s.sync_last_event, Some((2, false, err_msg)));
+    }
+
+    #[test]
+    fn runner_config_includes_generic_push_workflows_and_chained_when_binding_workflow_is_none() {
+        let mut settings = Settings::default();
+        settings.repo_bindings.push(RepoBinding {
+            id: "rb-auto".into(),
+            full_name: "widder/site".into(),
+            target_server_id: Some("vps-prod".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::WebhookOnVps,
+            workflow_id: None,
+            enabled: true,
+            last_sha: String::new(),
+            last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
+        });
+
+        let workflows = vec![
+            Workflow {
+                id: "wf-ci-generic".into(),
+                name: "CI Principal".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![Step { name: "Test".into(), run: "echo ok".into(), approval: false }],
+                on_success: Some("wf-deploy-generic".into()),
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-deploy-generic".into(),
+                name: "Deploy VPS".into(),
+                trigger: Trigger::Manual,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![Step { name: "Deploy".into(), run: "echo deploy".into(), approval: true }],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-unrelated-manual".into(),
+                name: "Isolamento RLS".into(),
+                trigger: Trigger::Manual,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+        ];
+
+        let cfg_str = build_runner_config_json(&settings, &workflows, "vps-prod").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&cfg_str).unwrap();
+        let wfs = cfg["workflows"].as_array().unwrap();
+        assert_eq!(wfs.len(), 2);
+        assert!(wfs.iter().any(|w| w["id"] == "wf-ci-generic"));
+        assert!(wfs.iter().any(|w| w["id"] == "wf-deploy-generic"));
+        assert!(!wfs.iter().any(|w| w["id"] == "wf-unrelated-manual"));
+    }
+
+    #[test]
+    fn detect_platform_from_paths_identifies_macos_windows_linux_and_cross_platform() {
+        assert_eq!(
+            detect_platform_from_paths(&[
+                "README.md".into(),
+                "ios/App.xcodeproj".into(),
+                "Dockerfile".into(),
+            ]),
+            PlatformTarget::MacOS
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["App/Info.plist".into()]),
+            PlatformTarget::MacOS
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["macos/Runner.xcworkspace".into()]),
+            PlatformTarget::MacOS
+        );
+
+        assert_eq!(
+            detect_platform_from_paths(&[
+                "app/Cargo.toml".into(),
+                "installer/".into(),
+                "scripts/build-installer.ps1".into(),
+            ]),
+            PlatformTarget::Windows
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["installer".into()]),
+            PlatformTarget::Windows
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["MySolution.sln".into()]),
+            PlatformTarget::Windows
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["deps/winresource".into()]),
+            PlatformTarget::Windows
+        );
+
+        assert_eq!(
+            detect_platform_from_paths(&["src/main.ts".into(), "Dockerfile".into()]),
+            PlatformTarget::Linux
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["deploy/docker-compose.yml".into()]),
+            PlatformTarget::Linux
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["systemd/app.service".into()]),
+            PlatformTarget::Linux
+        );
+        assert_eq!(
+            detect_platform_from_paths(&["install.sh".into()]),
+            PlatformTarget::Linux
+        );
+
+        assert_eq!(
+            detect_platform_from_paths(&["README.md".into(), "package.json".into(), "src/index.ts".into()]),
+            PlatformTarget::CrossPlatform
+        );
+        assert_eq!(detect_platform_from_paths(&[]), PlatformTarget::CrossPlatform);
+    }
+
+    #[test]
+    fn parse_repo_commits_json_extracts_commits_and_fallbacks() {
+        let payload = serde_json::json!([
+            {
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "commit": {
+                    "message": "feat(backend): detecção de plataforma\n\ncorpo detalhado",
+                    "author": {
+                        "name": "Matheus Widder",
+                        "date": "2026-11-18T10:15:00Z"
+                    }
+                },
+                "author": {
+                    "login": "matheuswidder"
+                }
+            },
+            {
+                "sha": "abcdef1234567",
+                "commit": {
+                    "message": "fix: ajuste rápido",
+                    "author": {
+                        "name": "CI Bot",
+                        "date": "2026-11-17T09:00:00Z"
+                    }
+                },
+                "author": null
+            },
+            {
+                "sha": "",
+                "commit": { "message": "ignorar sem sha" }
+            }
+        ]);
+
+        let commits = parse_repo_commits_json(&payload, "main").unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(commits[0].short_sha, "0123456");
+        assert_eq!(commits[0].message, "feat(backend): detecção de plataforma");
+        assert_eq!(commits[0].author, "matheuswidder");
+        assert_eq!(commits[0].date, "2026-11-18T10:15:00Z");
+        assert_eq!(commits[0].branch, "main");
+
+        assert_eq!(commits[1].short_sha, "abcdef1");
+        assert_eq!(commits[1].author, "CI Bot");
+
+        assert!(parse_repo_commits_json(&serde_json::json!({"message": "Not Found"}), "main").is_err());
+    }
+
+    #[test]
+    fn apply_detected_platform_updates_only_cross_platform_bindings() {
+        let mut s = Shared::default();
+        s.settings.repo_bindings.push(RepoBinding {
+            id: "rb-auto".into(),
+            full_name: "matheuswidder/w-workploy".into(),
+            platform: PlatformTarget::CrossPlatform,
+            ..RepoBinding::default()
+        });
+        s.settings.repo_bindings.push(RepoBinding {
+            id: "rb-manual".into(),
+            full_name: "matheuswidder/w-workploy".into(),
+            platform: PlatformTarget::Linux,
+            ..RepoBinding::default()
+        });
+
+        apply_detected_platform(&mut s, "matheuswidder/w-workploy", PlatformTarget::Windows);
+        assert_eq!(
+            s.detected_platform,
+            Some(("matheuswidder/w-workploy".into(), PlatformTarget::Windows))
+        );
+        assert_eq!(s.settings.repo_bindings[0].platform, PlatformTarget::Windows);
+        assert_eq!(s.settings.repo_bindings[1].platform, PlatformTarget::Linux);
     }
 }

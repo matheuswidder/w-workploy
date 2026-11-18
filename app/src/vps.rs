@@ -1033,6 +1033,7 @@ def queue_workflow(wf, trigger_label, repo_full_name="", branch="main", commit_i
             "cancel_requested": False,
             "secs": 0.0,
             "actor": actor,
+            "repo_name": repo_full_name or None,
             "branch": branch or "main",
             "summary": "",
             "annotations": [],
@@ -1059,6 +1060,23 @@ def branch_matches(pattern, branch):
     return False
 
 
+def resolve_workflow_for_binding(cfg, b):
+    wf_list = cfg.get("workflows", [])
+    workflows = {w.get("id"): w for w in wf_list if w.get("id")}
+    wf_id = b.get("workflow_id")
+    if wf_id and wf_id in workflows:
+        return workflows[wf_id]
+    bid = b.get("id")
+    if bid:
+        for w in wf_list:
+            if w.get("repo_id") == bid:
+                return w
+    for w in wf_list:
+        if w.get("trigger") == "Push":
+            return w
+    return None
+
+
 def poller_loop():
     poll_state = {}
     try:
@@ -1071,7 +1089,6 @@ def poller_loop():
         every = max(15, int(cfg.get("poll_secs", 60) or 60))
         gh_tok = read_text(GITHUB_TOKEN_PATH, "")
         bindings = cfg.get("bindings", [])
-        workflows = {w.get("id"): w for w in cfg.get("workflows", []) if w.get("id")}
 
         for b in bindings:
             if not b.get("enabled") or b.get("trigger_mode") != "PollOnVps":
@@ -1079,8 +1096,8 @@ def poller_loop():
             repo = (b.get("full_name") or "").strip()
             raw_branch = b.get("branch")
             branch_pat = (raw_branch if raw_branch is not None else "main").strip()
-            wf_id = b.get("workflow_id")
-            if not repo or not wf_id or wf_id not in workflows:
+            wf = resolve_workflow_for_binding(cfg, b)
+            if not repo or not wf:
                 continue
             headers = {
                 "User-Agent": "workploy-runner",
@@ -1142,7 +1159,7 @@ def poller_loop():
                             except Exception:
                                 pass
                         poll_state[key] = sha
-                        queue_workflow(workflows[wf_id], "sondagem 24/7 na VPS", repo, br, (sha, msg), "github-poll")
+                        queue_workflow(wf, "sondagem 24/7 na VPS", repo, br, (sha, msg), "github-poll")
                     elif sha and not prev:
                         poll_state[key] = sha
                     with open(POLL_STATE_PATH, "w", encoding="utf-8") as f:
@@ -1221,20 +1238,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg = ((payload.get("head_commit") or {}).get("message") or "webhook push").splitlines()[0]
             actor = ((payload.get("pusher") or {}).get("name") or "github").strip()
             cfg = load_config()
-            workflows = {w.get("id"): w for w in cfg.get("workflows", []) if w.get("id")}
             triggered = []
             for b in cfg.get("bindings", []):
                 if not b.get("enabled") or b.get("trigger_mode") != "WebhookOnVps":
                     continue
-                if (b.get("full_name") or "").strip().lower() != repo:
+                b_repo = (b.get("full_name") or "").strip()
+                if b_repo.lower() != repo:
                     continue
                 raw_branch = b.get("branch")
                 pat = raw_branch if raw_branch is not None else "main"
                 if not branch_matches(pat, branch):
                     continue
-                wf_id = b.get("workflow_id")
-                if wf_id and wf_id in workflows:
-                    rid = queue_workflow(workflows[wf_id], "webhook no GitHub", repo, branch, (sha, msg), actor)
+                wf = resolve_workflow_for_binding(cfg, b)
+                if wf:
+                    rid = queue_workflow(wf, "webhook no GitHub", b_repo or repo, branch, (sha, msg), actor)
                     triggered.append(rid)
             return self.send_json(200, {"ok": True, "triggered": triggered})
 
@@ -1921,6 +1938,7 @@ RUNNER_ACTIVE=1\r\n";
             cancel_requested: false,
             secs: 0.0,
             actor: "github".into(),
+            repo_name: None,
             branch: "main".into(),
             summary: String::new(),
             annotations: vec![],
@@ -1970,6 +1988,8 @@ RUNNER_ACTIVE=1\r\n";
         assert!(script.contains("/etc/workploy/config.json"));
         assert!(script.contains("\"/purge\""));
         assert!(script.contains("def branch_matches("));
+        assert!(script.contains("def resolve_workflow_for_binding("));
+        assert!(script.contains("\"repo_name\": repo_full_name or None"));
         assert!(!script.contains("widder"));
         assert!(!script.contains("docker.io"));
 

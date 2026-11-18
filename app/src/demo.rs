@@ -1,7 +1,7 @@
 use workploy::model::{
-    self, AnnKind, Annotation, AuthMethod, CapacityTier, GithubRepoSummary, PurgeRule,
-    RepoBinding, Run, RunStatus, RunnerKind, Settings, Shared, Step, StepRun, StepStatus, Trigger,
-    TriggerMode, VpsProbeResult, VpsServer, Workflow,
+    self, AnnKind, Annotation, AuthMethod, CapacityTier, GithubRepoSummary, PlatformTarget,
+    PurgeRule, RepoBinding, Run, RunStatus, RunnerKind, Settings, Shared, Step, StepRun,
+    StepStatus, Trigger, TriggerMode, VpsProbeResult, VpsServer, Workflow,
 };
 
 use crate::state::{AppState, ModalState, NavTarget, SettingsDraft, SettingsTab, WorkflowDraft};
@@ -54,7 +54,7 @@ pub fn populate_demo(s: &mut Shared) {
             ],
             on_success: Some(wf_deploy.clone()),
             server_id: None,
-            repo_id: Some(rb_landing_id.clone()),
+            repo_id: None,
         },
         Workflow {
             id: wf_deploy.clone(),
@@ -80,8 +80,8 @@ pub fn populate_demo(s: &mut Shared) {
                 },
             ],
             on_success: None,
-            server_id: Some(vps_prod_id.clone()),
-            repo_id: Some(rb_erp_id.clone()),
+            server_id: None,
+            repo_id: None,
         },
         Workflow {
             id: wf_rls.clone(),
@@ -206,6 +206,7 @@ pub fn populate_demo(s: &mut Shared) {
             enabled: true,
             last_sha: "a8f4c12".into(),
             last_status: "Webhook 24/7 ativo · último commit a8f4c12".into(),
+            platform: PlatformTarget::Linux,
         },
         RepoBinding {
             id: rb_landing_id,
@@ -217,6 +218,7 @@ pub fn populate_demo(s: &mut Shared) {
             enabled: true,
             last_sha: "c06c3c1".into(),
             last_status: "Monitorando no Desktop · commit atual c06c3c1".into(),
+            platform: PlatformTarget::CrossPlatform,
         },
     ];
 
@@ -367,6 +369,7 @@ pub fn populate_demo(s: &mut Shared) {
         cancel_requested: false,
         secs: 0.0,
         actor: "matheuswidder".into(),
+        repo_name: Some("widder/erp-central".into()),
         branch: "main".into(),
         summary: String::new(),
         annotations: vec![Annotation {
@@ -416,6 +419,7 @@ pub fn populate_demo(s: &mut Shared) {
         cancel_requested: false,
         secs: 0.0,
         actor: "ana.silva".into(),
+        repo_name: Some("matheuswidder/w-workploy".into()),
         branch: "feat/pix-recibo".into(),
         summary: String::new(),
         annotations: Vec::new(),
@@ -453,6 +457,7 @@ pub fn populate_demo(s: &mut Shared) {
         cancel_requested: false,
         secs: 0.0,
         actor: "matheuswidder".into(),
+        repo_name: Some("widder/faturamento-pix".into()),
         branch: "main".into(),
         summary: String::new(),
         annotations: vec![Annotation {
@@ -508,6 +513,7 @@ pub fn populate_demo(s: &mut Shared) {
         cancel_requested: false,
         secs: 15.0,
         actor: "matheuswidder".into(),
+        repo_name: Some("matheuswidder/w-workploy".into()),
         branch: "main".into(),
         summary: String::new(),
         annotations: vec![Annotation {
@@ -579,6 +585,7 @@ Dependências instaladas em 24 s";
         cancel_requested: false,
         secs: 453.0,
         actor: "matheuswidder".into(),
+        repo_name: Some("widder/landing".into()),
         branch: "main".into(),
         summary: "\
 # Resumo da execução #671 (c06c3c1)
@@ -641,6 +648,7 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
         cancel_requested: false,
         secs: 593.0,
         actor: "matheuswidder".into(),
+        repo_name: Some("widder/erp-central".into()),
         branch: "main".into(),
         summary: "Deploy VPS concluído em 9 min 53 s · todos os serviços saudáveis.".into(),
         annotations: Vec::new(),
@@ -671,6 +679,7 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
         cancel_requested: true,
         secs: 28.0,
         actor: "ana.silva".into(),
+        repo_name: Some("widder/mobile-app".into()),
         branch: "feat/mobile-offline".into(),
         summary: String::new(),
         annotations: Vec::new(),

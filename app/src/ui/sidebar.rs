@@ -86,7 +86,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
     ));
     y += ROW_PITCH + 10.0;
 
-    // 3. Fluxos de trabalho
+    // 3. Receitas de fluxo
     if !collapsed {
         items.push(
             row()
@@ -96,8 +96,9 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                 .px(18.0)
                 .center_y()
                 .justify_between()
+                .help("Receitas reutilizáveis (o que fazer). Onde e quando rodar é definido nos Vínculos em Configurações → GitHub.")
                 .child(
-                    text("FLUXOS DE TRABALHO")
+                    text("RECEITAS DE FLUXO")
                         .font(ty::EYEBROW)
                         .color(t.text_muted),
                 ),

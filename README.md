@@ -2,7 +2,7 @@
 
 Orquestrador desktop em Rust para CI/CD e deploy self-hosted multi-VPS.
 
-[![Versão](https://img.shields.io/badge/versão-0.1.7-d97706)](https://github.com/matheuswidder/w-workploy/releases)
+[![Versão](https://img.shields.io/badge/versão-0.1.8-d97706)](https://github.com/matheuswidder/w-workploy/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-b45309?logo=rust)](app/Cargo.toml)
 [![Plataforma](https://img.shields.io/badge/Plataforma-Windows%20%7C%20Linux-0078D6)](https://github.com/matheuswidder/w-workploy/releases)
 [![Licença MIT](https://img.shields.io/badge/licença-MIT-16a34a)](LICENSE)
@@ -19,6 +19,15 @@ O Workploy divide a execução contínua na sua infraestrutura do controle visua
 - **Autorização com 1 clique na aba Aprovações:** fluxos com **Portão de Aprovação** pausam na VPS antes da etapa crítica e aparecem na aba **Aprovações** do app desktop para você autorizar ou cancelar o deploy com 1 clique.
 
 Executar pipelines nas próprias VPSs elimina limites de minutos e cobranças de runners em nuvem, mantendo credenciais e código sob o seu controle.
+
+## Guia de automações YAML
+
+Quer criar seus próprios pipelines do zero? Leia o tutorial completo em [`docs/AUTOMACOES_YAML.md`](docs/AUTOMACOES_YAML.md) para aprender:
+
+- A diferença entre **Receita** (o que executar) e **Vínculo** (onde e quando rodar: Local Windows, VPS Linux, Webhook 24/7, Sondagem 24/7 e multi-branch).
+- Todos os campos do formato `.workploy.yml` (`name`, `trigger`, `workdir`, `on_success`, `steps` e `approval: true`) e sua equivalência com o importador YAML da interface.
+- Exemplos prontos para copiar (Node/Next.js + Docker Compose, Rust Cargo CI, Pipeline encadeado com Portão de Aprovação e builds Windows/Multiplataforma).
+- Como importar, vincular e testar sua automação direto pelo aplicativo.
 
 ## Principais recursos
 
@@ -63,7 +72,7 @@ flowchart LR
     end
 
     Desktop <-->|"HTTPS (PAT)"| API
-    Sobre -->|"Consulta e baixa v0.1.7+"| Releases
+    Sobre -->|"Consulta e baixa v0.1.8+"| Releases
     Sync <-->|"SSH (logs, runs, métricas e aprovações)"| Runner
     Hook -->|"POST Webhook"| Runner
     Runner -->|"Sondagem 24/7 & git clone/fetch"| API
@@ -71,18 +80,18 @@ flowchart LR
 
 ## Instalação (Windows)
 
-Baixe o pacote da versão `0.1.7` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
+Baixe o pacote da versão `0.1.8` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
 
-- **`Workploy-Setup-0.1.7.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
-- **`workploy-0.1.7-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
+- **`Workploy-Setup-0.1.8.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
+- **`workploy-0.1.8-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
 
 ## Instalação (Linux x86_64)
 
-Baixe o pacote `workploy-0.1.7-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
+Baixe o pacote `workploy-0.1.8-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
 
 ```bash
-tar -xzf workploy-0.1.7-linux-x86_64.tar.gz
-cd workploy-0.1.7-linux-x86_64
+tar -xzf workploy-0.1.8-linux-x86_64.tar.gz
+cd workploy-0.1.8-linux-x86_64
 ./install.sh
 ```
 
@@ -93,7 +102,7 @@ O script instala o binário em `~/.local/bin/workploy`, o ícone e o atalho `.de
 O Workploy verifica novas versões direto na interface em **Configurações -> Sobre**:
 
 1. Clique em **Buscar atualizações** para consultar a release oficial mais recente no GitHub.
-2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.7 agora** (ou na versão indicada).
+2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.8 agora** (ou na versão indicada).
 3. No Windows, o aplicativo baixa o instalador oficial, aplica a atualização e reinicia sozinho. No Linux, você também pode abrir a página da release direto pelo botão **Ver no GitHub**.
 
 ## Compilação e desenvolvimento local
@@ -132,7 +141,7 @@ cargo run --manifest-path app/Cargo.toml -- --demo
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 ```
 
-O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.7.exe` e `workploy-0.1.7-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
+O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.8.exe` e `workploy-0.1.8-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
 
 ## Estrutura do projeto
 
@@ -141,6 +150,7 @@ O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `a
 | [`app/`](app/) | Aplicação desktop em Rust (`app/src/`, `app/assets/` e `app/Cargo.toml`), engine de pipelines, cliente SSH, integração GitHub e agente `workploy-runner` |
 | [`installer/`](installer/) | Instalador nativo Win32 (`workploy-setup`) com compressão e desinstalador |
 | [`scripts/`](scripts/) | Automação de empacotamento e geração de hashes ([`build-installer.ps1`](scripts/build-installer.ps1)) |
+| [`docs/AUTOMACOES_YAML.md`](docs/AUTOMACOES_YAML.md) | Guia prático de criação, importação e teste de automações `.yml` |
 | [`README.md`](README.md) | Documentação principal de uso, instalação e build |
 | [`LICENSE`](LICENSE) | Texto integral da licença MIT |
 

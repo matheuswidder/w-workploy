@@ -37,8 +37,8 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 
     let main_content = match &s.nav {
         NavTarget::Onboarding => onboarding::view(s, t),
-        NavTarget::Runs => runs::view(s, t, &k, None, &mut layer),
-        NavTarget::WorkflowRuns(id) => runs::view(s, t, &k, Some(id), &mut layer),
+        NavTarget::Runs => runs::view(s, t, &k, None, main_w, &mut layer),
+        NavTarget::WorkflowRuns(id) => runs::view(s, t, &k, Some(id), main_w, &mut layer),
         NavTarget::Approvals => approvals::view(s, t),
         NavTarget::Connections => connections::view(s, t, main_w),
         NavTarget::Settings => settings::view(s, t, &k, narrow),

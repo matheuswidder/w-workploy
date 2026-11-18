@@ -8,9 +8,10 @@ use rune_kit::{ToastEffect, ToastEvent, ToastStack};
 use workploy::engine::{self, SharedHandle};
 use workploy::github;
 use workploy::model::{
-    self, AuthMethod, CapacityTier, DetectedWorkflow, GithubRepoSummary, ProvisionOptions,
-    PurgeRule, ReleaseInfo, RepoBinding, Run, RunStatus, RunnerKind, Settings, Shared, Step,
-    StepRun, StepStatus, Trigger, TriggerMode, VpsProbeResult, VpsServer, Workflow,
+    self, AuthMethod, CapacityTier, DetectedWorkflow, GithubRepoSummary, PlatformTarget,
+    ProvisionOptions, PurgeRule, ReleaseInfo, RepoBinding, RepoCommitItem, Run, RunStatus,
+    RunnerKind, Settings, Shared, Step, StepRun, StepStatus, Trigger, TriggerMode,
+    VpsProbeResult, VpsServer, Workflow,
 };
 use workploy::vault;
 use workploy::vps;
@@ -183,8 +184,6 @@ pub struct WorkflowDraft {
     pub name: TextEdit,
     pub trigger: Trigger,
     pub runner: RunnerKind,
-    pub server_id: Option<String>,
-    pub repo_id: Option<String>,
     pub workdir: TextEdit,
     pub on_success: Option<String>,
     pub steps: Vec<StepDraft>,
@@ -217,8 +216,6 @@ impl WorkflowDraft {
             name: TextEdit::new("Novo fluxo"),
             trigger: Trigger::Manual,
             runner: RunnerKind::Local,
-            server_id: None,
-            repo_id: None,
             workdir: TextEdit::new(""),
             on_success: None,
             steps: vec![StepDraft {
@@ -250,8 +247,6 @@ impl WorkflowDraft {
             name: TextEdit::new(wf.name.clone()),
             trigger: wf.trigger,
             runner: wf.runner,
-            server_id: wf.server_id.clone(),
-            repo_id: wf.repo_id.clone(),
             workdir: TextEdit::new(wf.workdir.clone()),
             on_success: wf.on_success.clone(),
             steps,
@@ -348,6 +343,24 @@ impl ServerDraft {
     }
 }
 
+pub fn platform_compat_warning(
+    platform: PlatformTarget,
+    target_server_id: Option<&str>,
+) -> Option<&'static str> {
+    match platform {
+        PlatformTarget::Windows if target_server_id.is_some() => Some(
+            "Este repositório exige runner Windows — VPS Linux não gera binário Win32/.exe nativo. Prefira 'Local (Esta máquina)' ou ajuste a plataforma.",
+        ),
+        PlatformTarget::Linux if target_server_id.is_none() && cfg!(target_os = "windows") => Some(
+            "Este repositório exige ambiente Linux (Docker/systemd) — no Windows Desktop use uma VPS Linux ou Docker.",
+        ),
+        PlatformTarget::MacOS => Some(
+            "Este repositório exige macOS (Xcode/Apple) — não há runner macOS conectado neste ambiente.",
+        ),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BindingDraft {
     pub id: Option<String>,
@@ -356,6 +369,7 @@ pub struct BindingDraft {
     pub target_server_id: Option<String>,
     pub trigger_mode: TriggerMode,
     pub workflow_id: Option<String>,
+    pub platform: PlatformTarget,
     pub enabled: bool,
     pub error: Option<String>,
 }
@@ -369,6 +383,7 @@ impl BindingDraft {
             target_server_id: default_server_id,
             trigger_mode: TriggerMode::PollOnVps,
             workflow_id: None,
+            platform: PlatformTarget::CrossPlatform,
             enabled: true,
             error: None,
         }
@@ -392,6 +407,7 @@ impl BindingDraft {
             target_server_id: default_server_id,
             trigger_mode,
             workflow_id: None,
+            platform: PlatformTarget::CrossPlatform,
             enabled: true,
             error: None,
         }
@@ -409,6 +425,7 @@ impl BindingDraft {
             target_server_id: b.target_server_id.clone(),
             trigger_mode: b.trigger_mode,
             workflow_id: b.workflow_id.clone(),
+            platform: b.platform,
             enabled: b.enabled,
             error: None,
         }
@@ -535,6 +552,7 @@ impl PurgeRuleDraft {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ModalState {
     None,
     WorkflowEditor(Box<WorkflowDraft>),
@@ -543,6 +561,11 @@ pub enum ModalState {
     ServerEditor(Box<ServerDraft>),
     DeleteServerConfirm { server_id: String, server_name: String },
     BindingEditor(Box<BindingDraft>),
+    RepoCommits {
+        binding_id: String,
+        full_name: String,
+        branch_input: TextEdit,
+    },
     ProvisionModal(Box<ProvisionDraft>),
     PurgeRuleEditor(Box<PurgeRuleDraft>),
 }
@@ -937,6 +960,7 @@ impl AppState {
             || self.snapshot.update_downloading
             || self.snapshot.repo_branches_loading
             || self.snapshot.repo_workflows_loading
+            || self.snapshot.repo_commits_loading
     }
 
     pub fn navigate_to(&mut self, target: NavTarget) {
@@ -1079,6 +1103,7 @@ impl AppState {
                     cancel_requested: false,
                     secs: 0.0,
                     actor: "maestro".into(),
+                    repo_name: None,
                     branch: "main".into(),
                     summary: String::new(),
                     annotations: Vec::new(),
@@ -1104,6 +1129,173 @@ impl AppState {
                 "Fluxo iniciado",
                 Some("Acompanhando execução em tempo real.".into()),
                 ToastKind::Success,
+                tx,
+            );
+        }
+    }
+
+    pub fn resolve_primary_branch(branch_expr: &str) -> String {
+        let raw = branch_expr.trim();
+        if raw.is_empty() || raw == "*" {
+            "main".to_string()
+        } else {
+            raw.split(',')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "*")
+                .unwrap_or("main")
+                .to_string()
+        }
+    }
+
+    pub fn run_binding_now(&mut self, binding_id: &str, tx: &mut Tx) {
+        let Some(binding) = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        if self.demo_mode {
+            let mut wf_ids = engine::matching_workflows_for_binding(&self.snapshot.workflows, &binding);
+            if wf_ids.is_empty()
+                && let Some(first) = self.snapshot.workflows.first()
+            {
+                wf_ids.push(first.id.clone());
+            }
+            let Some(wf_id) = wf_ids.into_iter().next() else {
+                self.push_toast(
+                    format!("run-bind-empty-{binding_id}"),
+                    "Nenhuma receita configurada",
+                    Some("Crie uma receita de fluxo antes de executar este projeto.".into()),
+                    ToastKind::Warning,
+                    tx,
+                );
+                return;
+            };
+            let Some(wf) = self
+                .snapshot
+                .workflows
+                .iter()
+                .find(|w| w.id == wf_id)
+                .cloned()
+            else {
+                return;
+            };
+            let number = self
+                .snapshot
+                .runs
+                .iter()
+                .filter(|r| r.workflow_id == wf.id)
+                .count() as u64
+                + 1;
+            let now = model::now_ts();
+            let mut steps: Vec<StepRun> = wf
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, st)| StepRun {
+                    name: st.name.clone(),
+                    status: if i == 0 {
+                        if st.approval {
+                            StepStatus::WaitingApproval
+                        } else {
+                            StepStatus::Running
+                        }
+                    } else {
+                        StepStatus::Pending
+                    },
+                    log: if i == 0 {
+                        format!(
+                            "Projeto: {}\nIniciando passo '{}'...\nExecutando: {}\n",
+                            binding.full_name, st.name, st.run
+                        )
+                    } else {
+                        String::new()
+                    },
+                    secs: 0.0,
+                    substeps: Vec::new(),
+                    started_ts: if i == 0 { Some(now) } else { None },
+                })
+                .collect();
+            let status = if steps
+                .first()
+                .is_some_and(|s| s.status == StepStatus::WaitingApproval)
+            {
+                if let Some(s0) = steps.first_mut() {
+                    s0.log.push_str(
+                        "[portão de aprovação] aguardando liberação manual para este passo...\n",
+                    );
+                }
+                RunStatus::AwaitingApproval
+            } else {
+                RunStatus::Running
+            };
+            let branch = Self::resolve_primary_branch(&binding.branch);
+            let run = Run {
+                id: model::new_id("run"),
+                workflow_id: wf.id.clone(),
+                workflow_name: wf.name.clone(),
+                status,
+                trigger_label: "disparo manual por projeto".into(),
+                title: format!("{} · {}", binding.full_name, wf.name),
+                number,
+                commit: None,
+                started_at: model::stamp_list(now),
+                started_ts: Some(now),
+                finished_at: None,
+                steps,
+                approved: false,
+                cancel_requested: false,
+                secs: 0.0,
+                actor: "maestro".into(),
+                repo_name: Some(binding.full_name.clone()),
+                branch,
+                summary: String::new(),
+                annotations: Vec::new(),
+            };
+            let rid = run.id.clone();
+            self.snapshot.runs.insert(0, run);
+            self.push_toast(
+                format!("run-bind-{rid}"),
+                "Execução iniciada",
+                Some(format!(
+                    "{} ({}) · receita '{}'",
+                    binding.full_name,
+                    self.server_label(binding.target_server_id.as_deref()),
+                    wf.name
+                )),
+                ToastKind::Success,
+                tx,
+            );
+            return;
+        }
+
+        if let Some(rid) =
+            engine::start_run_for_binding(&self.shared, binding_id, "disparo manual por projeto")
+        {
+            self.snapshot = self.shared.lock().unwrap().clone();
+            tx.wake_after(std::time::Duration::from_millis(120));
+            self.push_toast(
+                format!("run-bind-{rid}"),
+                "Execução iniciada",
+                Some(format!(
+                    "Projeto '{}' em execução.",
+                    binding.full_name
+                )),
+                ToastKind::Success,
+                tx,
+            );
+        } else {
+            self.push_toast(
+                format!("run-bind-fail-{binding_id}"),
+                "Nenhuma receita associada",
+                Some("Selecione uma receita no vínculo ou configure um fluxo com gatilho de push.".into()),
+                ToastKind::Warning,
                 tx,
             );
         }
@@ -1910,13 +2102,364 @@ impl AppState {
                     kind: "docker".into(),
                 },
             ];
+            let lower = repo.to_ascii_lowercase();
+            let det_plat = if lower.contains("workploy") || lower.contains("win") {
+                PlatformTarget::Windows
+            } else if lower.contains("macos") || lower.contains("xcode") {
+                PlatformTarget::MacOS
+            } else {
+                PlatformTarget::Linux
+            };
+            self.snapshot.detected_platform = Some((repo.clone(), det_plat));
+            if let ModalState::BindingEditor(d) = &mut self.modal
+                && det_plat != PlatformTarget::CrossPlatform
+            {
+                d.platform = det_plat;
+            }
             self.snapshot.repo_workflows_status =
                 "2 fluxo(s) encontrado(s) em .github/workflows + 1 arquivo(s) na raiz".into();
             return;
         }
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.detected_platform = None;
+        }
+        self.snapshot.detected_platform = None;
         github::scan_repo_workflows(&self.shared, repo);
         self.snapshot = self.shared.lock().unwrap().clone();
         tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
+    pub fn open_repo_commits_modal(&mut self, binding_id: &str, tx: &mut Tx) {
+        let Some(binding) = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .cloned()
+        else {
+            return;
+        };
+        let branch = Self::resolve_primary_branch(&binding.branch);
+        self.open_select = None;
+        self.modal = ModalState::RepoCommits {
+            binding_id: binding.id,
+            full_name: binding.full_name,
+            branch_input: TextEdit::new(branch),
+        };
+        self.fetch_repo_commits_for_modal(tx);
+    }
+
+    pub fn fetch_repo_commits_for_modal(&mut self, tx: &mut Tx) {
+        let (full_name, branch) = match &mut self.modal {
+            ModalState::RepoCommits {
+                full_name,
+                branch_input,
+                ..
+            } => {
+                let br = branch_input.text.trim();
+                let resolved = if br.is_empty() {
+                    "main".to_string()
+                } else {
+                    br.to_string()
+                };
+                if br.is_empty() {
+                    *branch_input = TextEdit::new(resolved.clone());
+                }
+                (full_name.trim().to_string(), resolved)
+            }
+            _ => return,
+        };
+
+        if self.demo_mode {
+            self.snapshot.repo_commits_loading = false;
+            if full_name.is_empty() || !full_name.contains('/') {
+                self.snapshot.repo_commits_repo.clear();
+                self.snapshot.repo_commits_branch.clear();
+                self.snapshot.repo_commits.clear();
+                self.snapshot.repo_commits_status =
+                    "Informe o repositório (dono/repo) para buscar commits.".into();
+                return;
+            }
+            let commits = if full_name.eq_ignore_ascii_case("widder/landing") && branch == "main" {
+                vec![
+                    RepoCommitItem {
+                        sha: "f3e8d21a9c4b5e6f708192a3b4c5d6e7f8a9b0c1".into(),
+                        short_sha: "f3e8d21".into(),
+                        message: "feat(seo): melhora metadados OpenGraph e schema JSON-LD".into(),
+                        author: "ana.silva".into(),
+                        date: "2026-11-18T15:40:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "c06c3c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b".into(),
+                        short_sha: "c06c3c1".into(),
+                        message: "feat(painel): consolida interface OpenCode em Rune com pulso discreto".into(),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-18T12:15:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "b21c440f8e7d6c5b4a3928172635445362718090".into(),
+                        short_sha: "b21c440".into(),
+                        message: "style(hero): ajusta espaçamento responsivo em telas 360px".into(),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-17T19:05:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                ]
+            } else if branch == "main" {
+                vec![
+                    RepoCommitItem {
+                        sha: "f3e8d21a9c4b5e6f708192a3b4c5d6e7f8a9b0c1".into(),
+                        short_sha: "f3e8d21".into(),
+                        message: "feat(faturamento): adiciona conciliação automática de boletos".into(),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-18T16:10:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "a8f4c12f9b3c4d5e6f708192a3b4c5d6e7f8091a".into(),
+                        short_sha: "a8f4c12".into(),
+                        message: "release(v2.14.0): prepara pacote de produção após CI #691".into(),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-18T14:25:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "d41a8e9c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3210".into(),
+                        short_sha: "d41a8e9".into(),
+                        message: "fix(api): corrige timeout no webhook de confirmação PIX".into(),
+                        author: "ana.silva".into(),
+                        date: "2026-11-17T21:40:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                ]
+            } else {
+                vec![
+                    RepoCommitItem {
+                        sha: "9c12ab34cd56ef78901234567890abcdef123456".into(),
+                        short_sha: "9c12ab3".into(),
+                        message: format!("feat({branch}): prepara ajustes de homologação na branch {branch}"),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-18T15:10:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "5e78cd90ef12ab34567890abcdef1234567890ab".into(),
+                        short_sha: "5e78cd9".into(),
+                        message: format!("fix({branch}): valida migrations em ambiente isolado"),
+                        author: "ana.silva".into(),
+                        date: "2026-11-18T10:30:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                    RepoCommitItem {
+                        sha: "3a45bc67de89fa0123456789abcdef0123456789".into(),
+                        short_sha: "3a45bc6".into(),
+                        message: "chore: atualiza dependências do workspace".into(),
+                        author: "matheuswidder".into(),
+                        date: "2026-11-17T17:50:00Z".into(),
+                        branch: branch.clone(),
+                    },
+                ]
+            };
+            self.snapshot.repo_commits_repo = full_name.clone();
+            self.snapshot.repo_commits_branch = branch.clone();
+            self.snapshot.repo_commits_status = format!(
+                "{} commit(s) recente(s) em {} ({}).",
+                commits.len(),
+                full_name,
+                branch
+            );
+            self.snapshot.repo_commits = commits;
+            return;
+        }
+
+        github::fetch_repo_commits(&self.shared, full_name, branch);
+        self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
+    pub fn run_binding_commit_now(
+        &mut self,
+        binding_id: &str,
+        sha: &str,
+        message: &str,
+        branch: &str,
+        tx: &mut Tx,
+    ) {
+        let Some(binding) = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .cloned()
+        else {
+            return;
+        };
+        let short: String = sha.chars().take(7).collect();
+        let clean_branch = if branch.trim().is_empty() {
+            Self::resolve_primary_branch(&binding.branch)
+        } else {
+            branch.trim().to_string()
+        };
+
+        if self.demo_mode {
+            let mut wf_ids =
+                engine::matching_workflows_for_binding(&self.snapshot.workflows, &binding);
+            if wf_ids.is_empty()
+                && let Some(first) = self.snapshot.workflows.first()
+            {
+                wf_ids.push(first.id.clone());
+            }
+            let Some(wf_id) = wf_ids.into_iter().next() else {
+                self.push_toast(
+                    format!("run-commit-empty-{binding_id}"),
+                    "Nenhuma receita configurada",
+                    Some("Crie uma receita de fluxo antes de executar este projeto.".into()),
+                    ToastKind::Warning,
+                    tx,
+                );
+                return;
+            };
+            let Some(wf) = self
+                .snapshot
+                .workflows
+                .iter()
+                .find(|w| w.id == wf_id)
+                .cloned()
+            else {
+                return;
+            };
+            let number = self
+                .snapshot
+                .runs
+                .iter()
+                .filter(|r| r.workflow_id == wf.id)
+                .count() as u64
+                + 1;
+            let now = model::now_ts();
+            let mut steps: Vec<StepRun> = wf
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, st)| StepRun {
+                    name: st.name.clone(),
+                    status: if i == 0 {
+                        if st.approval {
+                            StepStatus::WaitingApproval
+                        } else {
+                            StepStatus::Running
+                        }
+                    } else {
+                        StepStatus::Pending
+                    },
+                    log: if i == 0 {
+                        format!(
+                            "Projeto: {} ({}@{})\nIniciando passo '{}'...\nExecutando: {}\n",
+                            binding.full_name, clean_branch, short, st.name, st.run
+                        )
+                    } else {
+                        String::new()
+                    },
+                    secs: 0.0,
+                    substeps: Vec::new(),
+                    started_ts: if i == 0 { Some(now) } else { None },
+                })
+                .collect();
+            let status = if steps
+                .first()
+                .is_some_and(|s| s.status == StepStatus::WaitingApproval)
+            {
+                if let Some(s0) = steps.first_mut() {
+                    s0.log.push_str(
+                        "[portão de aprovação] aguardando liberação manual para este passo...\n",
+                    );
+                }
+                RunStatus::AwaitingApproval
+            } else {
+                RunStatus::Running
+            };
+            let trigger_label = if short.is_empty() {
+                format!("commit em {clean_branch}")
+            } else {
+                format!("commit {short} ({clean_branch})")
+            };
+            let title = message
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&trigger_label)
+                .to_string();
+            let run = Run {
+                id: model::new_id("run"),
+                workflow_id: wf.id.clone(),
+                workflow_name: wf.name.clone(),
+                status,
+                trigger_label,
+                title,
+                number,
+                commit: Some(sha.to_string()),
+                started_at: model::stamp_list(now),
+                started_ts: Some(now),
+                finished_at: None,
+                steps,
+                approved: false,
+                cancel_requested: false,
+                secs: 0.0,
+                actor: "maestro".into(),
+                repo_name: Some(binding.full_name.clone()),
+                branch: clean_branch,
+                summary: String::new(),
+                annotations: Vec::new(),
+            };
+            let rid = run.id.clone();
+            self.snapshot.runs.insert(0, run);
+            self.modal = ModalState::None;
+            self.navigate_to(NavTarget::Runs);
+            self.push_toast(
+                format!("run-commit-{rid}"),
+                format!("Execução iniciada para commit {short}"),
+                Some(format!(
+                    "{} ({}) · receita '{}'",
+                    binding.full_name,
+                    self.server_label(binding.target_server_id.as_deref()),
+                    wf.name
+                )),
+                ToastKind::Success,
+                tx,
+            );
+            return;
+        }
+
+        if let Some(rid) =
+            engine::start_run_for_binding_commit(&self.shared, binding_id, sha, message, &clean_branch)
+        {
+            self.snapshot = self.shared.lock().unwrap().clone();
+            self.modal = ModalState::None;
+            self.navigate_to(NavTarget::Runs);
+            tx.wake_after(std::time::Duration::from_millis(120));
+            self.push_toast(
+                format!("run-commit-{rid}"),
+                format!("Execução iniciada para commit {short}"),
+                Some(format!(
+                    "Projeto '{}' ({}) em execução.",
+                    binding.full_name, clean_branch
+                )),
+                ToastKind::Success,
+                tx,
+            );
+        } else {
+            self.push_toast(
+                format!("run-commit-fail-{binding_id}"),
+                "Nenhuma receita associada",
+                Some("Selecione uma receita no vínculo ou configure um fluxo com gatilho de push.".into()),
+                ToastKind::Warning,
+                tx,
+            );
+        }
     }
 
     pub fn open_new_binding_modal(&mut self, prefill: Option<&GithubRepoSummary>) {
@@ -1987,6 +2530,7 @@ impl AppState {
                 .map(|p| p.last_status.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "Aguardando sincronização".into()),
+            platform: draft.platform,
         };
 
         if self.demo_mode {
@@ -2380,11 +2924,6 @@ impl AppState {
             draft.error = Some("Adicione pelo menos um passo válido.".into());
             return;
         }
-        let server_id = if draft.runner == RunnerKind::Ssh {
-            draft.server_id.clone()
-        } else {
-            None
-        };
         let wf = Workflow {
             id: draft.id.clone().unwrap_or_else(|| model::new_id("wf")),
             name: name.clone(),
@@ -2393,8 +2932,8 @@ impl AppState {
             workdir: draft.workdir.text.trim().to_string(),
             steps,
             on_success: draft.on_success.clone(),
-            server_id,
-            repo_id: draft.repo_id.clone(),
+            server_id: None,
+            repo_id: None,
         };
         let wf_id = wf.id.clone();
         if self.demo_mode {
@@ -2621,8 +3160,17 @@ pub fn poll_app(s: &mut AppState, t: f64, tx: &mut Tx) -> bool {
     if g != s.last_wake_gen {
         s.last_wake_gen = g;
         if !s.demo_mode {
+            let prev_detected = s.snapshot.detected_platform.clone();
             if let Ok(guard) = s.shared.lock() {
                 s.snapshot = guard.clone();
+            }
+            if s.snapshot.detected_platform != prev_detected
+                && let Some((ref det_repo, det_plat)) = s.snapshot.detected_platform
+                && det_plat != PlatformTarget::CrossPlatform
+                && let ModalState::BindingEditor(d) = &mut s.modal
+                && d.full_name.text.trim().eq_ignore_ascii_case(det_repo)
+            {
+                d.platform = det_plat;
             }
             s.sync_connections_health_seen();
         }

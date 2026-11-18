@@ -86,6 +86,18 @@ pub fn start_run_full(
     trigger_label: &str,
     commit: Option<(String, String)>,
 ) -> Option<String> {
+    start_run_with_target(sh, workflow_id, trigger_label, commit, None, None, None)
+}
+
+pub fn start_run_with_target(
+    sh: &SharedHandle,
+    workflow_id: &str,
+    trigger_label: &str,
+    commit: Option<(String, String)>,
+    target_server_override: Option<String>,
+    repo_name: Option<String>,
+    branch: Option<String>,
+) -> Option<String> {
     let wf = {
         let s = sh.lock().unwrap();
         s.workflows.iter().find(|w| w.id == workflow_id).cloned()
@@ -105,6 +117,17 @@ pub fn start_run_full(
         ),
         None => (None, trigger_label.to_string()),
     };
+    let clean_repo = repo_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_branch = branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main")
+        .to_string();
     let run = Run {
         id: new_id("run"),
         workflow_id: wf.id.clone(),
@@ -133,7 +156,8 @@ pub fn start_run_full(
         cancel_requested: false,
         secs: 0.0,
         actor: "maestro".into(),
-        branch: "main".into(),
+        repo_name: clean_repo.clone(),
+        branch: clean_branch.clone(),
         summary: String::new(),
         annotations: Vec::new(),
     };
@@ -146,8 +170,93 @@ pub fn start_run_full(
     notify(sh);
     let sh2 = sh.clone();
     let rid = run_id.clone();
-    std::thread::spawn(move || execute_run(sh2, rid, wf));
+    std::thread::spawn(move || {
+        execute_run(
+            sh2,
+            rid,
+            wf,
+            target_server_override,
+            clean_repo,
+            Some(clean_branch),
+        )
+    });
     Some(run_id)
+}
+
+pub fn start_run_for_binding(
+    sh: &SharedHandle,
+    binding_id: &str,
+    trigger_label: &str,
+) -> Option<String> {
+    let (binding, workflows) = {
+        let s = sh.lock().unwrap();
+        let b = s
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|x| x.id == binding_id)
+            .cloned()?;
+        (b, s.workflows.clone())
+    };
+    let wf_ids = matching_workflows_for_binding(&workflows, &binding);
+    let mut first_run_id = None;
+    for wf_id in wf_ids {
+        if let Some(rid) = start_run_with_target(
+            sh,
+            &wf_id,
+            trigger_label,
+            None,
+            binding.target_server_id.clone(),
+            Some(binding.full_name.clone()),
+            Some(binding.branch.clone()),
+        ) && first_run_id.is_none()
+        {
+            first_run_id = Some(rid);
+        }
+    }
+    first_run_id
+}
+
+pub fn start_run_for_binding_commit(
+    sh: &SharedHandle,
+    binding_id: &str,
+    sha: &str,
+    message: &str,
+    branch: &str,
+) -> Option<String> {
+    let (binding, workflows) = {
+        let s = sh.lock().unwrap();
+        let b = s
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|x| x.id == binding_id)
+            .cloned()?;
+        (b, s.workflows.clone())
+    };
+    let wf_ids = matching_workflows_for_binding(&workflows, &binding);
+    let short: String = sha.chars().take(7).collect();
+    let trigger_label = if short.is_empty() {
+        format!("commit em {branch}")
+    } else {
+        format!("commit {short} ({branch})")
+    };
+    let mut first_run_id = None;
+    for wf_id in wf_ids {
+        if let Some(rid) = start_run_with_target(
+            sh,
+            &wf_id,
+            &trigger_label,
+            Some((sha.to_string(), message.to_string())),
+            binding.target_server_id.clone(),
+            Some(binding.full_name.clone()),
+            Some(branch.to_string()),
+        ) && first_run_id.is_none()
+        {
+            first_run_id = Some(rid);
+        }
+    }
+    first_run_id
 }
 
 fn finish_cancelled(
@@ -177,7 +286,14 @@ fn finish_cancelled(
     });
 }
 
-fn execute_run(sh: SharedHandle, run_id: String, wf: Workflow) {
+fn execute_run(
+    sh: SharedHandle,
+    run_id: String,
+    wf: Workflow,
+    target_server_override: Option<String>,
+    repo_name: Option<String>,
+    branch: Option<String>,
+) {
     let total = Instant::now();
     for (i, step) in wf.steps.iter().enumerate() {
         if is_cancelled(&sh, &run_id) {
@@ -229,16 +345,30 @@ fn execute_run(sh: SharedHandle, run_id: String, wf: Workflow) {
         });
         let (runner, ssh_host, target_server, workdir) = {
             let s = sh.lock().unwrap();
-            let srv = wf
-                .server_id
-                .as_ref()
-                .and_then(|sid| s.settings.servers.iter().find(|v| &v.id == sid).cloned());
-            (
-                wf.runner,
-                s.settings.ssh_host.clone(),
-                srv,
-                wf.workdir.clone(),
-            )
+            let override_sid = target_server_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|x| !x.is_empty());
+            if let Some(sid) = override_sid {
+                let srv = s.settings.servers.iter().find(|v| v.id == sid).cloned();
+                (
+                    RunnerKind::Ssh,
+                    s.settings.ssh_host.clone(),
+                    srv,
+                    wf.workdir.clone(),
+                )
+            } else {
+                let srv = wf
+                    .server_id
+                    .as_ref()
+                    .and_then(|sid| s.settings.servers.iter().find(|v| &v.id == sid).cloned());
+                (
+                    wf.runner,
+                    s.settings.ssh_host.clone(),
+                    srv,
+                    wf.workdir.clone(),
+                )
+            }
         };
         let (ok, secs) = exec_step(
             &sh,
@@ -292,7 +422,15 @@ fn execute_run(sh: SharedHandle, run_id: String, wf: Workflow) {
     if let Some(next) = &wf.on_success
         && next != &wf.id
     {
-        start_run(&sh, next, "encadeado: fluxo anterior concluído");
+        start_run_with_target(
+            &sh,
+            next,
+            "encadeado: fluxo anterior concluído",
+            None,
+            target_server_override,
+            repo_name,
+            branch,
+        );
     }
 }
 
@@ -516,7 +654,7 @@ pub fn matching_workflows_for_binding(workflows: &[Workflow], binding: &RepoBind
     }
     workflows
         .iter()
-        .filter(|w| w.trigger == Trigger::Push && w.server_id == binding.target_server_id)
+        .filter(|w| w.trigger == Trigger::Push)
         .map(|w| w.id.clone())
         .collect()
 }
@@ -779,11 +917,14 @@ pub fn spawn_github_poller(sh: SharedHandle) {
                                 &message,
                             );
                             for (wf_id, _summary) in triggers {
-                                start_run_full(
+                                start_run_with_target(
                                     &sh,
                                     &wf_id,
                                     "push no GitHub",
                                     Some((sha.clone(), message.clone())),
+                                    b.target_server_id.clone(),
+                                    Some(b.full_name.clone()),
+                                    Some(target_branch.clone()),
                                 );
                             }
                         }
@@ -1109,6 +1250,7 @@ mod tests {
                 enabled: true,
                 last_sha: String::new(),
                 last_status: String::new(),
+                platform: PlatformTarget::CrossPlatform,
             });
         }
 
@@ -1142,6 +1284,7 @@ mod tests {
                 enabled: true,
                 last_sha: String::new(),
                 last_status: String::new(),
+                platform: PlatformTarget::CrossPlatform,
             });
         }
 
@@ -1178,5 +1321,197 @@ mod tests {
         );
         assert_eq!(trig.len(), 1);
         assert_eq!(trig[0].0, "wf-multi");
+    }
+
+    #[test]
+    fn matching_workflows_uses_generic_push_regardless_of_workflow_server_id() {
+        let workflows = vec![
+            Workflow {
+                id: "wf-generic-push".into(),
+                name: "CI Principal".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: Some("wf-deploy".into()),
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-other-vps-push".into(),
+                name: "CI Outro".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: Some("vps-b".into()),
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-manual".into(),
+                name: "Deploy VPS".into(),
+                trigger: Trigger::Manual,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+        ];
+
+        let binding = RepoBinding {
+            id: "rb-1".into(),
+            full_name: "widder/app".into(),
+            target_server_id: Some("vps-a".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnVps,
+            workflow_id: None,
+            enabled: true,
+            last_sha: String::new(),
+            last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
+        };
+
+        let matched = matching_workflows_for_binding(&workflows, &binding);
+        assert_eq!(matched, vec!["wf-generic-push", "wf-other-vps-push"]);
+    }
+
+    #[test]
+    fn start_run_with_target_propagates_repo_branch_and_server_override_across_chain() {
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            s.workflows
+                .push(echo_workflow("wf-ci", false, Some("wf-deploy".into())));
+            s.workflows.push(echo_workflow("wf-deploy", false, None));
+        }
+
+        let rid = start_run_with_target(
+            &sh,
+            "wf-ci",
+            "push",
+            None,
+            None,
+            Some("widder/erp".into()),
+            Some("staging".into()),
+        )
+        .unwrap();
+
+        assert!(wait_status(&sh, &rid, RunStatus::Success, 20_000));
+        let deploy_run = {
+            let start = Instant::now();
+            loop {
+                let found = {
+                    let s = sh.lock().unwrap();
+                    s.runs.iter().find(|r| r.workflow_id == "wf-deploy").cloned()
+                };
+                if let Some(r) = found {
+                    break r;
+                }
+                assert!(start.elapsed().as_secs() < 20);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        assert!(wait_status(&sh, &deploy_run.id, RunStatus::Success, 20_000));
+
+        let s = sh.lock().unwrap();
+        let ci_run = s.runs.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(ci_run.repo_name.as_deref(), Some("widder/erp"));
+        assert_eq!(ci_run.branch, "staging");
+        assert_eq!(deploy_run.repo_name.as_deref(), Some("widder/erp"));
+        assert_eq!(deploy_run.branch, "staging");
+    }
+
+    #[test]
+    fn start_run_for_binding_forces_ssh_on_target_server_even_for_local_recipe() {
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            let mut wf = echo_workflow("wf-generic", false, None);
+            wf.trigger = Trigger::Push;
+            wf.runner = RunnerKind::Local;
+            wf.server_id = None;
+            s.workflows.push(wf);
+            s.settings.servers.push(VpsServer {
+                id: "vps-target".into(),
+                name: "VPS Alvo".into(),
+                host: "192.0.2.55".into(),
+                port: 22,
+                user: "deploy".into(),
+                auth: AuthMethod::PrivateKey {
+                    path: "/nonexistent/workploy_test_missing_key".into(),
+                },
+                last_probe: None,
+                runner_installed: false,
+                runner_port: 8787,
+                webhook_secret_key: None,
+            });
+            s.settings.repo_bindings.push(RepoBinding {
+                id: "rb-ssh".into(),
+                full_name: "widder/service".into(),
+                target_server_id: Some("vps-target".into()),
+                branch: "develop".into(),
+                trigger_mode: TriggerMode::PollOnDesktop,
+                workflow_id: None,
+                enabled: true,
+                last_sha: String::new(),
+                last_status: String::new(),
+                platform: PlatformTarget::CrossPlatform,
+            });
+        }
+
+        let rid = start_run_for_binding(&sh, "rb-ssh", "manual").unwrap();
+        assert!(wait_status(&sh, &rid, RunStatus::Failed, 10_000));
+        let s = sh.lock().unwrap();
+        let r = s.runs.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.repo_name.as_deref(), Some("widder/service"));
+        assert_eq!(r.branch, "develop");
+        assert!(
+            r.steps[0].log.contains("[erro SSH]"),
+            "deveria ter forçado execução SSH na VPS do vínculo, log={}",
+            r.steps[0].log
+        );
+    }
+
+    #[test]
+    fn start_run_for_binding_commit_populates_commit_repo_branch_and_target() {
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            let mut wf = echo_workflow("wf-commit", false, None);
+            wf.trigger = Trigger::Push;
+            s.workflows.push(wf);
+            s.settings.repo_bindings.push(RepoBinding {
+                id: "rb-commit".into(),
+                full_name: "matheuswidder/w-workploy".into(),
+                target_server_id: None,
+                branch: "main".into(),
+                trigger_mode: TriggerMode::PollOnDesktop,
+                workflow_id: None,
+                enabled: true,
+                last_sha: String::new(),
+                last_status: String::new(),
+                platform: PlatformTarget::Windows,
+            });
+        }
+
+        let rid = start_run_for_binding_commit(
+            &sh,
+            "rb-commit",
+            "deadbeef1234567890",
+            "fix(ci): ajusta build do instalador\n\ndetalhes",
+            "release/0.1.8",
+        )
+        .unwrap();
+        assert!(wait_status(&sh, &rid, RunStatus::Success, 10_000));
+        let s = sh.lock().unwrap();
+        let r = s.runs.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.commit.as_deref(), Some("deadbeef1234567890"));
+        assert_eq!(r.title, "fix(ci): ajusta build do instalador");
+        assert_eq!(r.repo_name.as_deref(), Some("matheuswidder/w-workploy"));
+        assert_eq!(r.branch, "release/0.1.8");
+        assert!(r.trigger_label.contains("deadbee"));
     }
 }

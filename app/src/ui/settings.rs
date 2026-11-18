@@ -1,9 +1,9 @@
 use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::{Kit, Switch, TextInput};
-use workploy::model::{CapacityTier, GithubRepoSummary, TriggerMode, VpsServer};
+use workploy::model::{CapacityTier, GithubRepoSummary, PlatformTarget, TriggerMode, VpsServer};
 
 use crate::gfx::MARK_PULSE_RADAR;
-use crate::state::{AppState, ModalState, SettingsTab};
+use crate::state::{AppState, ModalState, SettingsTab, platform_compat_warning};
 use crate::ui::components::{
     btn_danger, btn_ghost, btn_neutral, chip, field_box, header_card, pill_badge,
     primary_button, runner_connected_dot, surface_card, tool_chip,
@@ -656,6 +656,77 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
                     .help("Remove este vínculo de repositório."),
                 );
 
+            let mut title_badges = row()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(
+                    text(format!("{} ({})", b.full_name, b.branch))
+                        .font(ty::BODY_MED)
+                        .color(t.text_primary),
+                )
+                .child(pill_badge(t, &target_name, t.accent, t.accent_soft))
+                .child(pill_badge(
+                    t,
+                    b.trigger_mode.label(),
+                    t.text_secondary,
+                    t.surface_3,
+                ));
+            if b.platform != PlatformTarget::CrossPlatform {
+                title_badges = title_badges.child(
+                    pill_badge(t, b.platform.label(), t.text_secondary, t.surface_3)
+                        .key(format!("binding-platform-{}", b.id)),
+                );
+            }
+
+            let mut info_col = col()
+                .grow(1.0)
+                .shrink()
+                .min_w(190.0)
+                .gap(4.0)
+                .child(title_badges)
+                .child(
+                    text(format!(
+                        "Fluxo: {}  ·  {}{}",
+                        wf_name,
+                        if b.enabled { "" } else { "Pausado · " },
+                        if b.last_status.is_empty() {
+                            "Pronto para sincronizar"
+                        } else {
+                            b.last_status.as_str()
+                        }
+                    ))
+                    .font(ty::CAPTION)
+                    .color(t.text_muted)
+                    .wrap(),
+                );
+            if let Some(warn_msg) = platform_compat_warning(b.platform, b.target_server_id.as_deref())
+            {
+                info_col = info_col.child(
+                    row()
+                        .key(format!("binding-platform-warn-{}", b.id))
+                        .w_full()
+                        .min_w(0.0)
+                        .px(9.0)
+                        .py(6.0)
+                        .gap(6.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(t.warning_bg)
+                        .border(1.0, t.warning.alpha(0.38))
+                        .child(icon(&icons::BOLT, 12.5).color(t.warning).a11y_hidden())
+                        .child(
+                            text(warn_msg)
+                                .font(ty::CAPTION)
+                                .color(t.warning)
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .wrap(),
+                        ),
+                );
+            }
+
             bindings_col = bindings_col.child(
                 row()
                     .key(format!("binding-row-{}", b.id))
@@ -676,46 +747,7 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
                             t.warning.alpha(0.3)
                         },
                     )
-                    .child(
-                        col()
-                            .grow(1.0)
-                            .shrink()
-                            .min_w(190.0)
-                            .gap(3.0)
-                            .child(
-                                row()
-                                    .gap(8.0)
-                                    .center_y()
-                                    .flex_wrap()
-                                    .child(
-                                        text(format!("{} ({})", b.full_name, b.branch))
-                                            .font(ty::BODY_MED)
-                                            .color(t.text_primary),
-                                    )
-                                    .child(pill_badge(t, &target_name, t.accent, t.accent_soft))
-                                    .child(pill_badge(
-                                        t,
-                                        b.trigger_mode.label(),
-                                        t.text_secondary,
-                                        t.surface_3,
-                                    )),
-                            )
-                            .child(
-                                text(format!(
-                                    "Fluxo: {}  ·  {}{}",
-                                    wf_name,
-                                    if b.enabled { "" } else { "Pausado · " },
-                                    if b.last_status.is_empty() {
-                                        "Pronto para sincronizar"
-                                    } else {
-                                        b.last_status.as_str()
-                                    }
-                                ))
-                                .font(ty::CAPTION)
-                                .color(t.text_muted)
-                                .wrap(),
-                            ),
-                    )
+                    .child(info_col)
                     .child(row_actions),
             );
         }

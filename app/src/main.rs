@@ -1479,19 +1479,30 @@ mod tests {
     }
 
     #[test]
-    fn workflow_editor_presets_ssh_targets_and_tooltips_work() {
+    fn workflow_editor_presets_clean_recipe_and_tooltips_work() {
         let mut state = AppState::init_demo();
         state.open_edit_workflow_modal("wf-deploy-vps");
-        if let ModalState::WorkflowEditor(d) = &state.modal {
-            assert_eq!(d.server_id.as_deref(), Some("vps-prod"));
-            assert_eq!(d.repo_id.as_deref(), Some("rb-erp"));
-        } else {
-            panic!("expected WorkflowEditor");
-        }
+        assert!(matches!(state.modal, ModalState::WorkflowEditor(_)));
 
         let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
         rt.frame(0.0);
         rt.frame(1.0 / 60.0);
+
+        // Redundant VPS/repo/runner selectors must be removed from WorkflowEditor
+        for removed in [
+            "ed-run-local",
+            "ed-run-ssh",
+            "ed-srv-default",
+            "ed-srv-vps-prod",
+            "ed-repo-all",
+            "ed-repo-rb-erp",
+        ] {
+            assert!(
+                rt.find(removed).is_none(),
+                "WorkflowEditor must not render redundant control {removed}"
+            );
+        }
+        assert!(rt.find("ed-binding-hint").is_some());
 
         let els = rt.elements();
         for key in [
@@ -1502,12 +1513,6 @@ mod tests {
             "ed-trig-manual",
             "ed-trig-push",
             "ed-trig-folder",
-            "ed-run-local",
-            "ed-run-ssh",
-            "ed-srv-default",
-            "ed-srv-vps-prod",
-            "ed-repo-all",
-            "ed-repo-rb-erp",
             "ed-chain-none",
             "btn-add-step",
         ] {
@@ -1548,21 +1553,7 @@ mod tests {
             }
         }
 
-        // Select VPS Staging + repo rb-landing and save
-        let (sx, sy) = rt
-            .find("ed-srv-vps-staging")
-            .expect("ed-srv-vps-staging exists");
-        rt.pointer_down(sx, sy);
-        rt.pointer_up(sx, sy);
-        rt.frame(1.0 / 60.0);
-
-        let (rx, ry) = rt
-            .find("ed-repo-rb-landing")
-            .expect("ed-repo-rb-landing exists");
-        rt.pointer_down(rx, ry);
-        rt.pointer_up(rx, ry);
-        rt.frame(1.0 / 60.0);
-
+        // Save workflow as clean reusable recipe (server_id/repo_id = None)
         let (svx, svy) = rt.find("ed-save").expect("ed-save exists");
         rt.pointer_down(svx, svy);
         rt.pointer_up(svx, svy);
@@ -1576,18 +1567,17 @@ mod tests {
             .iter()
             .find(|w| w.id == "wf-deploy-vps")
             .unwrap();
-        assert_eq!(saved.server_id.as_deref(), Some("vps-staging"));
-        assert_eq!(saved.repo_id.as_deref(), Some("rb-landing"));
+        assert_eq!(saved.server_id, None);
+        assert_eq!(saved.repo_id, None);
     }
 
     #[test]
-    fn workflow_runs_pipeline_summary_and_local_vps_warning_work() {
+    fn workflow_runs_pipeline_summary_works_without_legacy_local_vps_warning() {
         for vw in [360.0_f32, 768.0, 1440.0] {
             let mut state = AppState::init_demo();
             if vw < 500.0 {
                 state.sidebar_collapsed = true;
             }
-            // Add an active automatic VPS binding so the smart warning triggers on wf-ci-principal (Local + Push)
             state.snapshot.settings.repo_bindings.push(workploy::model::RepoBinding {
                 id: "rb-auto-vps".into(),
                 full_name: "widder/portal-cliente".into(),
@@ -1598,6 +1588,7 @@ mod tests {
                 enabled: true,
                 last_sha: String::new(),
                 last_status: String::new(),
+                platform: workploy::model::PlatformTarget::CrossPlatform,
             });
             state.navigate_to(NavTarget::WorkflowRuns("wf-ci-principal".into()));
 
@@ -1620,30 +1611,122 @@ mod tests {
                 .iter()
                 .find(|e| e.key.as_deref() == Some("wf-pipeline-summary"))
                 .expect("wf-pipeline-summary exists");
-            let warn = els
-                .iter()
-                .find(|e| e.key.as_deref() == Some("wf-local-vps-warning"))
-                .expect("wf-local-vps-warning exists");
             assert!(
                 summary.rect[0] + summary.rect[2] <= vw + 0.5,
                 "pipeline summary overflowed {vw}px: {:?}",
                 summary.rect
             );
             assert!(
-                warn.rect[0] + warn.rect[2] <= vw + 0.5,
-                "warning banner overflowed {vw}px: {:?}",
-                warn.rect
+                rt.find("wf-local-vps-warning").is_none(),
+                "legacy wf-local-vps-warning must be removed"
             );
-
-            // Clicking "Editar fluxo" on warning banner opens WorkflowEditor
-            let (ex, ey) = rt
-                .find("btn-warn-edit-wf")
-                .expect("btn-warn-edit-wf exists");
-            rt.pointer_down(ex, ey);
-            rt.pointer_up(ex, ey);
-            rt.frame(1.0 / 60.0);
-            assert!(matches!(rt.state.modal, ModalState::WorkflowEditor(_)));
         }
+    }
+
+    #[test]
+    fn runs_projects_standby_cards_and_run_binding_now_work() {
+        // 1. Responsive layout across 360px, 768px, 1440px without horizontal overflow
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            let section = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("projects-section"))
+                .expect("projects-section exists");
+            assert!(
+                section.rect[0] + section.rect[2] <= vw + 0.5,
+                "projects-section overflowed {vw}px: {:?}",
+                section.rect
+            );
+            for key in [
+                "project-card-rb-erp",
+                "project-card-rb-landing",
+                "run-binding-rb-erp",
+                "run-binding-rb-landing",
+                "commits-binding-rb-erp",
+                "commits-binding-rb-landing",
+                "cfg-binding-rb-erp",
+                "cfg-binding-rb-landing",
+            ] {
+                let el = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("expected {key} at {vw}px"));
+                assert!(
+                    el.rect[0] + el.rect[2] <= vw + 0.5,
+                    "{key} overflowed {vw}px: {:?}",
+                    el.rect
+                );
+            }
+        }
+
+        // 2. Live status + run_binding_now + Configurar button
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // rb-erp has AwaitingApproval demo run; rb-landing is in standby with last Success
+        assert!(rt.find("project-status-rb-erp").is_some());
+        assert!(rt.find("project-status-rb-landing").is_some());
+
+        // Click "Executar agora" on rb-landing -> creates Running run for widder/landing & emits toast
+        let before_len = rt.state.snapshot.runs.len();
+        let (rx, ry) = rt
+            .find("run-binding-rb-landing")
+            .expect("run-binding-rb-landing exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.snapshot.runs.len(), before_len + 1);
+        assert_eq!(
+            rt.state.snapshot.runs[0].repo_name.as_deref(),
+            Some("widder/landing")
+        );
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.title == "Execução iniciada")
+        );
+
+        // Click "Configurar" on rb-erp -> opens BindingEditor
+        let (cx, cy) = rt
+            .find("cfg-binding-rb-erp")
+            .expect("cfg-binding-rb-erp exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::BindingEditor(_)));
+
+        // 3. Empty state when no bindings exist -> button navigates to Settings -> GitHub
+        let mut empty_state = AppState::init_demo();
+        empty_state.snapshot.settings.repo_bindings.clear();
+        let mut rt_empty =
+            Runtime::new(empty_state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt_empty.frame(0.0);
+        rt_empty.frame(1.0 / 60.0);
+        assert!(rt_empty.find("projects-empty").is_some());
+        let (gx, gy) = rt_empty
+            .find("btn-projects-goto-github")
+            .expect("btn-projects-goto-github exists");
+        rt_empty.pointer_down(gx, gy);
+        rt_empty.pointer_up(gx, gy);
+        rt_empty.frame(1.0 / 60.0);
+        assert_eq!(rt_empty.state.nav, NavTarget::Settings);
+        assert_eq!(rt_empty.state.settings_tab, SettingsTab::GitHub);
     }
 
     #[test]
@@ -1751,5 +1834,263 @@ mod tests {
             .expect("btn-purge-vps-vps-staging exists");
         assert_eq!(stg_set.label.as_deref(), Some("Limpar agora"));
         assert!(!stg_set.focusable);
+    }
+
+    #[test]
+    fn platform_compat_warning_and_binding_selector_work_across_viewports() {
+        use workploy::model::PlatformTarget;
+
+        assert!(state::platform_compat_warning(PlatformTarget::CrossPlatform, None).is_none());
+        assert!(
+            state::platform_compat_warning(PlatformTarget::CrossPlatform, Some("vps-prod"))
+                .is_none()
+        );
+        assert!(state::platform_compat_warning(PlatformTarget::Windows, None).is_none());
+        assert!(
+            state::platform_compat_warning(PlatformTarget::Windows, Some("vps-prod"))
+                .is_some_and(|m| m.contains("Windows"))
+        );
+        assert!(
+            state::platform_compat_warning(PlatformTarget::Linux, Some("vps-prod")).is_none()
+        );
+        if cfg!(target_os = "windows") {
+            assert!(
+                state::platform_compat_warning(PlatformTarget::Linux, None)
+                    .is_some_and(|m| m.contains("Linux"))
+            );
+        }
+        assert!(
+            state::platform_compat_warning(PlatformTarget::MacOS, None)
+                .is_some_and(|m| m.contains("macOS"))
+        );
+
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            state.open_new_binding_modal(None);
+            if let ModalState::BindingEditor(d) = &mut state.modal {
+                d.full_name = rune::TextEdit::new("matheuswidder/w-workploy");
+                d.target_server_id = Some("vps-prod".into());
+                d.platform = PlatformTarget::Windows;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            let dialog = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("binding-modal-dialog"))
+                .expect("binding-modal-dialog exists");
+            let warn = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("bind-platform-warning"))
+                .expect("bind-platform-warning exists");
+            assert!(
+                warn.rect[0] + warn.rect[2] <= dialog.rect[0] + dialog.rect[2] + 0.5,
+                "warning banner overflowed dialog at {vw}px: warn={:?}, dialog={:?}",
+                warn.rect,
+                dialog.rect
+            );
+            for key in [
+                "bind-plat-auto",
+                "bind-plat-windows",
+                "bind-plat-linux",
+                "bind-plat-macos",
+            ] {
+                assert!(rt.find(key).is_some(), "expected {key} at {vw}px");
+            }
+        }
+
+        // Scanning repo auto-updates draft platform & clicking platform chips switches warning
+        let mut state = AppState::init_demo();
+        state.open_edit_binding_modal("rb-erp");
+        if let ModalState::BindingEditor(d) = &mut state.modal {
+            d.full_name = rune::TextEdit::new("matheuswidder/w-workploy");
+            d.target_server_id = Some("vps-prod".into());
+            d.platform = PlatformTarget::CrossPlatform;
+        }
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("bind-platform-warning").is_none());
+
+        for _ in 0..8 {
+            let Some((_, sy)) = rt.find("bind-scan-workflows") else {
+                break;
+            };
+            if sy > 80.0 && sy < 740.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (sx, sy) = rt
+            .find("bind-scan-workflows")
+            .expect("bind-scan-workflows exists");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(1.0 / 60.0);
+
+        if let ModalState::BindingEditor(d) = &rt.state.modal {
+            assert_eq!(d.platform, PlatformTarget::Windows);
+        } else {
+            panic!("expected BindingEditor");
+        }
+        assert!(rt.find("bind-platform-warning").is_some());
+
+        // Switching to Linux clears warning since target is VPS Linux
+        for _ in 0..8 {
+            let Some((_, ly)) = rt.find("bind-plat-linux") else {
+                break;
+            };
+            if ly > 80.0 && ly < 740.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, 240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (lx, ly) = rt.find("bind-plat-linux").expect("bind-plat-linux exists");
+        rt.pointer_down(lx, ly);
+        rt.pointer_up(lx, ly);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("bind-platform-warning").is_none());
+
+        // Save binding and verify badge appears in Runs
+        let (svx, svy) = rt.find("bind-save").expect("bind-save exists");
+        rt.pointer_down(svx, svy);
+        rt.pointer_up(svx, svy);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::None));
+        assert!(rt.find("project-platform-rb-erp").is_some());
+
+        // Also check incompatible card warning renders cleanly in Runs & Settings across 360px/768px/1440px
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut s_runs = AppState::init_demo();
+            if vw < 500.0 {
+                s_runs.sidebar_collapsed = true;
+            }
+            s_runs.snapshot.settings.repo_bindings[0].platform = PlatformTarget::Windows;
+            let mut rt_runs = Runtime::new(s_runs, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt_runs.frame(0.0);
+            rt_runs.frame(1.0 / 60.0);
+            let els_runs = rt_runs.elements();
+            let w_card = els_runs
+                .iter()
+                .find(|e| e.key.as_deref() == Some("project-platform-warn-rb-erp"))
+                .expect("project-platform-warn-rb-erp exists");
+            assert!(w_card.rect[0] + w_card.rect[2] <= vw + 0.5);
+
+            let mut s_set = AppState::init_demo();
+            if vw < 500.0 {
+                s_set.sidebar_collapsed = true;
+            }
+            s_set.snapshot.settings.repo_bindings[0].platform = PlatformTarget::Windows;
+            s_set.open_settings(SettingsTab::GitHub);
+            let mut rt_set = Runtime::new(s_set, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt_set.frame(0.0);
+            rt_set.frame(1.0 / 60.0);
+            assert!(rt_set.find("binding-platform-rb-erp").is_some());
+            assert!(rt_set.find("binding-platform-warn-rb-erp").is_some());
+        }
+    }
+
+    #[test]
+    fn repo_commits_modal_fetches_branch_and_runs_commit() {
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            assert!(rt.find("commits-binding-rb-erp").is_some());
+            let (cx, cy) = rt
+                .find("commits-binding-rb-erp")
+                .expect("commits-binding-rb-erp exists");
+            rt.pointer_down(cx, cy);
+            rt.pointer_up(cx, cy);
+            rt.frame(1.0 / 60.0);
+
+            assert!(matches!(rt.state.modal, ModalState::RepoCommits { .. }));
+            assert_eq!(rt.state.snapshot.repo_commits.len(), 3);
+
+            let els = rt.elements();
+            let dialog = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("commits-modal-dialog"))
+                .expect("commits-modal-dialog exists");
+            assert!(dialog.rect[2] <= vw + 0.5);
+
+            for idx in 0..3 {
+                assert!(rt.find(&format!("commit-row-{idx}")).is_some());
+                assert!(rt.find(&format!("commit-badge-{idx}")).is_some());
+                assert!(rt.find(&format!("commit-run-{idx}")).is_some());
+            }
+        }
+
+        // Branch fetch + run commit flow
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        let (cx, cy) = rt
+            .find("commits-binding-rb-landing")
+            .expect("commits-binding-rb-landing exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+
+        // Commit 0 (f3e8d21) is Pendente; Commit 1 (c06c3c1) is Já rodou in demo runs
+        let els = rt.elements();
+        let b0 = els
+            .iter()
+            .find(|e| e.key.as_deref() == Some("commit-badge-0"))
+            .unwrap();
+        let b1 = els
+            .iter()
+            .find(|e| e.key.as_deref() == Some("commit-badge-1"))
+            .unwrap();
+        assert_eq!(b0.text.as_deref().or(b0.label.as_deref()), None);
+
+        // Edit branch to "staging" and click "Buscar commits"
+        if let ModalState::RepoCommits { branch_input, .. } = &mut rt.state.modal {
+            *branch_input = rune::TextEdit::new("staging");
+        }
+        let (fx, fy) = rt
+            .find("commits-fetch-btn")
+            .expect("commits-fetch-btn exists");
+        rt.pointer_down(fx, fy);
+        rt.pointer_up(fx, fy);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.snapshot.repo_commits_branch, "staging");
+        assert_eq!(rt.state.snapshot.repo_commits[0].short_sha, "9c12ab3");
+
+        // Click "▶ Rodar fluxo" on commit 0 -> closes modal, creates run with SHA & branch, shows toast
+        let before_runs = rt.state.snapshot.runs.len();
+        let (rx, ry) = rt.find("commit-run-0").expect("commit-run-0 exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+
+        assert!(matches!(rt.state.modal, ModalState::None));
+        assert_eq!(rt.state.nav, NavTarget::Runs);
+        assert_eq!(rt.state.snapshot.runs.len(), before_runs + 1);
+        assert_eq!(
+            rt.state.snapshot.runs[0].commit.as_deref(),
+            Some("9c12ab34cd56ef78901234567890abcdef123456")
+        );
+        assert_eq!(rt.state.snapshot.runs[0].branch, "staging");
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.title.contains("9c12ab3"))
+        );
+        let _ = (b0, b1);
     }
 }
