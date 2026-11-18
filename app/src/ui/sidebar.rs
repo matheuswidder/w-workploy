@@ -3,7 +3,7 @@ use rune::tok::motion;
 use rune::{Cursor, El, Icon, TextStyle, col, el, icon, row, text};
 
 use crate::state::{AppState, NavTarget};
-use crate::ui::components::runner_connected_dot;
+use crate::ui::components::health_pulse_dot;
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
@@ -40,25 +40,31 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
     let mut sel_y = y;
     let mut items: Vec<El> = Vec::new();
 
-    // 1. Início / Onboarding
-    let is_onb = selected_id == "nav-onboarding";
-    if is_onb {
-        sel_y = y;
+    // 1. Início / Onboarding (apenas na 1ª vez ou quando reaberto manualmente)
+    let show_onboarding_nav = !s.snapshot.settings.onboarding_completed
+        || matches!(s.nav, NavTarget::Onboarding)
+        || (matches!(s.nav, NavTarget::RunDetail { .. })
+            && matches!(s.previous_list_nav, NavTarget::Onboarding));
+    if show_onboarding_nav {
+        let is_onb = selected_id == "nav-onboarding";
+        if is_onb {
+            sel_y = y;
+        }
+        items.push(nav_row(
+            t,
+            "nav-onboarding",
+            "Guia inicial",
+            &icons::HOME,
+            None,
+            is_onb,
+            collapsed,
+            PILL_INSET,
+            y,
+            pill_w,
+            |s: &mut AppState| s.navigate_to(NavTarget::Onboarding),
+        ));
+        y += ROW_PITCH;
     }
-    items.push(nav_row(
-        t,
-        "nav-onboarding",
-        "Início",
-        &icons::HOME,
-        None,
-        is_onb,
-        collapsed,
-        PILL_INSET,
-        y,
-        pill_w,
-        |s: &mut AppState| s.navigate_to(NavTarget::Onboarding),
-    ));
-    y += ROW_PITCH;
 
     // 2. Execuções
     let is_runs = selected_id == "nav-runs";
@@ -240,21 +246,16 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
     if is_conn {
         sel_y = y;
     }
-    let runner_ok = s.snapshot.settings.servers.iter().any(|srv| {
-        srv.runner_installed || srv.last_probe.as_ref().is_some_and(|p| p.ok)
-    }) || s
-        .snapshot
-        .ssh_test
-        .as_ref()
-        .is_some_and(|(ok, _)| *ok)
-        || s.snapshot.settings.has_github_token;
-    let runner_dot = (!collapsed).then(|| runner_connected_dot(t, runner_ok));
+    let conn_dot = (!collapsed)
+        .then(|| s.sidebar_connections_indicator())
+        .flatten()
+        .map(|health| health_pulse_dot(t, health));
     items.push(nav_row(
         t,
         "nav-connections",
         "Conexões & Diagnóstico",
         &icons::ACTIVITY,
-        runner_dot,
+        conn_dot,
         is_conn,
         collapsed,
         PILL_INSET,

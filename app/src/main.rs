@@ -5,8 +5,22 @@ mod gfx;
 mod state;
 mod ui;
 
-use rune::{App, AppSpec, Key, KeyEvent, Tx};
+use rune::{App, AppSpec, Key, KeyEvent, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec, Tx};
 use state::{AppState, ModalState, poll_app, setup_app};
+
+fn load_tray_icon() -> Option<TrayIcon> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    Some(TrayIcon::rgba(w, h, img.into_raw()))
+}
+
+fn on_close(s: &mut AppState, tx: &mut Tx) {
+    if !s.snapshot.settings.minimize_to_tray {
+        tx.quit();
+    }
+}
 
 fn on_key(s: &mut AppState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     if ev.key == Key::Escape {
@@ -51,9 +65,34 @@ fn main() {
         ..AppSpec::new("Workploy", (1280.0, 820.0), AppState::init_live, ui::view)
     };
 
-    App::new(spec)
+    let app = App::new(spec)
         .compositor(gfx::WorkployGfx::default())
-        .run();
+        .keep_running()
+        .on_close(on_close);
+
+    let _tray = if !rune::tooling::is_headless() {
+        load_tray_icon().and_then(|tray_icon| {
+            let handle = app.handle();
+            let tray_spec = TraySpec::new("br.com.widder.workploy", "Workploy", tray_icon)
+                .tooltip("Workploy — CI/CD & Deploy self-hosted")
+                .menu(vec![
+                    TrayItem::action("open", "Abrir Workploy"),
+                    TrayItem::Separator,
+                    TrayItem::action("quit", "Sair"),
+                ]);
+            Tray::new(tray_spec, move |ev| match ev {
+                TrayEvent::Activate { .. } => handle.open(),
+                TrayEvent::Menu(id) if id == "open" => handle.open(),
+                TrayEvent::Menu(id) if id == "quit" => handle.quit(),
+                _ => {}
+            })
+            .ok()
+        })
+    } else {
+        None
+    };
+
+    app.run();
 }
 
 #[cfg(test)]
@@ -724,5 +763,213 @@ mod tests {
             .last()
             .expect("update info toast emitted");
         assert_eq!(last.options.kind, state::ToastKind::Info);
+    }
+
+    #[test]
+    fn binding_editor_branch_chips_and_workflow_scan_work() {
+        let mut state = AppState::init_demo();
+        state.open_settings(SettingsTab::GitHub);
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+
+        // Open BindingEditor prefilled with first repo ("widder/erp-central") via pointer click
+        let (rx, ry) = rt
+            .find("btn-bind-repo-0")
+            .expect("btn-bind-repo-0 exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::BindingEditor(_)));
+
+        // Click "Buscar branches"
+        let (bx, by) = rt
+            .find("bind-fetch-branches")
+            .expect("bind-fetch-branches exists");
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            rt.state.snapshot.repo_branches,
+            vec!["main", "dev", "staging"]
+        );
+
+        // Click "Todas (*)"
+        let (ax, ay) = rt
+            .find("bind-branch-all")
+            .expect("bind-branch-all exists");
+        rt.pointer_down(ax, ay);
+        rt.pointer_up(ax, ay);
+        rt.frame(1.0 / 60.0);
+        if let ModalState::BindingEditor(d) = &rt.state.modal {
+            assert_eq!(d.branch.text, "*");
+        } else {
+            panic!("expected BindingEditor");
+        }
+
+        // Click "Nenhuma"
+        let (nx, ny) = rt
+            .find("bind-branch-none")
+            .expect("bind-branch-none exists");
+        rt.pointer_down(nx, ny);
+        rt.pointer_up(nx, ny);
+        rt.frame(1.0 / 60.0);
+        if let ModalState::BindingEditor(d) = &rt.state.modal {
+            assert_eq!(d.branch.text, "");
+        }
+
+        // Select multi-branch chips: main + dev -> "main,dev"
+        let (b0x, b0y) = rt
+            .find("bind-branch-opt-0")
+            .expect("bind-branch-opt-0 exists");
+        rt.pointer_down(b0x, b0y);
+        rt.pointer_up(b0x, b0y);
+        rt.frame(1.0 / 60.0);
+        let (b1x, b1y) = rt
+            .find("bind-branch-opt-1")
+            .expect("bind-branch-opt-1 exists");
+        rt.pointer_down(b1x, b1y);
+        rt.pointer_up(b1x, b1y);
+        rt.frame(1.0 / 60.0);
+        if let ModalState::BindingEditor(d) = &rt.state.modal {
+            assert_eq!(d.branch.text, "main,dev");
+        }
+
+        // Toggle "main" off -> "dev"
+        let (b0x2, b0y2) = rt
+            .find("bind-branch-opt-0")
+            .expect("bind-branch-opt-0 exists");
+        rt.pointer_down(b0x2, b0y2);
+        rt.pointer_up(b0x2, b0y2);
+        rt.frame(1.0 / 60.0);
+        if let ModalState::BindingEditor(d) = &rt.state.modal {
+            assert_eq!(d.branch.text, "dev");
+        }
+
+        // Click "Buscar fluxos no repo"
+        let (wx, wy) = rt
+            .find("bind-scan-workflows")
+            .expect("bind-scan-workflows exists");
+        rt.pointer_down(wx, wy);
+        rt.pointer_up(wx, wy);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.snapshot.repo_workflows.is_empty());
+        assert!(rt.find("bind-detected-workflows").is_some());
+    }
+
+    #[test]
+    fn smart_sidebar_pulse_and_connections_alerts_work() {
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+
+        // Initially healthy & not seen -> green pulse shown
+        assert_eq!(rt.state.connections_health(), state::ConnectionsHealth::Healthy);
+        assert!(!rt.state.connections_seen_healthy);
+        assert!(rt.find("sidebar-conn-pulse-healthy").is_some());
+
+        // Click Conexões & Diagnóstico while healthy -> green pulse disappears
+        let (cx, cy) = rt
+            .find("nav-connections")
+            .expect("nav-connections exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.connections_seen_healthy);
+        assert!(rt.find("sidebar-conn-pulse-healthy").is_none());
+
+        // Trigger CPU >= 80% on VPS Staging -> Warning pulse + alert banner in Connections
+        rt.update(|s, _| {
+            if let Some(p) = &mut s.snapshot.settings.servers[1].last_probe {
+                p.cpu_usage_pct = 86;
+            }
+            s.sync_connections_health_seen();
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.connections_health(), state::ConnectionsHealth::Warning);
+        assert!(!rt.state.connections_seen_healthy);
+        assert!(rt.find("sidebar-conn-pulse-warning").is_some());
+        assert!(rt.find("connections-health-alert-banner").is_some());
+
+        // Trigger failed probe -> Danger pulse
+        rt.update(|s, _| {
+            if let Some(p) = &mut s.snapshot.settings.servers[0].last_probe {
+                p.ok = false;
+            }
+            s.sync_connections_health_seen();
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.connections_health(), state::ConnectionsHealth::Danger);
+        assert!(rt.find("sidebar-conn-pulse-danger").is_some());
+    }
+
+    #[test]
+    fn onboarding_completion_reopen_and_tray_toggle_work() {
+        let mut state = AppState::init_demo();
+        demo::scene_onboarding(&mut state);
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert_eq!(rt.state.nav, NavTarget::Onboarding);
+        assert!(rt.find("nav-onboarding").is_some());
+
+        // Scroll to bottom of onboarding if needed and click "Concluir configuração inicial"
+        for _ in 0..8 {
+            let Some((_, by)) = rt.find("onb-btn-complete") else { break };
+            if by > 80.0 && by < 780.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (bx, by) = rt
+            .find("onb-btn-complete")
+            .expect("onb-btn-complete exists");
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.snapshot.settings.onboarding_completed);
+        assert_eq!(rt.state.nav, NavTarget::Runs);
+        assert!(rt.find("nav-onboarding").is_none());
+
+        // Open Settings -> Appearance and toggle minimize_to_tray
+        let (sx, sy) = rt.find("nav-settings").expect("nav-settings exists");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(1.0 / 60.0);
+
+        let (apx, apy) = rt
+            .find("tab-settings-appearance")
+            .expect("tab-settings-appearance exists");
+        rt.pointer_down(apx, apy);
+        rt.pointer_up(apx, apy);
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.state.snapshot.settings.minimize_to_tray);
+        let (tx, ty) = rt
+            .find("app-minimize-to-tray")
+            .expect("app-minimize-to-tray exists");
+        rt.pointer_down(tx, ty);
+        rt.pointer_up(tx, ty);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.snapshot.settings.minimize_to_tray);
+
+        // Open About tab and reopen onboarding
+        let (abx, aby) = rt
+            .find("tab-settings-about")
+            .expect("tab-settings-about exists");
+        rt.pointer_down(abx, aby);
+        rt.pointer_up(abx, aby);
+        rt.frame(1.0 / 60.0);
+
+        let (rx, ry) = rt
+            .find("btn-reopen-onboarding")
+            .expect("btn-reopen-onboarding exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.nav, NavTarget::Onboarding);
     }
 }

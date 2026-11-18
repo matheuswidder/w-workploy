@@ -266,6 +266,10 @@ pub struct VpsProbeResult {
     #[serde(default)]
     pub disk_free_gb: u64,
     #[serde(default)]
+    pub cpu_usage_pct: u8,
+    #[serde(default)]
+    pub disk_used_pct: u8,
+    #[serde(default)]
     pub has_git: bool,
     #[serde(default)]
     pub has_docker: bool,
@@ -474,6 +478,13 @@ impl Default for PurgeRule {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectedWorkflow {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReleaseInfo {
     pub tag_name: String,
@@ -515,6 +526,10 @@ pub struct Settings {
     pub github_user: String,
     #[serde(default)]
     pub purge_rule: PurgeRule,
+    #[serde(default)]
+    pub onboarding_completed: bool,
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -533,6 +548,8 @@ impl Default for Settings {
             repo_bindings: Vec::new(),
             github_user: String::new(),
             purge_rule: PurgeRule::default(),
+            onboarding_completed: false,
+            minimize_to_tray: true,
         }
     }
 }
@@ -572,6 +589,22 @@ pub struct Shared {
     pub latest_release: Option<ReleaseInfo>,
     #[serde(skip)]
     pub update_last_event: Option<(u64, bool, String)>,
+    #[serde(skip)]
+    pub repo_branches_loading: bool,
+    #[serde(skip)]
+    pub repo_branches_repo: String,
+    #[serde(skip)]
+    pub repo_branches: Vec<String>,
+    #[serde(skip)]
+    pub repo_branches_status: String,
+    #[serde(skip)]
+    pub repo_workflows_loading: bool,
+    #[serde(skip)]
+    pub repo_workflows_repo: String,
+    #[serde(skip)]
+    pub repo_workflows: Vec<DetectedWorkflow>,
+    #[serde(skip)]
+    pub repo_workflows_status: String,
     #[serde(skip)]
     pub wake: Option<WakeFn>,
 }
@@ -717,10 +750,21 @@ pub fn save_settings(s: &Shared) {
 }
 
 pub fn load_shared_from_dir(dir: &std::path::Path) -> Shared {
+    let settings_raw = std::fs::read_to_string(dir.join("settings.json")).ok();
+    let has_explicit_onboarding = settings_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| v.get("onboarding_completed").map(|_| ()))
+        .is_some();
+    let loaded_settings: Settings = settings_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+
     let mut s = Shared {
         workflows: read_json(dir.join("workflows.json")).unwrap_or_default(),
         runs: read_json(dir.join("runs.json")).unwrap_or_default(),
-        settings: read_json(dir.join("settings.json")).unwrap_or_default(),
+        settings: loaded_settings,
         ..Default::default()
     };
 
@@ -737,6 +781,14 @@ pub fn load_shared_from_dir(dir: &std::path::Path) -> Shared {
     {
         s.settings.github_token = tok;
         s.settings.has_github_token = true;
+    }
+
+    if !has_explicit_onboarding
+        && (s.settings.has_github_token
+            || !s.settings.servers.is_empty()
+            || !s.settings.repo_bindings.is_empty())
+    {
+        s.settings.onboarding_completed = true;
     }
 
     // Execuções interrompidas (app fechado no meio) não ficam "executando" para sempre.
@@ -1420,5 +1472,42 @@ mod duration_tests {
         let json = serde_json::to_string(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.purge_rule, custom);
+        assert!(legacy_settings.minimize_to_tray);
+        assert!(!legacy_settings.onboarding_completed);
+    }
+
+    #[test]
+    fn onboarding_auto_completes_for_existing_installations_unless_explicit() {
+        let _guard = vault::test_lock();
+        let _ = vault::delete_secret(vault::KEY_GITHUB_PAT);
+
+        let tmp = std::env::temp_dir().join(format!("workploy-onboard-test-{}", new_id("dir")));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Sem configuração prévia -> onboarding_completed = false
+        std::fs::write(tmp.join("settings.json"), r#"{}"#).unwrap();
+        let fresh = load_shared_from_dir(&tmp);
+        assert!(!fresh.settings.onboarding_completed);
+        assert!(fresh.settings.minimize_to_tray);
+
+        // 2. JSON legado com servidor cadastrado e sem campo onboarding_completed -> true
+        std::fs::write(
+            tmp.join("settings.json"),
+            r#"{"servers":[{"id":"vps-1","name":"Prod","host":"10.0.0.1"}]}"#,
+        )
+        .unwrap();
+        let migrated = load_shared_from_dir(&tmp);
+        assert!(migrated.settings.onboarding_completed);
+
+        // 3. Explícito false deve ser respeitado mesmo com servidores cadastrados
+        std::fs::write(
+            tmp.join("settings.json"),
+            r#"{"onboarding_completed":false,"servers":[{"id":"vps-1","name":"Prod","host":"10.0.0.1"}]}"#,
+        )
+        .unwrap();
+        let explicit_false = load_shared_from_dir(&tmp);
+        assert!(!explicit_false.settings.onboarding_completed);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

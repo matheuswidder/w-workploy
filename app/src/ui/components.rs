@@ -5,7 +5,7 @@ use rune_kit::{Kit, Toast, ToastEvent, ToastRegion};
 use workploy::model::{RunStatus, StepStatus};
 
 use crate::gfx::{MARK_PULSE_BREATHE, MARK_PULSE_RADAR};
-use crate::state::{AppState, ToastKind};
+use crate::state::{AppState, ConnectionsHealth, ToastKind};
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
@@ -358,6 +358,49 @@ pub fn runner_connected_dot(t: UiTheme, connected: bool) -> El {
         d = d.child(el().size(8.0, 8.0).radius(4.0).fill(t.text_muted));
     }
     d
+}
+
+pub fn health_pulse_dot(t: UiTheme, health: ConnectionsHealth) -> El {
+    let (key, mark, color_idx, dot_color, reach, period, intensity) = match health {
+        ConnectionsHealth::Healthy => (
+            "sidebar-conn-pulse-healthy",
+            MARK_PULSE_BREATHE,
+            1.0,
+            t.success,
+            6.0,
+            2.6,
+            0.55,
+        ),
+        ConnectionsHealth::Warning => (
+            "sidebar-conn-pulse-warning",
+            MARK_PULSE_BREATHE,
+            2.0,
+            t.warning,
+            7.0,
+            2.0,
+            0.65,
+        ),
+        ConnectionsHealth::Danger => (
+            "sidebar-conn-pulse-danger",
+            MARK_PULSE_RADAR,
+            3.0,
+            t.danger,
+            8.0,
+            1.5,
+            0.75,
+        ),
+    };
+    el().key(key)
+        .size(8.0, 8.0)
+        .center()
+        .child(
+            effect(mark)
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(4.0)
+                .effect_bleed(reach)
+                .effect_data([color_idx, reach, period, intensity]),
+        )
+        .child(el().size(8.0, 8.0).radius(4.0).fill(dot_color))
 }
 
 pub fn copyable_sha(t: UiTheme, key: impl Into<String>, full_sha: &str) -> El {

@@ -148,7 +148,7 @@ pub fn view(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> El {
             }
         }
         SettingsTab::Appearance => {
-            scroll_col = scroll_col.child(appearance_card(s, t));
+            scroll_col = scroll_col.child(appearance_card(s, t, k));
         }
         SettingsTab::About => {
             scroll_col = scroll_col.child(about_card(s, t));
@@ -1389,7 +1389,7 @@ fn provision_log_card(s: &AppState, t: UiTheme) -> El {
     )
 }
 
-fn appearance_card(s: &AppState, t: UiTheme) -> El {
+fn appearance_card(s: &AppState, t: UiTheme, k: &Kit) -> El {
     let theme_row = row()
         .w_full()
         .px(14.0)
@@ -1506,6 +1506,47 @@ fn appearance_card(s: &AppState, t: UiTheme) -> El {
                 ),
         );
 
+    let tray_row = row()
+        .w_full()
+        .px(14.0)
+        .py(14.0)
+        .gap(14.0)
+        .center_y()
+        .justify_between()
+        .flex_wrap()
+        .radius(10.0)
+        .fill(t.surface_2)
+        .border(1.0, t.border_subtle)
+        .child(
+            col()
+                .grow(1.0)
+                .shrink()
+                .min_w(180.0)
+                .gap(2.0)
+                .child(
+                    text("Minimizar para a bandeja ao fechar")
+                        .font(ty::BODY_MED)
+                        .color(t.text_primary),
+                )
+                .child(
+                    text("Ao fechar a janela, o Workploy continua rodando na bandeja do sistema (System Tray) para manter o monitoramento ativo.")
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .wrap(),
+                ),
+        )
+        .child(
+            Switch::new(s.snapshot.settings.minimize_to_tray)
+                .label("Ativo")
+                .on_toggle_tx(|s: &mut AppState, tx: &mut Tx| {
+                    s.toggle_minimize_to_tray(tx);
+                })
+                .build(k)
+                .key("app-minimize-to-tray")
+                .cursor(Cursor::Pointer)
+                .help("Mantém o aplicativo oculto na bandeja do sistema ao fechar a janela."),
+        );
+
     surface_card(
         t,
         "settings-appearance-card",
@@ -1523,13 +1564,14 @@ fn appearance_card(s: &AppState, t: UiTheme) -> El {
                             .color(t.text_primary),
                     )
                     .child(
-                        text("Ajuste visual rápido da interface.")
+                        text("Ajuste visual rápido da interface e comportamento da janela.")
                             .font(ty::CAPTION)
                             .color(t.text_muted),
                     ),
             )
             .child(theme_row)
-            .child(anim_row),
+            .child(anim_row)
+            .child(tray_row),
     )
 }
 
@@ -1812,6 +1854,36 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
 
         body = body.child(rel_col);
     }
+
+    body = body.child(
+        row()
+            .w_full()
+            .px(14.0)
+            .py(10.0)
+            .justify_between()
+            .center_y()
+            .flex_wrap()
+            .gap(8.0)
+            .radius(8.0)
+            .fill(t.surface_2)
+            .border(1.0, t.border_subtle)
+            .child(
+                text("Primeiras configurações e atalhos iniciais")
+                    .font(ty::SMALL)
+                    .color(t.text_muted),
+            )
+            .child(
+                btn_ghost(
+                    t,
+                    "btn-reopen-onboarding",
+                    "Reabrir guia inicial (Onboarding)",
+                    Some(&icons::HOME),
+                    30.0,
+                    |s: &mut AppState, _| s.reopen_onboarding(),
+                )
+                .help("Abre novamente o guia inicial do Workploy."),
+            ),
+    );
 
     surface_card(t, "settings-about-card", 12.0, body)
 }

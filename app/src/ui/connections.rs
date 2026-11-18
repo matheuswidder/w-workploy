@@ -2,10 +2,12 @@ use rune::{El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use workploy::model::{CapacityTier, VpsServer};
 
 use crate::gfx::MARK_PULSE_RADAR;
-use crate::state::{AppState, SettingsTab};
+use crate::state::{
+    AppState, ConnectionsHealth, SettingsTab, vps_health_status, vps_ram_used_pct,
+};
 use crate::ui::components::{
-    btn_ghost, btn_neutral, header_card, pill_badge, runner_connected_dot, surface_card,
-    tool_chip,
+    btn_ghost, btn_neutral, header_card, health_pulse_dot, pill_badge, runner_connected_dot,
+    surface_card, tool_chip,
 };
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -123,6 +125,66 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                         .grow(1.0)
                         .shrink()
                         .wrap(),
+                ),
+        );
+    }
+
+    let mut alert_entries: Vec<(ConnectionsHealth, String)> = Vec::new();
+    for srv in &s.snapshot.settings.servers {
+        let (h, alerts) = vps_health_status(srv);
+        if h != ConnectionsHealth::Healthy && !alerts.is_empty() {
+            alert_entries.push((h, format!("{}: {}", srv.name, alerts.join(" · "))));
+        }
+    }
+    if !alert_entries.is_empty() {
+        let has_danger = alert_entries
+            .iter()
+            .any(|(h, _)| *h == ConnectionsHealth::Danger);
+        let (bg, border, fg, title, ic) = if has_danger {
+            (
+                t.danger_bg,
+                t.danger.alpha(0.42),
+                t.danger,
+                "Atenção: falha de conexão ou agente inativo em VPS",
+                &icons::X_CIRCLE,
+            )
+        } else {
+            (
+                t.warning_bg,
+                t.warning.alpha(0.45),
+                t.warning,
+                "Alerta de capacidade (CPU, RAM ou Disco acima de 80%)",
+                &icons::BOLT,
+            )
+        };
+        let mut alert_lines = col().w_full().gap(3.0);
+        for (_, line) in &alert_entries {
+            alert_lines = alert_lines.child(
+                text(line.clone())
+                    .font(ty::SMALL)
+                    .color(t.text_primary)
+                    .wrap(),
+            );
+        }
+        scroll_col = scroll_col.child(
+            row()
+                .key("connections-health-alert-banner")
+                .w_full()
+                .px(14.0)
+                .py(12.0)
+                .gap(10.0)
+                .radius(10.0)
+                .fill(bg)
+                .border(1.0, border)
+                .child(icon(ic, 16.0).color(fg))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .gap(4.0)
+                        .child(text(title).font(ty::BODY_MED).color(fg))
+                        .child(alert_lines),
                 ),
         );
     }
@@ -434,12 +496,12 @@ fn vps_diagnostics_card(s: &AppState, t: UiTheme) -> El {
 fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
     let is_probing = s.snapshot.probing_server_id.as_deref() == Some(srv.id.as_str());
     let is_provisioning = s.snapshot.provisioning_server_id.as_deref() == Some(srv.id.as_str());
+    let (srv_health, srv_alerts) = vps_health_status(srv);
     let probe_ok = srv.last_probe.as_ref().is_some_and(|p| p.ok);
     let runner_online = srv
         .last_probe
         .as_ref()
-        .is_some_and(|p| p.ok && (p.runner_active || srv.runner_installed))
-        || probe_ok;
+        .is_some_and(|p| p.ok && (!p.has_widder_runner || p.runner_active));
 
     let status_dot = if is_probing || is_provisioning {
         el().size(8.0, 8.0)
@@ -452,6 +514,8 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                     .effect_data([4.0, 10.0, 1.4, 0.0]),
             )
             .child(el().size(8.0, 8.0).radius(4.0).fill(t.info))
+    } else if srv.last_probe.is_some() && srv_health != ConnectionsHealth::Healthy {
+        health_pulse_dot(t, srv_health)
     } else {
         runner_connected_dot(t, runner_online)
     };
@@ -553,10 +617,16 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
         .fill(t.surface_2)
         .border(
             1.0,
-            if runner_online {
-                t.success.alpha(0.32)
-            } else {
-                t.border_subtle
+            match srv_health {
+                ConnectionsHealth::Danger => t.danger.alpha(0.45),
+                ConnectionsHealth::Warning => t.warning.alpha(0.45),
+                ConnectionsHealth::Healthy => {
+                    if probe_ok && runner_online {
+                        t.success.alpha(0.32)
+                    } else {
+                        t.border_subtle
+                    }
+                }
             },
         )
         .child(
@@ -609,13 +679,17 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 CapacityTier::Light => (t.warning, t.warning_bg),
                 CapacityTier::Insufficient => (t.danger, t.danger_bg),
             };
+            let ram_pct = vps_ram_used_pct(probe);
             let specs_line = format!(
-                "{} ({})  ·  {} vCPU  ·  {:.1}/{:.1} GB RAM livres  ·  {} GB disco livre  ·  Verificado: {}",
+                "{} ({})  ·  {} vCPU (CPU {}%)  ·  RAM {}% ({:.1}/{:.1} GB livres)  ·  Disco {}% ({} GB livres)  ·  Verificado: {}",
                 probe.os,
                 probe.arch,
                 probe.vcpus,
+                probe.cpu_usage_pct,
+                ram_pct,
                 probe.ram_free_mb as f64 / 1024.0,
                 probe.ram_total_mb as f64 / 1024.0,
+                probe.disk_used_pct,
                 probe.disk_free_gb,
                 probe.checked_at
             );
@@ -639,45 +713,85 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                     probe.has_widder_runner,
                 ));
 
-            card = card.child(
-                col()
-                    .w_full()
-                    .px(12.0)
-                    .py(10.0)
-                    .gap(8.0)
-                    .radius(8.0)
-                    .fill(t.surface_1)
-                    .border(1.0, t.border_subtle)
-                    .child(
-                        row()
-                            .w_full()
-                            .justify_between()
-                            .center_y()
-                            .flex_wrap()
-                            .gap(8.0)
-                            .child(
-                                text(specs_line)
-                                    .font(ty::CAPTION)
-                                    .color(t.text_secondary)
-                                    .grow(1.0)
-                                    .shrink()
-                                    .wrap(),
-                            )
-                            .child(pill_badge(
-                                t,
-                                &format!("Capacidade {}", probe.tier.label()),
-                                tier_fg,
-                                tier_bg,
-                            )),
+            let mut details_col = col()
+                .w_full()
+                .px(12.0)
+                .py(10.0)
+                .gap(8.0)
+                .radius(8.0)
+                .fill(t.surface_1)
+                .border(1.0, t.border_subtle)
+                .child(
+                    row()
+                        .w_full()
+                        .justify_between()
+                        .center_y()
+                        .flex_wrap()
+                        .gap(8.0)
+                        .child(
+                            text(specs_line)
+                                .font(ty::CAPTION)
+                                .color(t.text_secondary)
+                                .grow(1.0)
+                                .shrink()
+                                .wrap(),
+                        )
+                        .child(pill_badge(
+                            t,
+                            &format!("Capacidade {}", probe.tier.label()),
+                            tier_fg,
+                            tier_bg,
+                        )),
+                )
+                .child(tools_row)
+                .child(
+                    text(probe.verdict.clone())
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .wrap(),
+                );
+
+            if !srv_alerts.is_empty() {
+                let is_danger = srv_health == ConnectionsHealth::Danger;
+                let (abg, abd, afg, aic) = if is_danger {
+                    (
+                        t.danger_bg,
+                        t.danger.alpha(0.35),
+                        t.danger,
+                        &icons::X_CIRCLE,
                     )
-                    .child(tools_row)
-                    .child(
-                        text(probe.verdict.clone())
-                            .font(ty::CAPTION)
-                            .color(t.text_muted)
-                            .wrap(),
-                    ),
-            );
+                } else {
+                    (
+                        t.warning_bg,
+                        t.warning.alpha(0.4),
+                        t.warning,
+                        &icons::BOLT,
+                    )
+                };
+                details_col = details_col.child(
+                    row()
+                        .key(format!("conn-srv-alert-{}", srv.id))
+                        .w_full()
+                        .px(10.0)
+                        .py(7.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(abg)
+                        .border(1.0, abd)
+                        .child(icon(aic, 13.0).color(afg))
+                        .child(
+                            text(srv_alerts.join(" · "))
+                                .font(ty::CAPTION)
+                                .color(afg)
+                                .grow(1.0)
+                                .shrink()
+                                .wrap(),
+                        ),
+                );
+            }
+
+            card = card.child(details_col);
         } else {
             card = card.child(
                 row()

@@ -345,6 +345,8 @@ pub fn parse_probe_output(raw: &str) -> VpsProbeResult {
             "RAM_TOTAL_MB" => res.ram_total_mb = val.parse().unwrap_or(0),
             "RAM_FREE_MB" => res.ram_free_mb = val.parse().unwrap_or(0),
             "DISK_FREE_GB" => res.disk_free_gb = val.parse().unwrap_or(0),
+            "CPU_PCT" => res.cpu_usage_pct = val.parse::<u16>().unwrap_or(0).min(100) as u8,
+            "DISK_USED_PCT" => res.disk_used_pct = val.parse::<u16>().unwrap_or(0).min(100) as u8,
             "HAS_GIT" => res.has_git = val == "1" || val.eq_ignore_ascii_case("true"),
             "HAS_DOCKER" => res.has_docker = val == "1" || val.eq_ignore_ascii_case("true"),
             "HAS_NODE" => res.has_node = val == "1" || val.eq_ignore_ascii_case("true"),
@@ -373,6 +375,10 @@ MEM_TOT=$(awk "/^MemTotal:/{printf \"%d\", \$2/1024}" /proc/meminfo 2>/dev/null 
 MEM_AVAIL=$(awk "/^MemAvailable:/{printf \"%d\", \$2/1024}" /proc/meminfo 2>/dev/null || echo 0)
 DISK_FREE=$(df -BG --output=avail / 2>/dev/null | tail -n 1 | tr -dc "0-9")
 [ -z "$DISK_FREE" ] && DISK_FREE=$(df -k / 2>/dev/null | awk "NR==2{printf \"%d\", \$4/1048576}")
+DISK_USED_PCT=$(df -P / 2>/dev/null | awk "NR==2{gsub(\"%\",\"\"); print \$5}" | tr -dc "0-9")
+[ -z "$DISK_USED_PCT" ] && DISK_USED_PCT=0
+CPU_PCT=$( (awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8+\$9, \$5+\$6; exit}" /proc/stat 2>/dev/null; (sleep 0.2 2>/dev/null || sleep 1); awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8+\$9, \$5+\$6; exit}" /proc/stat 2>/dev/null) | awk "NR==1{t1=\$1;i1=\$2} NR==2{dt=\$1-t1; di=\$2-i1; if(dt>0) printf \"%d\", (100*(dt-di))/dt; else print 0}" )
+[ -z "$CPU_PCT" ] && CPU_PCT=0
 has_cmd() { command -v "$1" >/dev/null 2>&1 && echo 1 || echo 0; }
 HAS_GIT=$(has_cmd git)
 HAS_DOCKER=$(has_cmd docker)
@@ -382,8 +388,8 @@ HAS_RUST=$(has_cmd cargo)
 HAS_SYSTEMD=$([ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && echo 1 || echo 0)
 HAS_RUNNER=$([ -f /opt/workploy/workploy_runner.py ] && echo 1 || echo 0)
 RUNNER_ACT=$(systemctl is-active --quiet workploy-runner 2>/dev/null && echo 1 || echo 0)
-printf "OS=%s\nARCH=%s\nVCPUS=%s\nRAM_TOTAL_MB=%s\nRAM_FREE_MB=%s\nDISK_FREE_GB=%s\nHAS_GIT=%s\nHAS_DOCKER=%s\nHAS_NODE=%s\nHAS_PNPM=%s\nHAS_RUST=%s\nHAS_SYSTEMD=%s\nHAS_RUNNER=%s\nRUNNER_ACTIVE=%s\n" \
-"$OS" "$ARCH" "$VCPUS" "$MEM_TOT" "$MEM_AVAIL" "${DISK_FREE:-0}" "$HAS_GIT" "$HAS_DOCKER" "$HAS_NODE" "$HAS_PNPM" "$HAS_RUST" "$HAS_SYSTEMD" "$HAS_RUNNER" "$RUNNER_ACT"
+printf "OS=%s\nARCH=%s\nVCPUS=%s\nRAM_TOTAL_MB=%s\nRAM_FREE_MB=%s\nDISK_FREE_GB=%s\nCPU_PCT=%s\nDISK_USED_PCT=%s\nHAS_GIT=%s\nHAS_DOCKER=%s\nHAS_NODE=%s\nHAS_PNPM=%s\nHAS_RUST=%s\nHAS_SYSTEMD=%s\nHAS_RUNNER=%s\nRUNNER_ACTIVE=%s\n" \
+"$OS" "$ARCH" "$VCPUS" "$MEM_TOT" "$MEM_AVAIL" "${DISK_FREE:-0}" "${CPU_PCT:-0}" "${DISK_USED_PCT:-0}" "$HAS_GIT" "$HAS_DOCKER" "$HAS_NODE" "$HAS_PNPM" "$HAS_RUST" "$HAS_SYSTEMD" "$HAS_RUNNER" "$RUNNER_ACT"
 '"#;
 
 pub fn probe_vps(sh: &SharedHandle, server_id: &str) {
@@ -1033,6 +1039,18 @@ def queue_workflow(wf, trigger_label, repo_full_name="", branch="main", commit_i
     return run_id
 
 
+def branch_matches(pattern, branch):
+    pat = (pattern or "").strip()
+    if not pat or pat == "*":
+        return True
+    target = (branch or "").strip()
+    for item in pat.split(","):
+        cand = item.strip()
+        if cand == "*" or (cand and cand == target):
+            return True
+    return False
+
+
 def poller_loop():
     poll_state = {}
     try:
@@ -1051,34 +1069,78 @@ def poller_loop():
             if not b.get("enabled") or b.get("trigger_mode") != "PollOnVps":
                 continue
             repo = (b.get("full_name") or "").strip()
-            branch = (b.get("branch") or "main").strip()
+            raw_branch = b.get("branch")
+            branch_pat = (raw_branch if raw_branch is not None else "main").strip()
             wf_id = b.get("workflow_id")
             if not repo or not wf_id or wf_id not in workflows:
                 continue
-            url = f"https://api.github.com/repos/{repo}/commits/{branch}"
             headers = {
                 "User-Agent": "workploy-runner",
                 "Accept": "application/vnd.github+json",
             }
             if gh_tok:
                 headers["Authorization"] = f"Bearer {gh_tok}"
-            req = urllib.request.Request(url, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                sha = payload.get("sha", "")
-                msg = ((payload.get("commit") or {}).get("message") or "commit").splitlines()[0]
-                key = f"{repo}:{branch}"
-                prev = poll_state.get(key)
-                if sha and prev and prev != sha:
-                    poll_state[key] = sha
-                    queue_workflow(workflows[wf_id], "sondagem 24/7 na VPS", repo, branch, (sha, msg), "github-poll")
-                elif sha and not prev:
-                    poll_state[key] = sha
-                with open(POLL_STATE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(poll_state, f)
-            except Exception:
-                pass
+
+            targets = []
+            has_wildcard = (not branch_pat) or branch_pat == "*" or any(
+                item.strip() == "*" for item in branch_pat.split(",")
+            )
+            if has_wildcard:
+                branches_url = f"https://api.github.com/repos/{repo}/branches?per_page=100"
+                req_b = urllib.request.Request(branches_url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req_b, timeout=20) as resp:
+                        blist = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(blist, list):
+                        for item in blist:
+                            bname = (item.get("name") or "").strip()
+                            bsha = ((item.get("commit") or {}).get("sha") or "").strip()
+                            if bname and bsha:
+                                targets.append((bname, bsha))
+                except Exception:
+                    pass
+                if not targets:
+                    targets.append(("main", None))
+            else:
+                seen = set()
+                for item in branch_pat.split(","):
+                    br = item.strip()
+                    if br and br not in seen:
+                        seen.add(br)
+                        targets.append((br, None))
+
+            for br, known_sha in targets:
+                try:
+                    if known_sha:
+                        sha = known_sha
+                        msg = f"push em {br}"
+                    else:
+                        url = f"https://api.github.com/repos/{repo}/commits/{br}"
+                        req = urllib.request.Request(url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=20) as resp:
+                            payload = json.loads(resp.read().decode("utf-8"))
+                        sha = payload.get("sha", "")
+                        msg = ((payload.get("commit") or {}).get("message") or "commit").splitlines()[0]
+                    key = f"{repo}:{br}"
+                    prev = poll_state.get(key)
+                    if sha and prev and prev != sha:
+                        if known_sha:
+                            try:
+                                c_url = f"https://api.github.com/repos/{repo}/commits/{sha}"
+                                c_req = urllib.request.Request(c_url, headers=headers)
+                                with urllib.request.urlopen(c_req, timeout=15) as c_resp:
+                                    c_payload = json.loads(c_resp.read().decode("utf-8"))
+                                    msg = ((c_payload.get("commit") or {}).get("message") or msg).splitlines()[0]
+                            except Exception:
+                                pass
+                        poll_state[key] = sha
+                        queue_workflow(workflows[wf_id], "sondagem 24/7 na VPS", repo, br, (sha, msg), "github-poll")
+                    elif sha and not prev:
+                        poll_state[key] = sha
+                    with open(POLL_STATE_PATH, "w", encoding="utf-8") as f:
+                        json.dump(poll_state, f)
+                except Exception:
+                    pass
         time.sleep(every)
 
 
@@ -1158,7 +1220,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if (b.get("full_name") or "").strip().lower() != repo:
                     continue
-                if (b.get("branch") or "main").strip() != branch:
+                raw_branch = b.get("branch")
+                pat = raw_branch if raw_branch is not None else "main"
+                if not branch_matches(pat, branch):
                     continue
                 wf_id = b.get("workflow_id")
                 if wf_id and wf_id in workflows:
@@ -1690,6 +1754,8 @@ VCPUS=4\r\n\
 RAM_TOTAL_MB=7952\r\n\
 RAM_FREE_MB=6120\r\n\
 DISK_FREE_GB=74\r\n\
+CPU_PCT=37\r\n\
+DISK_USED_PCT=62\r\n\
 HAS_GIT=1\r\n\
 HAS_DOCKER=1\r\n\
 HAS_NODE=1\r\n\
@@ -1707,6 +1773,8 @@ RUNNER_ACTIVE=1\r\n";
         assert_eq!(res.ram_total_mb, 7952);
         assert_eq!(res.ram_free_mb, 6120);
         assert_eq!(res.disk_free_gb, 74);
+        assert_eq!(res.cpu_usage_pct, 37);
+        assert_eq!(res.disk_used_pct, 62);
         assert!(res.has_git);
         assert!(res.has_docker);
         assert!(res.has_node);
@@ -1820,11 +1888,14 @@ RUNNER_ACTIVE=1\r\n";
         assert!(script.contains("/var/lib/workploy/purge_state.json"));
         assert!(script.contains("/etc/workploy/config.json"));
         assert!(script.contains("\"/purge\""));
+        assert!(script.contains("def branch_matches("));
         assert!(!script.contains("widder"));
         assert!(!script.contains("docker.io"));
 
         assert!(PROBE_REMOTE_SCRIPT.contains("/opt/workploy/workploy_runner.py"));
         assert!(PROBE_REMOTE_SCRIPT.contains("workploy-runner"));
+        assert!(PROBE_REMOTE_SCRIPT.contains("CPU_PCT"));
+        assert!(PROBE_REMOTE_SCRIPT.contains("DISK_USED_PCT"));
         assert!(!PROBE_REMOTE_SCRIPT.contains("widder"));
     }
 }

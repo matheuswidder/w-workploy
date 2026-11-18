@@ -13,6 +13,310 @@ struct RunnerConfigPayload {
     purge_rule: PurgeRule,
 }
 
+pub fn branch_matches(pattern: &str, branch: &str) -> bool {
+    let pat = pattern.trim();
+    if pat.is_empty() || pat == "*" {
+        return true;
+    }
+    let target = branch.trim();
+    pat.split(',').any(|item| {
+        let cand = item.trim();
+        cand == "*" || (!cand.is_empty() && cand == target)
+    })
+}
+
+pub fn expand_branch_targets(pattern: &str, default_branch: &str) -> Vec<String> {
+    let def = if default_branch.trim().is_empty() {
+        "main"
+    } else {
+        default_branch.trim()
+    };
+    let pat = pattern.trim();
+    if pat.is_empty() || pat == "*" {
+        return vec![def.to_string()];
+    }
+    let mut out = Vec::new();
+    for item in pat.split(',') {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resolved = if trimmed == "*" { def } else { trimmed };
+        if !out.iter().any(|x| x == resolved) {
+            out.push(resolved.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push(def.to_string());
+    }
+    out
+}
+
+pub fn parse_repo_branches_json(v: &serde_json::Value) -> Result<Vec<String>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "Resposta inesperada ao listar branches do GitHub.".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if let Some(name) = item.get("name").and_then(|x| x.as_str()).map(str::trim)
+            && !name.is_empty()
+        {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+pub fn parse_github_workflows_dir_json(v: &serde_json::Value) -> Vec<DetectedWorkflow> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let kind_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("file");
+        if kind_type != "file" {
+            continue;
+        }
+        let Some(name) = item.get("name").and_then(|x| x.as_str()).map(str::trim) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".yml") || lower.ends_with(".yaml") {
+            let path = item
+                .get("path")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!(".github/workflows/{name}"));
+            out.push(DetectedWorkflow {
+                path,
+                name: name.to_string(),
+                kind: "github-actions".into(),
+            });
+        }
+    }
+    out
+}
+
+pub fn parse_repo_root_manifests_json(v: &serde_json::Value) -> Vec<DetectedWorkflow> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let kind_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("file");
+        if kind_type != "file" {
+            continue;
+        }
+        let Some(name) = item.get("name").and_then(|x| x.as_str()).map(str::trim) else {
+            continue;
+        };
+        let kind = match name {
+            "workploy.yml" | "workploy.yaml" => Some("workploy"),
+            "Dockerfile" => Some("docker"),
+            "docker-compose.yml" | "docker-compose.yaml" => Some("docker-compose"),
+            "package.json" => Some("node"),
+            "Cargo.toml" => Some("rust"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let path = item
+                .get("path")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| name.to_string());
+            out.push(DetectedWorkflow {
+                path,
+                name: name.to_string(),
+                kind: kind.into(),
+            });
+        }
+    }
+    out
+}
+
+fn github_get_request(url: &str, token: Option<&str>) -> ureq::Request {
+    let mut req = ureq::get(url)
+        .set("User-Agent", "workploy")
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(tok) = token {
+        let trimmed = tok.trim();
+        if !trimmed.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {trimmed}"));
+        }
+    }
+    req
+}
+
+pub fn fetch_repo_branches(sh: &SharedHandle, full_name: String) {
+    let repo = full_name.trim().to_string();
+    if repo.is_empty() {
+        let mut s = sh.lock().unwrap();
+        s.repo_branches_loading = false;
+        s.repo_branches_repo.clear();
+        s.repo_branches.clear();
+        s.repo_branches_status = "Informe o repositório (dono/repo) para buscar branches.".into();
+        drop(s);
+        engine::notify(sh);
+        return;
+    }
+    {
+        let mut s = sh.lock().unwrap();
+        if s.repo_branches_loading && s.repo_branches_repo == repo {
+            return;
+        }
+        s.repo_branches_loading = true;
+        s.repo_branches_repo = repo.clone();
+        s.repo_branches_status = format!("Buscando branches de {repo}...");
+    }
+    engine::notify(sh);
+
+    let sh2 = sh.clone();
+    std::thread::spawn(move || {
+        let token = resolve_github_token(&sh2, None);
+        let url = format!("https://api.github.com/repos/{repo}/branches?per_page=100");
+        let result = match github_get_request(&url, token.as_deref()).call() {
+            Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                Ok(v) => parse_repo_branches_json(&v),
+                Err(_) => Err("Não foi possível ler a lista de branches do GitHub.".into()),
+            },
+            Err(ureq::Error::Status(404, _)) => {
+                Err(format!("Repositório '{repo}' não encontrado ou sem permissão."))
+            }
+            Err(ureq::Error::Status(401, _)) => {
+                Err("Token do GitHub inválido ou expirado (HTTP 401).".into())
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                Err(format!("GitHub retornou erro HTTP {code} ao buscar branches."))
+            }
+            Err(ureq::Error::Transport(t)) => {
+                Err(format!("Falha de rede ao buscar branches: {t}"))
+            }
+        };
+
+        {
+            let mut s = sh2.lock().unwrap();
+            if s.repo_branches_repo == repo {
+                s.repo_branches_loading = false;
+                match result {
+                    Ok(branches) => {
+                        s.repo_branches_status = if branches.is_empty() {
+                            format!("Nenhuma branch encontrada em {repo}.")
+                        } else {
+                            format!("{} branch(es) encontrada(s) em {repo}.", branches.len())
+                        };
+                        s.repo_branches = branches;
+                    }
+                    Err(err) => {
+                        s.repo_branches_status = err;
+                    }
+                }
+            }
+        }
+        engine::notify(&sh2);
+    });
+}
+
+pub fn scan_repo_workflows(sh: &SharedHandle, full_name: String) {
+    let repo = full_name.trim().to_string();
+    if repo.is_empty() {
+        let mut s = sh.lock().unwrap();
+        s.repo_workflows_loading = false;
+        s.repo_workflows_repo.clear();
+        s.repo_workflows.clear();
+        s.repo_workflows_status = "Informe o repositório (dono/repo) para buscar fluxos.".into();
+        drop(s);
+        engine::notify(sh);
+        return;
+    }
+    {
+        let mut s = sh.lock().unwrap();
+        if s.repo_workflows_loading && s.repo_workflows_repo == repo {
+            return;
+        }
+        s.repo_workflows_loading = true;
+        s.repo_workflows_repo = repo.clone();
+        s.repo_workflows_status = format!("Buscando fluxos automatizados em {repo}...");
+    }
+    engine::notify(sh);
+
+    let sh2 = sh.clone();
+    std::thread::spawn(move || {
+        let token = resolve_github_token(&sh2, None);
+
+        let wf_url = format!("https://api.github.com/repos/{repo}/contents/.github/workflows");
+        let mut gh_workflows = Vec::new();
+        let mut wf_err: Option<String> = None;
+        match github_get_request(&wf_url, token.as_deref()).call() {
+            Ok(resp) => {
+                if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    gh_workflows = parse_github_workflows_dir_json(&v);
+                }
+            }
+            Err(ureq::Error::Status(404, _)) => {}
+            Err(ureq::Error::Status(code, _)) => {
+                wf_err = Some(format!("GitHub retornou erro HTTP {code} ao verificar fluxos."));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                wf_err = Some(format!("Falha de rede ao verificar fluxos: {t}"));
+            }
+        }
+
+        let root_url = format!("https://api.github.com/repos/{repo}/contents/");
+        let mut root_items = Vec::new();
+        let mut root_err: Option<String> = None;
+        match github_get_request(&root_url, token.as_deref()).call() {
+            Ok(resp) => {
+                if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    root_items = parse_repo_root_manifests_json(&v);
+                }
+            }
+            Err(ureq::Error::Status(404, _)) => {
+                root_err = Some(format!("Repositório '{repo}' não encontrado ou vazio."));
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                root_err = Some(format!("GitHub retornou erro HTTP {code} ao listar arquivos."));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                root_err = Some(format!("Falha de rede ao listar arquivos: {t}"));
+            }
+        }
+
+        let gh_count = gh_workflows.len();
+        let root_count = root_items.len();
+        let mut all = gh_workflows;
+        all.extend(root_items);
+
+        {
+            let mut s = sh2.lock().unwrap();
+            if s.repo_workflows_repo == repo {
+                s.repo_workflows_loading = false;
+                if all.is_empty() && (root_err.is_some() || wf_err.is_some()) {
+                    s.repo_workflows.clear();
+                    s.repo_workflows_status = root_err
+                        .or(wf_err)
+                        .unwrap_or_else(|| "Não foi possível analisar o repositório.".into());
+                } else {
+                    s.repo_workflows = all;
+                    s.repo_workflows_status = match (gh_count, root_count) {
+                        (0, 0) => "Nenhum fluxo automatizado encontrado no repositório.".into(),
+                        (g, 0) => format!("{g} fluxo(s) encontrado(s) em .github/workflows"),
+                        (0, r) => format!("{r} arquivo(s) de automação encontrado(s) na raiz"),
+                        (g, r) => format!(
+                            "{g} fluxo(s) encontrado(s) em .github/workflows + {r} arquivo(s) na raiz"
+                        ),
+                    };
+                }
+            }
+        }
+        engine::notify(&sh2);
+    });
+}
+
 pub fn parse_github_user_json(v: &serde_json::Value) -> Result<String, String> {
     v.get("login")
         .and_then(|x| x.as_str())
@@ -498,6 +802,109 @@ fn record_update_event(s: &mut Shared, ok: bool, msg: String) {
     s.update_last_event = Some((seq, ok, msg));
 }
 
+pub fn parse_release_from_redirect_location(
+    location: &str,
+    current_version: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("Resposta de redirecionamento do GitHub sem cabeçalho Location.".into());
+    }
+    let Some((_, after_tag)) = trimmed.split_once("/releases/tag/") else {
+        // Quando não há nenhuma release publicada, /releases/latest redireciona para /releases
+        if trimmed.ends_with("/releases") || trimmed.contains("/releases?") {
+            return Ok(None);
+        }
+        return Err("Não foi possível identificar a versão da release no redirecionamento.".into());
+    };
+    let tag_name = after_tag
+        .split(['?', '#', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Tag de release vazia no redirecionamento do GitHub.".to_string())?
+        .to_string();
+
+    let version = tag_name.trim_start_matches(['v', 'V']).to_string();
+    let html_url = format!("https://github.com/matheuswidder/w-workploy/releases/tag/{tag_name}");
+    let installer_url = format!(
+        "https://github.com/matheuswidder/w-workploy/releases/download/{tag_name}/Workploy-Setup-{version}.exe"
+    );
+    let has_update = is_newer_version(current_version, &tag_name);
+
+    Ok(Some(ReleaseInfo {
+        tag_name,
+        version,
+        html_url,
+        installer_url,
+        published_at: String::new(),
+        notes: String::new(),
+        has_update,
+    }))
+}
+
+fn fetch_latest_release_via_redirect(current_version: &str) -> Result<Option<ReleaseInfo>, String> {
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let resp = agent
+        .get("https://github.com/matheuswidder/w-workploy/releases/latest")
+        .set("User-Agent", "workploy")
+        .call();
+
+    match resp {
+        Ok(r) => {
+            if let Some(loc) = r.header("Location") {
+                parse_release_from_redirect_location(loc, current_version)
+            } else {
+                Err("GitHub não retornou redirecionamento para a última release.".into())
+            }
+        }
+        Err(ureq::Error::Status(301 | 302 | 303 | 307 | 308, r)) => {
+            if let Some(loc) = r.header("Location") {
+                parse_release_from_redirect_location(loc, current_version)
+            } else {
+                Err("GitHub não retornou cabeçalho Location ao buscar release.".into())
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(ureq::Error::Status(code, _)) => Err(format!(
+            "GitHub retornou erro HTTP {code} ao verificar atualizações."
+        )),
+        Err(ureq::Error::Transport(t)) => {
+            Err(format!("Não foi possível verificar atualizações: {t}"))
+        }
+    }
+}
+
+fn apply_release_outcome(sh: &SharedHandle, current_ver: &str, outcome: Result<Option<ReleaseInfo>, String>) {
+    let mut s = sh.lock().unwrap();
+    s.update_checking = false;
+    match outcome {
+        Ok(Some(info)) => {
+            let status = if info.has_update {
+                format!(
+                    "Nova versão disponível: v{} (atual: v{current_ver})",
+                    info.version
+                )
+            } else {
+                format!("Você já está na versão mais recente (v{current_ver}).")
+            };
+            s.latest_release = Some(info);
+            s.update_status = status.clone();
+            record_update_event(&mut s, true, status);
+        }
+        Ok(None) => {
+            let msg = "Nenhuma release publicada ainda em matheuswidder/w-workploy.".to_string();
+            s.latest_release = None;
+            s.update_status = msg.clone();
+            record_update_event(&mut s, true, msg);
+        }
+        Err(msg) => {
+            s.update_status = msg.clone();
+            record_update_event(&mut s, false, msg);
+        }
+    }
+}
+
 pub fn check_for_updates(sh: &SharedHandle) {
     {
         let mut s = sh.lock().unwrap();
@@ -511,70 +918,29 @@ pub fn check_for_updates(sh: &SharedHandle) {
 
     let sh2 = sh.clone();
     std::thread::spawn(move || {
+        let token = resolve_github_token(&sh2, None);
         let url = "https://api.github.com/repos/matheuswidder/w-workploy/releases/latest";
-        let resp = ureq::get(url)
-            .set("User-Agent", "workploy")
-            .set("Accept", "application/vnd.github+json")
-            .call();
-
+        let resp = github_get_request(url, token.as_deref()).call();
         let current_ver = env!("CARGO_PKG_VERSION");
 
-        match resp {
+        let outcome = match resp {
             Ok(r) => match r.into_json::<serde_json::Value>() {
-                Ok(v) => match parse_release_json(&v, current_ver) {
-                    Ok(info) => {
-                        let status = if info.has_update {
-                            format!(
-                                "Nova versão disponível: v{} (atual: v{current_ver})",
-                                info.version
-                            )
-                        } else {
-                            format!("Você já está na versão mais recente (v{current_ver}).")
-                        };
-                        let mut s = sh2.lock().unwrap();
-                        s.update_checking = false;
-                        s.latest_release = Some(info);
-                        s.update_status = status.clone();
-                        record_update_event(&mut s, true, status);
-                    }
-                    Err(e) => {
-                        let mut s = sh2.lock().unwrap();
-                        s.update_checking = false;
-                        s.update_status = e.clone();
-                        record_update_event(&mut s, false, e);
-                    }
-                },
-                Err(_) => {
-                    let msg = "Não foi possível ler os dados da release no GitHub.".to_string();
-                    let mut s = sh2.lock().unwrap();
-                    s.update_checking = false;
-                    s.update_status = msg.clone();
-                    record_update_event(&mut s, false, msg);
-                }
+                Ok(v) => parse_release_json(&v, current_ver).map(Some),
+                Err(_) => Err("Não foi possível ler os dados da release no GitHub.".to_string()),
             },
-            Err(ureq::Error::Status(404, _)) => {
-                let msg = "Nenhuma release publicada ainda em matheuswidder/w-workploy.".to_string();
-                let mut s = sh2.lock().unwrap();
-                s.update_checking = false;
-                s.latest_release = None;
-                s.update_status = msg.clone();
-                record_update_event(&mut s, true, msg);
+            Err(ureq::Error::Status(403 | 429, _)) => {
+                fetch_latest_release_via_redirect(current_ver)
             }
-            Err(ureq::Error::Status(code, _)) => {
-                let msg = format!("GitHub retornou erro HTTP {code} ao verificar atualizações.");
-                let mut s = sh2.lock().unwrap();
-                s.update_checking = false;
-                s.update_status = msg.clone();
-                record_update_event(&mut s, false, msg);
-            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(ureq::Error::Status(code, _)) => Err(format!(
+                "GitHub retornou erro HTTP {code} ao verificar atualizações."
+            )),
             Err(ureq::Error::Transport(t)) => {
-                let msg = format!("Não foi possível verificar atualizações: {t}");
-                let mut s = sh2.lock().unwrap();
-                s.update_checking = false;
-                s.update_status = msg.clone();
-                record_update_event(&mut s, false, msg);
+                Err(format!("Não foi possível verificar atualizações: {t}"))
             }
-        }
+        };
+
+        apply_release_outcome(&sh2, current_ver, outcome);
         engine::notify(&sh2);
     });
 }
@@ -840,5 +1206,99 @@ mod tests {
         let same = parse_release_json(&release_without_exe, "0.1.2").unwrap();
         assert_eq!(same.installer_url, same.html_url);
         assert!(!same.has_update);
+    }
+
+    #[test]
+    fn parse_release_redirect_location_builds_release_and_handles_no_releases() {
+        let info = parse_release_from_redirect_location(
+            "https://github.com/matheuswidder/w-workploy/releases/tag/v0.1.4",
+            "0.1.3",
+        )
+        .unwrap()
+        .expect("should parse release");
+        assert_eq!(info.tag_name, "v0.1.4");
+        assert_eq!(info.version, "0.1.4");
+        assert_eq!(
+            info.html_url,
+            "https://github.com/matheuswidder/w-workploy/releases/tag/v0.1.4"
+        );
+        assert_eq!(
+            info.installer_url,
+            "https://github.com/matheuswidder/w-workploy/releases/download/v0.1.4/Workploy-Setup-0.1.4.exe"
+        );
+        assert!(info.has_update);
+
+        let same = parse_release_from_redirect_location("/matheuswidder/w-workploy/releases/tag/v0.1.3?foo=1", "0.1.3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(same.tag_name, "v0.1.3");
+        assert!(!same.has_update);
+
+        let none = parse_release_from_redirect_location(
+            "https://github.com/matheuswidder/w-workploy/releases",
+            "0.1.3",
+        )
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn branch_matching_and_expansion_support_wildcard_and_lists() {
+        assert!(branch_matches("*", "main"));
+        assert!(branch_matches("*", "feature/xyz"));
+        assert!(branch_matches("", "develop"));
+        assert!(branch_matches("main, dev, staging", "dev"));
+        assert!(branch_matches("main,dev", "main"));
+        assert!(!branch_matches("main,dev", "staging"));
+        assert!(branch_matches("main", "main"));
+        assert!(!branch_matches("main", "master"));
+
+        assert_eq!(expand_branch_targets("*", "master"), vec!["master"]);
+        assert_eq!(expand_branch_targets("", ""), vec!["main"]);
+        assert_eq!(
+            expand_branch_targets("main, dev, main, staging", "main"),
+            vec!["main", "dev", "staging"]
+        );
+    }
+
+    #[test]
+    fn parses_repo_branches_and_detected_workflows() {
+        let branches_json = serde_json::json!([
+            { "name": "main" },
+            { "name": "staging" },
+            { "name": "dev" }
+        ]);
+        assert_eq!(
+            parse_repo_branches_json(&branches_json).unwrap(),
+            vec!["main", "staging", "dev"]
+        );
+
+        let wf_dir_json = serde_json::json!([
+            { "name": "ci.yml", "path": ".github/workflows/ci.yml", "type": "file" },
+            { "name": "deploy.yaml", "path": ".github/workflows/deploy.yaml", "type": "file" },
+            { "name": "README.md", "path": ".github/workflows/README.md", "type": "file" },
+            { "name": "subdir", "path": ".github/workflows/subdir", "type": "dir" }
+        ]);
+        let ghs = parse_github_workflows_dir_json(&wf_dir_json);
+        assert_eq!(ghs.len(), 2);
+        assert_eq!(ghs[0].path, ".github/workflows/ci.yml");
+        assert_eq!(ghs[0].kind, "github-actions");
+        assert_eq!(ghs[1].name, "deploy.yaml");
+
+        let root_json = serde_json::json!([
+            { "name": "workploy.yml", "path": "workploy.yml", "type": "file" },
+            { "name": "Dockerfile", "path": "Dockerfile", "type": "file" },
+            { "name": "docker-compose.yml", "path": "docker-compose.yml", "type": "file" },
+            { "name": "package.json", "path": "package.json", "type": "file" },
+            { "name": "Cargo.toml", "path": "Cargo.toml", "type": "file" },
+            { "name": "README.md", "path": "README.md", "type": "file" }
+        ]);
+        let roots = parse_repo_root_manifests_json(&root_json);
+        assert_eq!(roots.len(), 5);
+        assert_eq!(roots[0].kind, "workploy");
+        assert_eq!(roots[1].kind, "docker");
+        assert_eq!(roots[2].kind, "docker-compose");
+        assert_eq!(roots[3].kind, "node");
+        assert_eq!(roots[4].kind, "rust");
     }
 }

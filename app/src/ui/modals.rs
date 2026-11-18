@@ -6,7 +6,7 @@ use workploy::model::{RunnerKind, Trigger, TriggerMode};
 use crate::state::{
     AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind,
 };
-use crate::ui::components::{btn_danger, btn_icon, btn_neutral, chip, primary_button};
+use crate::ui::components::{btn_danger, btn_icon, btn_neutral, chip, pill_badge, primary_button};
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
@@ -851,16 +851,132 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .build(k)
                 .cursor(Cursor::Text);
 
+            let repo_trimmed = draft.full_name.text.trim().to_string();
             let branch_in = TextInput::new(&draft.branch)
                 .label("Branch monitorada")
-                .placeholder("main")
-                .width(Some(200.0))
+                .placeholder("main ou *")
+                .width(Some(220.0))
                 .on_edit(|s: &mut AppState| match &mut s.modal {
                     ModalState::BindingEditor(d) => &mut d.branch,
                     _ => unreachable!(),
                 })
                 .build(k)
                 .cursor(Cursor::Text);
+
+            let branches_match = !repo_trimmed.is_empty()
+                && s.snapshot
+                    .repo_branches_repo
+                    .eq_ignore_ascii_case(&repo_trimmed);
+            let show_branch_status = !s.snapshot.repo_branches_status.trim().is_empty()
+                && (branches_match || s.snapshot.repo_branches_repo.is_empty());
+            let selected_branches: Vec<String> = draft
+                .branch
+                .text
+                .split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty() && *x != "*")
+                .map(str::to_string)
+                .collect();
+
+            let mut branch_chips = row()
+                .gap(6.0)
+                .flex_wrap()
+                .child(
+                    chip(
+                        t,
+                        "bind-branch-all",
+                        "Todas (*)",
+                        draft.branch.text.trim() == "*",
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.branch = rune::TextEdit::new("*");
+                            }
+                        },
+                    )
+                    .help("Monitora todas as branches deste repositório."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "bind-branch-none",
+                        "Nenhuma",
+                        draft.branch.text.trim().is_empty(),
+                        |s: &mut AppState, _| {
+                            if let ModalState::BindingEditor(d) = &mut s.modal {
+                                d.branch = rune::TextEdit::new("");
+                            }
+                        },
+                    )
+                    .help("Limpa a seleção atual de branches para escolher manualmente."),
+                );
+            if branches_match {
+                for (idx, br) in s.snapshot.repo_branches.iter().enumerate() {
+                    let active = selected_branches.iter().any(|x| x == br);
+                    let br_name = br.clone();
+                    branch_chips = branch_chips.child(
+                        chip(
+                            t,
+                            format!("bind-branch-opt-{idx}"),
+                            br.clone(),
+                            active,
+                            move |s: &mut AppState, _| {
+                                if let ModalState::BindingEditor(d) = &mut s.modal {
+                                    AppState::toggle_binding_branch(&mut d.branch, &br_name);
+                                }
+                            },
+                        )
+                        .help(format!("Adicionar ou remover '{br}' da lista de branches monitoradas.")),
+                    );
+                }
+            }
+
+            let branches_loading = s.snapshot.repo_branches_loading;
+            let mut branch_section = col()
+                .w_full()
+                .gap(8.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .flex_wrap()
+                        .child(branch_in)
+                        .child(
+                            btn_neutral(
+                                t,
+                                "bind-fetch-branches",
+                                if branches_loading {
+                                    "Buscando..."
+                                } else {
+                                    "Buscar branches"
+                                },
+                                Some(&icons::BRANCH),
+                                32.0,
+                                move |s: &mut AppState, tx: &mut Tx| {
+                                    if !branches_loading {
+                                        s.fetch_binding_branches(tx);
+                                    }
+                                },
+                            )
+                            .help("Consulta as branches disponíveis deste repositório no GitHub."),
+                        ),
+                )
+                .child(branch_chips);
+
+            if show_branch_status {
+                let st_lower = s.snapshot.repo_branches_status.to_lowercase();
+                let st_err = st_lower.contains("erro")
+                    || st_lower.contains("falha")
+                    || st_lower.contains("não encontrado")
+                    || st_lower.contains("informe")
+                    || st_lower.contains("inválido");
+                branch_section = branch_section.child(
+                    text(s.snapshot.repo_branches_status.clone())
+                        .font(ty::CAPTION)
+                        .color(if st_err { t.danger } else { t.text_muted })
+                        .wrap(),
+                );
+            }
 
             let mut target_chips = row().gap(6.0).flex_wrap().child(
                 chip(
@@ -985,14 +1101,117 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 );
             }
 
+            let workflows_match = !repo_trimmed.is_empty()
+                && s.snapshot
+                    .repo_workflows_repo
+                    .eq_ignore_ascii_case(&repo_trimmed);
+            let show_wf_status = !s.snapshot.repo_workflows_status.trim().is_empty()
+                && (workflows_match || s.snapshot.repo_workflows_repo.is_empty());
+            let workflows_loading = s.snapshot.repo_workflows_loading;
+
+            let mut wf_section = col()
+                .w_full()
+                .gap(8.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .flex_wrap()
+                        .child(wf_chips)
+                        .child(
+                            btn_neutral(
+                                t,
+                                "bind-scan-workflows",
+                                if workflows_loading {
+                                    "Buscando..."
+                                } else {
+                                    "Buscar fluxos no repo"
+                                },
+                                Some(&icons::CODE),
+                                30.0,
+                                move |s: &mut AppState, tx: &mut Tx| {
+                                    if !workflows_loading {
+                                        s.scan_binding_workflows(tx);
+                                    }
+                                },
+                            )
+                            .help("Procura arquivos de automação (.github/workflows, Dockerfile, etc.) no repositório."),
+                        ),
+                );
+
+            if show_wf_status {
+                let wf_st_lower = s.snapshot.repo_workflows_status.to_lowercase();
+                let wf_st_err = wf_st_lower.contains("erro")
+                    || wf_st_lower.contains("falha")
+                    || wf_st_lower.contains("não encontrado")
+                    || wf_st_lower.contains("informe")
+                    || wf_st_lower.contains("não foi possível");
+                let mut detected_box = col()
+                    .key("bind-detected-workflows")
+                    .w_full()
+                    .padding(10.0)
+                    .gap(6.0)
+                    .radius(8.0)
+                    .fill(t.surface_2)
+                    .border(
+                        1.0,
+                        if wf_st_err {
+                            t.danger.alpha(0.35)
+                        } else {
+                            t.border_subtle
+                        },
+                    )
+                    .child(
+                        text(s.snapshot.repo_workflows_status.clone())
+                            .font(ty::CAPTION)
+                            .color(if wf_st_err { t.danger } else { t.text_secondary })
+                            .wrap(),
+                    );
+                if workflows_match && !s.snapshot.repo_workflows.is_empty() {
+                    let mut items_col = col().w_full().gap(4.0);
+                    for dw in &s.snapshot.repo_workflows {
+                        items_col = items_col.child(
+                            row()
+                                .w_full()
+                                .justify_between()
+                                .center_y()
+                                .flex_wrap()
+                                .gap(6.0)
+                                .child(
+                                    text(dw.path.clone())
+                                        .font(ty::MONO_SM)
+                                        .color(t.text_primary)
+                                        .grow(1.0)
+                                        .shrink()
+                                        .truncate(),
+                                )
+                                .child(pill_badge(
+                                    t,
+                                    &dw.name,
+                                    t.accent,
+                                    t.accent_soft,
+                                )),
+                        );
+                    }
+                    detected_box = detected_box.child(items_col).child(
+                        text("Dica: o Workploy pode disparar o fluxo selecionado acima automaticamente a cada push neste repositório.")
+                            .font(ty::CAPTION)
+                            .color(t.text_muted)
+                            .wrap(),
+                    );
+                }
+                wf_section = wf_section.child(detected_box);
+            }
+
             let mut form = col()
                 .w_full()
                 .gap(12.0)
                 .child(labeled(t, "Repositório GitHub (dono/nome)", repo_in))
-                .child(labeled(t, "Branch monitorada", branch_in))
+                .child(labeled(t, "Branch monitorada", branch_section))
                 .child(labeled(t, "Servidor de destino", target_chips))
                 .child(labeled(t, "Modo de disparo", mode_chips))
-                .child(labeled(t, "Fluxo disparado", wf_chips))
+                .child(labeled(t, "Fluxo disparado", wf_section))
                 .child(
                     Switch::new(draft.enabled)
                         .label("Vínculo ativo")

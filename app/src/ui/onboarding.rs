@@ -299,7 +299,39 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             .child(step1)
             .child(step2)
             .child(step3)
-            .child(step4),
+            .child(step4)
+            .child(el().w_full().h(t.hair).fill(t.border_subtle))
+            .child(
+                row()
+                    .w_full()
+                    .justify_between()
+                    .center_y()
+                    .flex_wrap()
+                    .gap(10.0)
+                    .child(
+                        text(if s.snapshot.settings.onboarding_completed {
+                            "Configuração inicial já concluída. Você pode reabrir este guia em Configurações → Sobre."
+                        } else {
+                            "Ao concluir, o Workploy abrirá diretamente na tela de Execuções."
+                        })
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .grow(1.0)
+                        .shrink()
+                        .wrap(),
+                    )
+                    .child(
+                        primary_button(
+                            t,
+                            "onb-btn-complete",
+                            "Concluir configuração inicial",
+                            Some(&icons::CHECK_CIRCLE),
+                            34.0,
+                            |s: &mut AppState, tx: &mut Tx| s.complete_onboarding(tx),
+                        )
+                        .help("Marca a configuração inicial como concluída e vai para Execuções."),
+                    ),
+            ),
     );
 
     col()

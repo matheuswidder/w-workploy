@@ -143,6 +143,8 @@ pub fn populate_demo(s: &mut Shared) {
                 ram_total_mb: 8192,
                 ram_free_mb: 6180,
                 disk_free_gb: 64,
+                cpu_usage_pct: 22,
+                disk_used_pct: 36,
                 has_git: true,
                 has_docker: true,
                 has_node: true,
@@ -176,6 +178,8 @@ pub fn populate_demo(s: &mut Shared) {
                 ram_total_mb: 4096,
                 ram_free_mb: 2890,
                 disk_free_gb: 34,
+                cpu_usage_pct: 14,
+                disk_used_pct: 42,
                 has_git: true,
                 has_docker: true,
                 has_node: true,
@@ -230,6 +234,8 @@ pub fn populate_demo(s: &mut Shared) {
         repo_bindings,
         github_user: "matheuswidder".into(),
         purge_rule: PurgeRule::default(),
+        onboarding_completed: true,
+        minimize_to_tray: true,
     };
     s.github_repos = vec![
         GithubRepoSummary {
@@ -734,6 +740,7 @@ pub fn scene_onboarding(s: &mut AppState) {
     s.snapshot.github_repos.clear();
     s.snapshot.github_status.clear();
     s.snapshot.runner_sync_status.clear();
+    s.snapshot.settings.onboarding_completed = false;
     s.settings_draft = SettingsDraft::from_settings(&s.snapshot.settings);
     s.navigate_to(NavTarget::Onboarding);
 }

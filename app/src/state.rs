@@ -8,9 +8,9 @@ use rune_kit::{ToastEffect, ToastEvent, ToastStack};
 use workploy::engine::{self, SharedHandle};
 use workploy::github;
 use workploy::model::{
-    self, AuthMethod, CapacityTier, GithubRepoSummary, ProvisionOptions, PurgeRule, ReleaseInfo,
-    RepoBinding, Run, RunStatus, RunnerKind, Settings, Shared, Step, StepRun, StepStatus, Trigger,
-    TriggerMode, VpsProbeResult, VpsServer, Workflow,
+    self, AuthMethod, CapacityTier, DetectedWorkflow, GithubRepoSummary, ProvisionOptions,
+    PurgeRule, ReleaseInfo, RepoBinding, Run, RunStatus, RunnerKind, Settings, Shared, Step,
+    StepRun, StepStatus, Trigger, TriggerMode, VpsProbeResult, VpsServer, Workflow,
 };
 use workploy::vault;
 use workploy::vps;
@@ -487,6 +487,67 @@ impl SettingsDraft {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConnectionsHealth {
+    Healthy,
+    Warning,
+    Danger,
+}
+
+pub fn vps_ram_used_pct(probe: &VpsProbeResult) -> u8 {
+    if probe.ram_total_mb == 0 {
+        return 0;
+    }
+    let used = probe.ram_total_mb.saturating_sub(probe.ram_free_mb);
+    (used.saturating_mul(100) / probe.ram_total_mb).min(100) as u8
+}
+
+pub fn vps_health_status(srv: &VpsServer) -> (ConnectionsHealth, Vec<String>) {
+    let Some(probe) = &srv.last_probe else {
+        return (ConnectionsHealth::Healthy, Vec::new());
+    };
+    let mut alerts = Vec::new();
+    let mut health = ConnectionsHealth::Healthy;
+
+    if !probe.ok {
+        health = ConnectionsHealth::Danger;
+        let msg = if probe.verdict.trim().is_empty() {
+            "Falha na última verificação SSH.".to_string()
+        } else {
+            probe.verdict.trim().to_string()
+        };
+        alerts.push(msg);
+        return (health, alerts);
+    }
+
+    if probe.has_widder_runner && !probe.runner_active {
+        health = ConnectionsHealth::Danger;
+        alerts.push("Agente workploy-runner instalado, mas inativo.".to_string());
+    }
+
+    let ram_pct = vps_ram_used_pct(probe);
+    if ram_pct >= 80 {
+        if health != ConnectionsHealth::Danger {
+            health = ConnectionsHealth::Warning;
+        }
+        alerts.push(format!("Uso de RAM elevado: {ram_pct}%"));
+    }
+    if probe.cpu_usage_pct >= 80 {
+        if health != ConnectionsHealth::Danger {
+            health = ConnectionsHealth::Warning;
+        }
+        alerts.push(format!("Uso de CPU elevado: {}%", probe.cpu_usage_pct));
+    }
+    if probe.disk_used_pct >= 80 {
+        if health != ConnectionsHealth::Danger {
+            health = ConnectionsHealth::Warning;
+        }
+        alerts.push(format!("Uso de disco elevado: {}%", probe.disk_used_pct));
+    }
+
+    (health, alerts)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
@@ -513,6 +574,7 @@ pub struct AppState {
 
     pub dark: bool,
     pub sidebar_collapsed: bool,
+    pub connections_seen_healthy: bool,
     pub nav: NavTarget,
     pub previous_list_nav: NavTarget,
     pub settings_tab: SettingsTab,
@@ -596,6 +658,7 @@ impl AppState {
             demo_mode,
             dark: true,
             sidebar_collapsed: false,
+            connections_seen_healthy: false,
             nav: NavTarget::Runs,
             previous_list_nav: NavTarget::Runs,
             settings_tab: SettingsTab::GitHub,
@@ -630,10 +693,90 @@ impl AppState {
     }
 
     pub fn should_show_onboarding(&self) -> bool {
-        self.snapshot.runs.is_empty()
-            && self.snapshot.settings.servers.is_empty()
-            && !self.snapshot.settings.has_github_token
-            && self.snapshot.settings.repo_bindings.is_empty()
+        !self.snapshot.settings.onboarding_completed
+    }
+
+    pub fn connections_health(&self) -> ConnectionsHealth {
+        let mut worst = ConnectionsHealth::Healthy;
+        for srv in &self.snapshot.settings.servers {
+            let (h, _) = vps_health_status(srv);
+            match h {
+                ConnectionsHealth::Danger => return ConnectionsHealth::Danger,
+                ConnectionsHealth::Warning => worst = ConnectionsHealth::Warning,
+                ConnectionsHealth::Healthy => {}
+            }
+        }
+        worst
+    }
+
+    pub fn sync_connections_health_seen(&mut self) {
+        if self.connections_health() != ConnectionsHealth::Healthy {
+            self.connections_seen_healthy = false;
+        }
+    }
+
+    pub fn sidebar_connections_indicator(&self) -> Option<ConnectionsHealth> {
+        match self.connections_health() {
+            ConnectionsHealth::Danger => Some(ConnectionsHealth::Danger),
+            ConnectionsHealth::Warning => Some(ConnectionsHealth::Warning),
+            ConnectionsHealth::Healthy => {
+                if self.connections_seen_healthy {
+                    None
+                } else {
+                    Some(ConnectionsHealth::Healthy)
+                }
+            }
+        }
+    }
+
+    pub fn complete_onboarding(&mut self, tx: &mut Tx) {
+        if self.demo_mode {
+            self.snapshot.settings.onboarding_completed = true;
+        } else {
+            let mut guard = self.shared.lock().unwrap();
+            guard.settings.onboarding_completed = true;
+            model::save_settings(&guard);
+            self.snapshot = guard.clone();
+        }
+        self.navigate_to(NavTarget::Runs);
+        self.push_toast(
+            "onboarding-done",
+            "Configuração inicial concluída",
+            Some("Você pode reabrir o guia quando quiser em Configurações → Sobre.".into()),
+            ToastKind::Success,
+            tx,
+        );
+    }
+
+    pub fn reopen_onboarding(&mut self) {
+        self.navigate_to(NavTarget::Onboarding);
+    }
+
+    pub fn toggle_minimize_to_tray(&mut self, tx: &mut Tx) {
+        let next = !self.snapshot.settings.minimize_to_tray;
+        if self.demo_mode {
+            self.snapshot.settings.minimize_to_tray = next;
+        } else {
+            let mut guard = self.shared.lock().unwrap();
+            guard.settings.minimize_to_tray = next;
+            model::save_settings(&guard);
+            self.snapshot = guard.clone();
+        }
+        self.push_toast(
+            "tray-toggle",
+            if next {
+                "Minimizar para a bandeja ativado"
+            } else {
+                "Minimizar para a bandeja desativado"
+            },
+            Some(if next {
+                "Ao fechar a janela, o Workploy continuará ativo na bandeja do sistema.".into()
+            } else {
+                "Ao fechar a janela, o aplicativo será encerrado.".into()
+            }),
+            ToastKind::Info,
+            tx,
+        );
     }
 
     pub fn open_settings(&mut self, tab: SettingsTab) {
@@ -688,12 +831,18 @@ impl AppState {
             || self.snapshot.provisioning_server_id.is_some()
             || self.snapshot.github_testing
             || self.snapshot.update_checking
+            || self.snapshot.repo_branches_loading
+            || self.snapshot.repo_workflows_loading
     }
 
     pub fn navigate_to(&mut self, target: NavTarget) {
         self.open_select = None;
         if !matches!(target, NavTarget::RunDetail { .. }) {
             self.previous_list_nav = target.clone();
+        }
+        if matches!(target, NavTarget::Connections) {
+            self.connections_seen_healthy =
+                self.connections_health() == ConnectionsHealth::Healthy;
         }
         self.nav = target;
     }
@@ -1141,6 +1290,7 @@ impl AppState {
             model::save_settings(&guard);
             self.snapshot = guard.clone();
         }
+        self.sync_connections_health_seen();
         self.modal = ModalState::None;
         self.push_toast(
             format!("srv-save-{id}"),
@@ -1191,6 +1341,7 @@ impl AppState {
                 }
             }
         }
+        self.sync_connections_health_seen();
         self.modal = ModalState::None;
         self.push_toast(
             format!("srv-del-{server_id}"),
@@ -1232,6 +1383,8 @@ impl AppState {
                     ram_total_mb: ram,
                     ram_free_mb: ram * 3 / 4,
                     disk_free_gb: disk,
+                    cpu_usage_pct: 18,
+                    disk_used_pct: 38,
                     has_git: true,
                     has_docker: true,
                     has_node: true,
@@ -1261,6 +1414,7 @@ impl AppState {
                     tx,
                 );
             }
+            self.sync_connections_health_seen();
             return;
         }
         vps::probe_vps(&self.shared, server_id);
@@ -1338,6 +1492,7 @@ impl AppState {
             }
             self.snapshot.runner_sync_status =
                 format!("'{server_name}' provisionada com workploy-runner ativo na porta {port}.");
+            self.sync_connections_health_seen();
             self.push_toast(
                 format!("prov-{server_id}"),
                 "Motor provisionado",
@@ -1447,6 +1602,96 @@ impl AppState {
             ToastKind::Info,
             tx,
         );
+    }
+
+    pub fn toggle_binding_branch(branch_edit: &mut TextEdit, branch_name: &str) {
+        let target = branch_name.trim();
+        if target.is_empty() {
+            return;
+        }
+        let current = branch_edit.text.trim();
+        if current.is_empty() || current == "*" {
+            *branch_edit = TextEdit::new(target);
+            return;
+        }
+        let mut items: Vec<String> = current
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*")
+            .map(str::to_string)
+            .collect();
+        if let Some(pos) = items.iter().position(|x| x == target) {
+            items.remove(pos);
+        } else {
+            items.push(target.to_string());
+        }
+        *branch_edit = TextEdit::new(items.join(","));
+    }
+
+    pub fn fetch_binding_branches(&mut self, tx: &mut Tx) {
+        let repo = match &self.modal {
+            ModalState::BindingEditor(d) => d.full_name.text.trim().to_string(),
+            _ => return,
+        };
+        if self.demo_mode {
+            self.snapshot.repo_branches_loading = false;
+            if repo.is_empty() || !repo.contains('/') {
+                self.snapshot.repo_branches_repo.clear();
+                self.snapshot.repo_branches.clear();
+                self.snapshot.repo_branches_status =
+                    "Informe o repositório (dono/repo) para buscar branches.".into();
+                return;
+            }
+            self.snapshot.repo_branches_repo = repo.clone();
+            self.snapshot.repo_branches = vec!["main".into(), "dev".into(), "staging".into()];
+            self.snapshot.repo_branches_status =
+                format!("3 branch(es) encontrada(s) em {repo}.");
+            return;
+        }
+        github::fetch_repo_branches(&self.shared, repo);
+        self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
+    pub fn scan_binding_workflows(&mut self, tx: &mut Tx) {
+        let repo = match &self.modal {
+            ModalState::BindingEditor(d) => d.full_name.text.trim().to_string(),
+            _ => return,
+        };
+        if self.demo_mode {
+            self.snapshot.repo_workflows_loading = false;
+            if repo.is_empty() || !repo.contains('/') {
+                self.snapshot.repo_workflows_repo.clear();
+                self.snapshot.repo_workflows.clear();
+                self.snapshot.repo_workflows_status =
+                    "Informe o repositório (dono/repo) para buscar fluxos.".into();
+                return;
+            }
+            self.snapshot.repo_workflows_repo = repo.clone();
+            self.snapshot.repo_workflows = vec![
+                DetectedWorkflow {
+                    path: ".github/workflows/ci.yml".into(),
+                    name: "CI".into(),
+                    kind: "github-actions".into(),
+                },
+                DetectedWorkflow {
+                    path: ".github/workflows/deploy.yml".into(),
+                    name: "Deploy VPS".into(),
+                    kind: "github-actions".into(),
+                },
+                DetectedWorkflow {
+                    path: "Dockerfile".into(),
+                    name: "Dockerfile".into(),
+                    kind: "docker".into(),
+                },
+            ];
+            self.snapshot.repo_workflows_status =
+                "2 fluxo(s) encontrado(s) em .github/workflows + 1 arquivo(s) na raiz".into();
+            return;
+        }
+        github::scan_repo_workflows(&self.shared, repo);
+        self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
     }
 
     pub fn open_new_binding_modal(&mut self, prefill: Option<&GithubRepoSummary>) {
@@ -1751,6 +1996,8 @@ impl AppState {
             repo_bindings: prev.repo_bindings.clone(),
             github_user: prev.github_user.clone(),
             purge_rule: prev.purge_rule.clone(),
+            onboarding_completed: prev.onboarding_completed,
+            minimize_to_tray: prev.minimize_to_tray,
         };
         if !self.demo_mode {
             let mut guard = self.shared.lock().unwrap();
@@ -2035,10 +2282,11 @@ pub fn poll_app(s: &mut AppState, t: f64, tx: &mut Tx) -> bool {
     let g = s.wake_gen.load(Ordering::Relaxed);
     if g != s.last_wake_gen {
         s.last_wake_gen = g;
-        if !s.demo_mode
-            && let Ok(guard) = s.shared.lock()
-        {
-            s.snapshot = guard.clone();
+        if !s.demo_mode {
+            if let Ok(guard) = s.shared.lock() {
+                s.snapshot = guard.clone();
+            }
+            s.sync_connections_health_seen();
         }
         changed = true;
     }

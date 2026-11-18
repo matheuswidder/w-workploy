@@ -553,6 +553,58 @@ pub fn poll_binding_step(
     to_trigger
 }
 
+pub fn poll_binding_branch_step(
+    sh: &SharedHandle,
+    branch_shas: &mut std::collections::HashMap<(String, String), String>,
+    binding_id: &str,
+    branch: &str,
+    total_branches: usize,
+    sha: &str,
+    message: &str,
+) -> Vec<(String, String)> {
+    if total_branches <= 1 {
+        return poll_binding_step(sh, binding_id, sha, message);
+    }
+    let short = sha[..7.min(sha.len())].to_string();
+    let key = (binding_id.to_string(), branch.to_string());
+    let prev = branch_shas.get(&key).cloned();
+    let mut to_trigger: Vec<(String, String)> = Vec::new();
+    {
+        let mut s = sh.lock().unwrap();
+        let workflows = s.workflows.clone();
+        if let Some(b) = s.settings.repo_bindings.iter_mut().find(|x| x.id == binding_id) {
+            let repo_name = b.full_name.clone();
+            match prev {
+                None => {
+                    branch_shas.insert(key, sha.to_string());
+                    b.last_sha = sha.to_string();
+                    b.last_status =
+                        format!("Monitorando {total_branches} branches — {branch}: {short}");
+                }
+                Some(ref old) if old != sha => {
+                    branch_shas.insert(key, sha.to_string());
+                    b.last_sha = sha.to_string();
+                    b.last_status =
+                        format!("Novo commit {short} em {branch} — disparando execução");
+                    for wf_id in matching_workflows_for_binding(&workflows, b) {
+                        to_trigger.push((
+                            wf_id,
+                            format!("push em {repo_name}@{branch} ({short}): {message}"),
+                        ));
+                    }
+                }
+                Some(_) => {
+                    b.last_status =
+                        format!("Sem alterações em {total_branches} branches ({branch}: {short})");
+                }
+            }
+            save_settings(&s);
+        }
+    }
+    notify(sh);
+    to_trigger
+}
+
 fn fetch_branch_head_sha(repo: &str, branch: &str, token: &str) -> Result<(String, String), String> {
     let url = format!("https://api.github.com/repos/{repo}/commits/{branch}");
     let mut req = ureq::get(&url)
@@ -586,12 +638,22 @@ fn fetch_branch_head_sha(repo: &str, branch: &str, token: &str) -> Result<(Strin
 
 pub fn spawn_github_poller(sh: SharedHandle) {
     std::thread::spawn(move || {
+        let mut branch_shas: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
         let mut last_check = Instant::now()
             .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let (legacy_enabled, legacy_repo, legacy_branch, mem_token, every, desktop_bindings) = {
+            let (
+                legacy_enabled,
+                legacy_repo,
+                legacy_branch,
+                mem_token,
+                every,
+                desktop_bindings,
+                default_branches,
+            ) = {
                 let s = sh.lock().unwrap();
                 let bindings: Vec<RepoBinding> = s
                     .settings
@@ -604,6 +666,11 @@ pub fn spawn_github_poller(sh: SharedHandle) {
                     })
                     .cloned()
                     .collect();
+                let defs: Vec<(String, String)> = s
+                    .github_repos
+                    .iter()
+                    .map(|r| (r.full_name.to_ascii_lowercase(), r.default_branch.clone()))
+                    .collect();
                 (
                     s.settings.poll_enabled,
                     s.settings.github_repo.clone(),
@@ -611,6 +678,7 @@ pub fn spawn_github_poller(sh: SharedHandle) {
                     s.settings.github_token.clone(),
                     s.settings.poll_secs.max(15),
                     bindings,
+                    defs,
                 )
             };
 
@@ -691,32 +759,48 @@ pub fn spawn_github_poller(sh: SharedHandle) {
             }
 
             for b in desktop_bindings {
-                let branch = if b.branch.trim().is_empty() {
-                    "main"
-                } else {
-                    b.branch.trim()
-                };
-                match fetch_branch_head_sha(b.full_name.trim(), branch, &token) {
-                    Ok((sha, message)) => {
-                        let triggers = poll_binding_step(&sh, &b.id, &sha, &message);
-                        for (wf_id, _summary) in triggers {
-                            start_run_full(
+                let def_branch = default_branches
+                    .iter()
+                    .find(|(name, _)| *name == b.full_name.trim().to_ascii_lowercase())
+                    .map(|(_, br)| br.as_str())
+                    .unwrap_or("main");
+                let branches = crate::github::expand_branch_targets(&b.branch, def_branch);
+                let total_branches = branches.len();
+                for target_branch in branches {
+                    match fetch_branch_head_sha(b.full_name.trim(), &target_branch, &token) {
+                        Ok((sha, message)) => {
+                            let triggers = poll_binding_branch_step(
                                 &sh,
-                                &wf_id,
-                                "push no GitHub",
-                                Some((sha.clone(), message.clone())),
+                                &mut branch_shas,
+                                &b.id,
+                                &target_branch,
+                                total_branches,
+                                &sha,
+                                &message,
                             );
+                            for (wf_id, _summary) in triggers {
+                                start_run_full(
+                                    &sh,
+                                    &wf_id,
+                                    "push no GitHub",
+                                    Some((sha.clone(), message.clone())),
+                                );
+                            }
                         }
-                    }
-                    Err(err) => {
-                        let mut s = sh.lock().unwrap();
-                        if let Some(entry) =
-                            s.settings.repo_bindings.iter_mut().find(|x| x.id == b.id)
-                        {
-                            entry.last_status = err;
+                        Err(err) => {
+                            let mut s = sh.lock().unwrap();
+                            if let Some(entry) =
+                                s.settings.repo_bindings.iter_mut().find(|x| x.id == b.id)
+                            {
+                                entry.last_status = if total_branches > 1 {
+                                    format!("{target_branch}: {err}")
+                                } else {
+                                    err
+                                };
+                            }
+                            drop(s);
+                            notify(&sh);
                         }
-                        drop(s);
-                        notify(&sh);
                     }
                 }
             }
@@ -1040,5 +1124,59 @@ mod tests {
         let t3 = poll_binding_step(&sh, "rb-1", "2222222bbbbbbb", "feat: deploy");
         assert_eq!(t3.len(), 1);
         assert_eq!(t3[0].0, "wf-bound");
+    }
+
+    #[test]
+    fn desktop_repo_binding_multi_branch_polling_tracks_each_branch() {
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            s.workflows.push(echo_workflow("wf-multi", false, None));
+            s.settings.repo_bindings.push(RepoBinding {
+                id: "rb-multi".into(),
+                full_name: "widder/app".into(),
+                target_server_id: None,
+                branch: "main,dev".into(),
+                trigger_mode: TriggerMode::PollOnDesktop,
+                workflow_id: Some("wf-multi".into()),
+                enabled: true,
+                last_sha: String::new(),
+                last_status: String::new(),
+            });
+        }
+
+        let mut branch_shas = std::collections::HashMap::new();
+        // Primeira sondagem em main e dev não dispara
+        assert!(
+            poll_binding_branch_step(&sh, &mut branch_shas, "rb-multi", "main", 2, "aaa1111", "init main")
+                .is_empty()
+        );
+        assert!(
+            poll_binding_branch_step(&sh, &mut branch_shas, "rb-multi", "dev", 2, "bbb2222", "init dev")
+                .is_empty()
+        );
+
+        // Segunda sondagem sem mudança em nenhuma das duas não dispara
+        assert!(
+            poll_binding_branch_step(&sh, &mut branch_shas, "rb-multi", "main", 2, "aaa1111", "init main")
+                .is_empty()
+        );
+        assert!(
+            poll_binding_branch_step(&sh, &mut branch_shas, "rb-multi", "dev", 2, "bbb2222", "init dev")
+                .is_empty()
+        );
+
+        // Novo commit apenas em dev dispara
+        let trig = poll_binding_branch_step(
+            &sh,
+            &mut branch_shas,
+            "rb-multi",
+            "dev",
+            2,
+            "ccc3333",
+            "feat: dev",
+        );
+        assert_eq!(trig.len(), 1);
+        assert_eq!(trig[0].0, "wf-multi");
     }
 }
