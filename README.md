@@ -70,11 +70,19 @@ Baixe o pacote da versão desejada na página de [Releases](https://github.com/m
 - **`Workploy-Setup-<versão>.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
 - **`workploy-<versão>-win64-portable.zip`**: pacote portátil com `portable.flag`, pronto para extrair e executar em qualquer pasta sem alterar o registro do Windows.
 
-## Suporte Linux (Roadmap / Compilação)
+## Instalação (Linux x86_64)
 
-O núcleo em Rust, a interface em Rune (`wgpu` e `winit`) e o agente `workploy-runner` já são compatíveis com Linux. Hoje, apenas o instalador Win32 (`installer/`) e o backend do Cofre do Windows (`windows-native-keyring-store`) dependem do Windows. Em sistemas Unix, [`app/src/vault.rs`](app/src/vault.rs) usa armazenamento em memória enquanto o suporte ao Secret Service e os pacotes AppImage/DEB entram no roadmap.
+Baixe o pacote `workploy-<versão>-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
 
-Para compilar e executar o cliente desktop no Linux:
+```bash
+tar -xzf workploy-0.1.3-linux-x86_64.tar.gz
+cd workploy-0.1.3-linux-x86_64
+./install.sh
+```
+
+O script instala o binário em `~/.local/bin/workploy`, o ícone e o atalho `.desktop` no menu de aplicativos do usuário (e inclui `./uninstall.sh` para remoção limpa). Em sistemas Linux, [`app/src/vault.rs`](app/src/vault.rs) usa armazenamento em memória na sessão enquanto a integração com Secret Service entra nas próximas versões.
+
+Para compilar e executar o cliente desktop manualmente no Linux:
 
 ```bash
 cargo check --manifest-path app/Cargo.toml --all-targets
