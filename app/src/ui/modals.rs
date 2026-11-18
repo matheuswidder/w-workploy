@@ -879,7 +879,9 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .map(str::to_string)
                 .collect();
 
-            let mut branch_chips = row()
+            let branch_quick_chips = row()
+                .w_full()
+                .min_w(0.0)
                 .gap(6.0)
                 .flex_wrap()
                 .child(
@@ -910,34 +912,16 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     )
                     .help("Limpa a seleção atual de branches para escolher manualmente."),
                 );
-            if branches_match {
-                for (idx, br) in s.snapshot.repo_branches.iter().enumerate() {
-                    let active = selected_branches.iter().any(|x| x == br);
-                    let br_name = br.clone();
-                    branch_chips = branch_chips.child(
-                        chip(
-                            t,
-                            format!("bind-branch-opt-{idx}"),
-                            br.clone(),
-                            active,
-                            move |s: &mut AppState, _| {
-                                if let ModalState::BindingEditor(d) = &mut s.modal {
-                                    AppState::toggle_binding_branch(&mut d.branch, &br_name);
-                                }
-                            },
-                        )
-                        .help(format!("Adicionar ou remover '{br}' da lista de branches monitoradas.")),
-                    );
-                }
-            }
 
             let branches_loading = s.snapshot.repo_branches_loading;
             let mut branch_section = col()
                 .w_full()
+                .min_w(0.0)
                 .gap(8.0)
                 .child(
                     row()
                         .w_full()
+                        .min_w(0.0)
                         .gap(8.0)
                         .center_y()
                         .flex_wrap()
@@ -962,7 +946,48 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                             .help("Consulta as branches disponíveis deste repositório no GitHub."),
                         ),
                 )
-                .child(branch_chips);
+                .child(branch_quick_chips);
+
+            if branches_match && !s.snapshot.repo_branches.is_empty() {
+                let mut fetched_chips = row().w_full().min_w(0.0).gap(6.0).flex_wrap();
+                for (idx, br) in s.snapshot.repo_branches.iter().enumerate() {
+                    let active = selected_branches.iter().any(|x| x == br);
+                    let br_name = br.clone();
+                    fetched_chips = fetched_chips.child(
+                        chip(
+                            t,
+                            format!("bind-branch-opt-{idx}"),
+                            br.clone(),
+                            active,
+                            move |s: &mut AppState, _| {
+                                if let ModalState::BindingEditor(d) = &mut s.modal {
+                                    AppState::toggle_binding_branch(&mut d.branch, &br_name);
+                                }
+                            },
+                        )
+                        .help(format!("Adicionar ou remover '{br}' da lista de branches monitoradas.")),
+                    );
+                }
+                branch_section = branch_section.child(
+                    col()
+                        .key("bind-branches-scroll")
+                        .w_full()
+                        .min_w(0.0)
+                        .max_h(104.0)
+                        .min_h(0.0)
+                        .padding(8.0)
+                        .radius(8.0)
+                        .fill(t.surface_2)
+                        .border(1.0, t.border_subtle)
+                        .clip_rounded(8.0)
+                        .clip_soft(0.0)
+                        .scroll(ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .scroll_edge_fade(8.0)
+                        .child(fetched_chips),
+                );
+            }
 
             if show_branch_status {
                 let st_lower = s.snapshot.repo_branches_status.to_lowercase();

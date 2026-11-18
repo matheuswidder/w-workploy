@@ -582,6 +582,8 @@ pub struct Shared {
     #[serde(skip)]
     pub runner_sync_status: String,
     #[serde(skip)]
+    pub sync_last_event: Option<(u64, bool, String)>,
+    #[serde(skip)]
     pub update_checking: bool,
     #[serde(skip)]
     pub update_downloading: bool,

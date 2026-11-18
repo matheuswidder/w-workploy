@@ -1334,4 +1334,147 @@ mod tests {
         }
         assert_eq!(show_calls.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn provision_modal_clears_stale_log_when_idle_and_keeps_active_log() {
+        let mut state = AppState::init_demo();
+        state.snapshot.provisioning_server_id = None;
+        state.snapshot.provision_log = "=== Provisionamento concluído! ===\nlog antigo".into();
+
+        state.open_provision_modal("vps-staging");
+        assert!(
+            state.snapshot.provision_log.is_empty(),
+            "idle open_provision_modal must clear previous VPS log"
+        );
+        assert!(matches!(state.modal, ModalState::ProvisionModal(_)));
+
+        // When a provision is actively running, opening the modal must preserve the active log
+        state.snapshot.provisioning_server_id = Some("vps-prod".into());
+        state.snapshot.provision_log = "Instalando Docker...".into();
+        state.open_provision_modal("vps-staging");
+        assert_eq!(state.snapshot.provision_log, "Instalando Docker...");
+    }
+
+    #[test]
+    fn sync_last_event_triggers_automatic_toasts_on_poll() {
+        let state = AppState::init_demo();
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+
+        let mut tx = Tx::default();
+        rt.state.snapshot.sync_last_event = Some((
+            1,
+            true,
+            "Regras e repositórios sincronizados em 'VPS Produção'.".into(),
+        ));
+        assert!(poll_app(&mut rt.state, 0.1, &mut tx));
+        rt.frame(0.1);
+        assert_eq!(rt.state.last_sync_event_seq, 1);
+        let ok_toast = rt
+            .state
+            .toasts
+            .entries()
+            .last()
+            .expect("sync success toast emitted");
+        assert_eq!(ok_toast.options.kind, state::ToastKind::Success);
+        assert!(
+            ok_toast
+                .options
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("VPS Produção"))
+        );
+
+        rt.state.snapshot.sync_last_event = Some((
+            2,
+            false,
+            "Falha ao enviar configuração para 'VPS Produção': timeout".into(),
+        ));
+        assert!(poll_app(&mut rt.state, 0.2, &mut tx));
+        rt.frame(0.2);
+        assert_eq!(rt.state.last_sync_event_seq, 2);
+        let err_toast = rt
+            .state
+            .toasts
+            .entries()
+            .last()
+            .expect("sync danger toast emitted");
+        assert_eq!(err_toast.options.kind, state::ToastKind::Danger);
+        assert!(
+            err_toast
+                .options
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("timeout"))
+        );
+    }
+
+    #[test]
+    fn binding_editor_branches_scroll_container_bounds_height_and_keeps_controls_fixed() {
+        // 1. Without fetched branches, scroll box is hidden while quick controls stay visible
+        let mut empty_state = AppState::init_demo();
+        empty_state.open_new_binding_modal(None);
+        let mut rt_empty = Runtime::new(
+            empty_state,
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt_empty.frame(0.0);
+        rt_empty.frame(1.0 / 60.0);
+        assert!(rt_empty.find("bind-fetch-branches").is_some());
+        assert!(rt_empty.find("bind-branch-all").is_some());
+        assert!(rt_empty.find("bind-branch-none").is_some());
+        assert!(rt_empty.find("bind-branches-scroll").is_none());
+
+        // 2. With 24 branches across 360px, 768px, 1440px: compact scroll <= 104px, no overflow, controls above
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            state.open_new_binding_modal(None);
+            if let ModalState::BindingEditor(d) = &mut state.modal {
+                d.full_name = rune::TextEdit::new("widder/erp-central");
+            }
+            state.snapshot.repo_branches_repo = "widder/erp-central".into();
+            state.snapshot.repo_branches = (0..24)
+                .map(|i| format!("feature/module-{i:02}-long-branch"))
+                .collect();
+
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            let dialog = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("binding-modal-dialog"))
+                .expect("binding-modal-dialog exists");
+            let scroll = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("bind-branches-scroll"))
+                .expect("bind-branches-scroll exists");
+            assert!(
+                scroll.rect[3] <= 104.5,
+                "branch scroll container exceeded max_h(104.0) at {vw}px: {:?}",
+                scroll.rect
+            );
+            assert!(
+                scroll.rect[0] + scroll.rect[2] <= dialog.rect[0] + dialog.rect[2] + 0.5,
+                "branch scroll container overflowed dialog at {vw}px: scroll={:?}, dialog={:?}",
+                scroll.rect,
+                dialog.rect
+            );
+            for ctrl_key in ["bind-fetch-branches", "bind-branch-all", "bind-branch-none"] {
+                let ctrl = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(ctrl_key))
+                    .unwrap_or_else(|| panic!("{ctrl_key} exists"));
+                assert!(
+                    ctrl.rect[1] + ctrl.rect[3] <= scroll.rect[1] + 0.5,
+                    "{ctrl_key} should sit above bind-branches-scroll at {vw}px: ctrl={:?}, scroll={:?}",
+                    ctrl.rect,
+                    scroll.rect
+                );
+            }
+        }
+    }
 }

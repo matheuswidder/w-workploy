@@ -570,6 +570,7 @@ pub struct AppState {
     pub last_wake_gen: u64,
     pub last_github_event_seq: u64,
     pub last_update_event_seq: u64,
+    pub last_sync_event_seq: u64,
     pub demo_mode: bool,
 
     pub dark: bool,
@@ -649,6 +650,11 @@ impl AppState {
             .as_ref()
             .map(|e| e.0)
             .unwrap_or(0);
+        let last_sync_event_seq = snapshot
+            .sync_last_event
+            .as_ref()
+            .map(|e| e.0)
+            .unwrap_or(0);
         let mut st = Self {
             shared,
             snapshot,
@@ -656,6 +662,7 @@ impl AppState {
             last_wake_gen: 0,
             last_github_event_seq,
             last_update_event_seq,
+            last_sync_event_seq,
             demo_mode,
             dark: true,
             sidebar_collapsed: false,
@@ -1538,15 +1545,26 @@ impl AppState {
 
     pub fn open_provision_modal(&mut self, server_id: &str) {
         self.open_select = None;
-        if let Some(srv) = self
+        let Some(draft) = self
             .snapshot
             .settings
             .servers
             .iter()
             .find(|s| s.id == server_id)
-        {
-            self.modal = ModalState::ProvisionModal(Box::new(ProvisionDraft::for_server(srv)));
+            .map(ProvisionDraft::for_server)
+        else {
+            return;
+        };
+        if self.snapshot.provisioning_server_id.is_none() {
+            if !self.demo_mode
+                && let Ok(mut s) = self.shared.lock()
+                && s.provisioning_server_id.is_none()
+            {
+                s.provision_log.clear();
+            }
+            self.snapshot.provision_log.clear();
         }
+        self.modal = ModalState::ProvisionModal(Box::new(draft));
     }
 
     pub fn start_provision(&mut self, tx: &mut Tx) {
@@ -2483,6 +2501,19 @@ pub fn poll_app(s: &mut AppState, t: f64, tx: &mut Tx) -> bool {
             ("Atualizações verificadas", ToastKind::Info)
         };
         s.push_toast(format!("upd-event-{seq}"), title, Some(msg), kind, tx);
+        changed = true;
+    }
+
+    if let Some((seq, ok, msg)) = s.snapshot.sync_last_event.clone()
+        && seq > s.last_sync_event_seq
+    {
+        s.last_sync_event_seq = seq;
+        let (title, kind) = if ok {
+            ("Sincronizado na VPS", ToastKind::Success)
+        } else {
+            ("Falha ao sincronizar na VPS", ToastKind::Danger)
+        };
+        s.push_toast(format!("sync-event-{seq}"), title, Some(msg), kind, tx);
         changed = true;
     }
 

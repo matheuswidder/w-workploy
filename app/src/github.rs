@@ -616,7 +616,7 @@ pub fn server_needs_github_token(settings: &Settings, server_id: &str) -> bool {
 
 pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
     let (server, config_json, needs_gh_token, gh_token) = {
-        let s = sh.lock().unwrap();
+        let mut s = sh.lock().unwrap();
         let Some(srv) = s.settings.servers.iter().find(|v| v.id == server_id).cloned() else {
             return;
         };
@@ -624,10 +624,7 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
             Ok(c) => c,
             Err(e) => {
                 drop(s);
-                let mut g = sh.lock().unwrap();
-                g.runner_sync_status = e;
-                drop(g);
-                engine::notify(sh);
+                finish_sync_status(sh, server_id, false, e);
                 return;
             }
         };
@@ -637,8 +634,10 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
         } else {
             vault::load_secret(vault::KEY_GITHUB_PAT).ok().flatten()
         };
+        mark_sync_started(&mut s, server_id, &srv.name);
         (srv, cfg, needs_tok, tok)
     };
+    engine::notify(sh);
 
     let sh2 = sh.clone();
     std::thread::spawn(move || {
@@ -652,11 +651,17 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
         match vps::ssh_run_with_stdin(&server, upload_cfg_cmd, config_json.as_bytes()) {
             Ok((true, _, _)) => {}
             Ok((false, _, err)) => {
-                set_sync_status(&sh2, format!("Falha ao enviar configuração para '{}': {}", server.name, err.trim()));
+                let detail = err.trim();
+                let msg = if detail.is_empty() {
+                    format!("Falha ao enviar configuração para '{}'.", server.name)
+                } else {
+                    format!("Falha ao enviar configuração para '{}': {detail}", server.name)
+                };
+                finish_sync_status(&sh2, &server.id, false, msg);
                 return;
             }
             Err(e) => {
-                set_sync_status(&sh2, e);
+                finish_sync_status(&sh2, &server.id, false, e);
                 return;
             }
         }
@@ -669,18 +674,23 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
             match vps::ssh_run_with_stdin(&server, upload_tok_cmd, tok.trim().as_bytes()) {
                 Ok((true, _, _)) => {}
                 Ok((false, _, err)) => {
-                    set_sync_status(
-                        &sh2,
+                    let detail = err.trim();
+                    let msg = if detail.is_empty() {
                         format!(
-                            "Configuração enviada, mas falhou ao gravar github_token em '{}': {}",
-                            server.name,
-                            err.trim()
-                        ),
-                    );
+                            "Configuração enviada, mas falhou ao gravar github_token em '{}'.",
+                            server.name
+                        )
+                    } else {
+                        format!(
+                            "Configuração enviada, mas falhou ao gravar github_token em '{}': {detail}",
+                            server.name
+                        )
+                    };
+                    finish_sync_status(&sh2, &server.id, false, msg);
                     return;
                 }
                 Err(e) => {
-                    set_sync_status(&sh2, e);
+                    finish_sync_status(&sh2, &server.id, false, e);
                     return;
                 }
             }
@@ -689,19 +699,84 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
         let reload_cmd = format!(
             "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -X POST -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/reload'"
         );
-        let msg = match vps::ssh_run_capture(&server, &reload_cmd) {
-            Ok((true, _, _)) => format!("Regras e repositórios sincronizados em '{}'.", server.name),
-            Ok((false, _, err)) => format!("Configuração enviada para '{}', mas o reload falhou: {}", server.name, err.trim()),
-            Err(e) => e,
+        let (ok, msg) = match vps::ssh_run_capture(&server, &reload_cmd) {
+            Ok((true, _, _)) => (
+                true,
+                format!("Regras e repositórios sincronizados em '{}'.", server.name),
+            ),
+            Ok((false, _, err)) => {
+                let detail = err.trim();
+                let m = if detail.is_empty() {
+                    format!(
+                        "Configuração enviada para '{}', mas o reload falhou.",
+                        server.name
+                    )
+                } else {
+                    format!(
+                        "Configuração enviada para '{}', mas o reload falhou: {detail}",
+                        server.name
+                    )
+                };
+                (false, m)
+            }
+            Err(e) => (false, e),
         };
-        set_sync_status(&sh2, msg);
+        finish_sync_status(&sh2, &server.id, ok, msg);
     });
 }
 
-fn set_sync_status(sh: &SharedHandle, msg: String) {
+fn record_sync_event(s: &mut Shared, ok: bool, msg: String) {
+    let seq = s.sync_last_event.as_ref().map(|e| e.0).unwrap_or(0) + 1;
+    s.sync_last_event = Some((seq, ok, msg));
+}
+
+fn short_sync_error(msg: &str) -> String {
+    let first_line = msg
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("Falha ao sincronizar na VPS.");
+    const MAX_CHARS: usize = 96;
+    if first_line.chars().count() > MAX_CHARS {
+        let truncated: String = first_line.chars().take(MAX_CHARS - 1).collect();
+        format!("{truncated}…")
+    } else {
+        first_line.to_string()
+    }
+}
+
+fn mark_sync_started(s: &mut Shared, server_id: &str, server_name: &str) {
+    let status = format!("Sincronizando em '{server_name}'...");
+    for b in &mut s.settings.repo_bindings {
+        if b.enabled && b.target_server_id.as_deref() == Some(server_id) {
+            b.last_status = status.clone();
+        }
+    }
+    s.runner_sync_status = status;
+}
+
+fn apply_sync_status(s: &mut Shared, server_id: &str, ok: bool, msg: String) {
+    let binding_status = if ok {
+        "Sincronizado na VPS".to_string()
+    } else {
+        short_sync_error(&msg)
+    };
+    for b in &mut s.settings.repo_bindings {
+        if b.target_server_id.as_deref() == Some(server_id)
+            && (b.enabled || b.last_status.starts_with("Sincronizando"))
+        {
+            b.last_status = binding_status.clone();
+        }
+    }
+    s.runner_sync_status = msg.clone();
+    record_sync_event(s, ok, msg);
+}
+
+fn finish_sync_status(sh: &SharedHandle, server_id: &str, ok: bool, msg: String) {
     {
         let mut s = sh.lock().unwrap();
-        s.runner_sync_status = msg;
+        apply_sync_status(&mut s, server_id, ok, msg);
+        save_settings(&s);
     }
     engine::notify(sh);
 }
@@ -1717,5 +1792,62 @@ mod tests {
         }
 
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn sync_status_updates_bindings_and_records_monotonic_events() {
+        let mut s = Shared::default();
+        s.settings.repo_bindings.push(RepoBinding {
+            id: "rb-1".into(),
+            full_name: "widder/api".into(),
+            target_server_id: Some("vps-a".into()),
+            enabled: true,
+            last_status: String::new(),
+            ..RepoBinding::default()
+        });
+        s.settings.repo_bindings.push(RepoBinding {
+            id: "rb-disabled".into(),
+            full_name: "widder/paused".into(),
+            target_server_id: Some("vps-a".into()),
+            enabled: false,
+            last_status: "Pausado antes".into(),
+            ..RepoBinding::default()
+        });
+        s.settings.repo_bindings.push(RepoBinding {
+            id: "rb-other".into(),
+            full_name: "widder/other".into(),
+            target_server_id: Some("vps-b".into()),
+            enabled: true,
+            last_status: "Monitorando".into(),
+            ..RepoBinding::default()
+        });
+
+        mark_sync_started(&mut s, "vps-a", "Prod");
+        assert_eq!(
+            s.settings.repo_bindings[0].last_status,
+            "Sincronizando em 'Prod'..."
+        );
+        assert_eq!(s.settings.repo_bindings[1].last_status, "Pausado antes");
+        assert_eq!(s.settings.repo_bindings[2].last_status, "Monitorando");
+        assert_eq!(s.runner_sync_status, "Sincronizando em 'Prod'...");
+
+        let ok_msg = "Regras e repositórios sincronizados em 'Prod'.".to_string();
+        apply_sync_status(&mut s, "vps-a", true, ok_msg.clone());
+        assert_eq!(s.settings.repo_bindings[0].last_status, "Sincronizado na VPS");
+        assert_eq!(s.settings.repo_bindings[1].last_status, "Pausado antes");
+        assert_eq!(s.settings.repo_bindings[2].last_status, "Monitorando");
+        assert_eq!(s.runner_sync_status, ok_msg);
+        assert_eq!(s.sync_last_event, Some((1, true, ok_msg)));
+
+        let err_msg = "Falha ao enviar configuração para 'Prod': Permission denied\ndetalhe extra".to_string();
+        apply_sync_status(&mut s, "vps-a", false, err_msg.clone());
+        assert_eq!(
+            s.settings.repo_bindings[0].last_status,
+            "Falha ao enviar configuração para 'Prod': Permission denied"
+        );
+        assert_eq!(s.settings.repo_bindings[1].last_status, "Pausado antes");
+        assert_eq!(s.settings.repo_bindings[2].last_status, "Monitorando");
+        assert_eq!(s.runner_sync_status, err_msg);
+        assert_eq!(s.sync_last_event, Some((2, false, err_msg)));
     }
 }
