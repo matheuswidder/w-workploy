@@ -572,6 +572,8 @@ pub struct Shared {
     #[serde(skip)]
     pub provisioning_server_id: Option<String>,
     #[serde(skip)]
+    pub purging_server_id: Option<String>,
+    #[serde(skip)]
     pub provision_log: String,
     #[serde(skip)]
     pub github_repos: Vec<GithubRepoSummary>,

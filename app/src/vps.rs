@@ -480,18 +480,25 @@ pub fn probe_vps(sh: &SharedHandle, server_id: &str) {
     });
 }
 
+fn push_provision_log_line(s: &mut Shared, line: &str) {
+    s.provision_log.push_str(line);
+    if !line.ends_with('\n') {
+        s.provision_log.push('\n');
+    }
+    const CAP: usize = 200_000;
+    if s.provision_log.len() > CAP {
+        let mut cut = s.provision_log.len() - CAP;
+        while cut < s.provision_log.len() && !s.provision_log.is_char_boundary(cut) {
+            cut += 1;
+        }
+        s.provision_log.drain(..cut);
+    }
+}
+
 fn append_provision_log(sh: &SharedHandle, line: &str) {
     {
         let mut s = sh.lock().unwrap();
-        s.provision_log.push_str(line);
-        if !line.ends_with('\n') {
-            s.provision_log.push('\n');
-        }
-        const CAP: usize = 200_000;
-        if s.provision_log.len() > CAP {
-            let cut = s.provision_log.len() - CAP;
-            s.provision_log.drain(..cut);
-        }
+        push_provision_log_line(&mut s, line);
     }
     engine::notify(sh);
 }
@@ -1672,13 +1679,80 @@ pub fn remote_approve_or_cancel(sh: &SharedHandle, server_id: &str, run_id: &str
     });
 }
 
+pub fn webhook_endpoint_and_secret(server: &VpsServer) -> (String, Option<String>) {
+    let host = server.host.trim();
+    let port = if server.runner_port == 0 {
+        8787
+    } else {
+        server.runner_port
+    };
+    let url = format!("http://{host}:{port}/webhook/github");
+    let secret = vault::load_secret(&vault::vps_webhook_secret_key(&server.id))
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    (url, secret)
+}
+
+fn begin_vps_purge(s: &mut Shared, server_id: &str) -> Option<VpsServer> {
+    if s.purging_server_id.is_some() {
+        return None;
+    }
+    let srv = s.settings.servers.iter().find(|v| v.id == server_id).cloned()?;
+    s.purging_server_id = Some(server_id.to_string());
+    s.runner_sync_status = format!("Limpando caches e workspaces em '{}'...", srv.name);
+    push_provision_log_line(s, &format!("[purge] Iniciando limpeza em '{}'...", srv.name));
+    Some(srv)
+}
+
+fn parse_purge_response(server_name: &str, stdout: &str) -> (bool, String) {
+    match serde_json::from_str::<serde_json::Value>(stdout) {
+        Ok(v) => {
+            let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true);
+            let freed = v.get("freed_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let detail = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if ok {
+                let msg = match detail {
+                    Some(d) => format!(
+                        "Limpeza concluída em '{server_name}': {d} ({freed:.1} MB liberados)"
+                    ),
+                    None => format!(
+                        "Limpeza concluída em '{server_name}': {freed:.1} MB liberados"
+                    ),
+                };
+                (true, msg)
+            } else {
+                let msg = match detail {
+                    Some(d) => format!(
+                        "Limpeza falhou em '{server_name}': {d} ({freed:.1} MB liberados)"
+                    ),
+                    None => format!("Limpeza falhou em '{server_name}'."),
+                };
+                (false, msg)
+            }
+        }
+        Err(_) => (true, format!("Limpeza concluída em '{server_name}'.")),
+    }
+}
+
+fn finish_vps_purge(s: &mut Shared, ok: bool, msg: String, log_line: &str) {
+    push_provision_log_line(s, log_line);
+    s.purging_server_id = None;
+    s.runner_sync_status = msg.clone();
+    let seq = s.sync_last_event.as_ref().map(|e| e.0).unwrap_or(0) + 1;
+    s.sync_last_event = Some((seq, ok, msg));
+}
+
 pub fn trigger_vps_purge(sh: &SharedHandle, server_id: &str) {
     let server = {
         let mut s = sh.lock().unwrap();
-        let Some(srv) = s.settings.servers.iter().find(|v| v.id == server_id).cloned() else {
+        let Some(srv) = begin_vps_purge(&mut s, server_id) else {
             return;
         };
-        s.runner_sync_status = format!("Executando limpeza na VPS '{}'...", srv.name);
         srv
     };
     engine::notify(sh);
@@ -1693,38 +1767,41 @@ pub fn trigger_vps_purge(sh: &SharedHandle, server_id: &str) {
         let cmd = format!(
             "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -X POST -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/purge'"
         );
-        let msg = match ssh_run_capture(&server, &cmd) {
-            Ok((true, stdout, _)) => match serde_json::from_str::<serde_json::Value>(&stdout) {
-                Ok(v) => {
-                    let freed = v.get("freed_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let detail = v
-                        .get("message")
-                        .and_then(|x| x.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
-                    match detail {
-                        Some(d) => format!(
-                            "Limpeza concluída em '{}': {:.1} MB liberados ({d}).",
-                            server.name, freed
-                        ),
-                        None => format!(
-                            "Limpeza concluída em '{}': {:.1} MB liberados.",
-                            server.name, freed
-                        ),
-                    }
-                }
-                Err(_) => format!("Limpeza concluída em '{}'.", server.name),
-            },
-            Ok((false, _, stderr)) => format!(
-                "Falha ao executar limpeza em '{}': {}",
-                server.name,
-                stderr.trim()
-            ),
-            Err(e) => e,
+        let (ok, msg, log_line) = match ssh_run_capture(&server, &cmd) {
+            Ok((true, stdout, _)) => {
+                let (ok, msg) = parse_purge_response(&server.name, &stdout);
+                let log_line = if serde_json::from_str::<serde_json::Value>(&stdout).is_ok() {
+                    format!("[purge] {msg}")
+                } else if !stdout.trim().is_empty() {
+                    format!("[purge] {msg} (resposta: {})", stdout.trim())
+                } else {
+                    format!("[purge] {msg}")
+                };
+                (ok, msg, log_line)
+            }
+            Ok((false, stdout, stderr)) => {
+                let err_detail = match (stderr.trim(), stdout.trim()) {
+                    ("", "") => "erro desconhecido ao executar POST /purge".to_string(),
+                    (e, "") => e.to_string(),
+                    ("", o) => o.to_string(),
+                    (e, o) => format!("{e} | saída: {o}"),
+                };
+                let msg = format!(
+                    "Falha ao executar limpeza em '{}': {err_detail}",
+                    server.name
+                );
+                let log_line = format!("[purge erro] {msg}");
+                (false, msg, log_line)
+            }
+            Err(e) => {
+                let msg = format!("Falha ao executar limpeza em '{}': {e}", server.name);
+                let log_line = format!("[purge erro] {msg}");
+                (false, msg, log_line)
+            }
         };
         {
             let mut s = sh2.lock().unwrap();
-            s.runner_sync_status = msg;
+            finish_vps_purge(&mut s, ok, msg, &log_line);
         }
         engine::notify(&sh2);
     });
@@ -1923,5 +2000,104 @@ RUNNER_ACTIVE=1\r\n";
         assert!(script.contains("https://sh.rustup.rs"));
         assert!(script.contains("rustc --version && cargo --version"));
         assert!(!script.contains("cargo --version || true"));
+    }
+
+    #[test]
+    fn webhook_endpoint_and_secret_formats_url_with_port_fallback_and_reads_vault() {
+        let _guard = vault::test_lock();
+        let mut srv = VpsServer {
+            id: "vps-webhook-helper-test".into(),
+            name: "Prod".into(),
+            host: " 203.0.113.42 ".into(),
+            port: 22,
+            user: "deploy".into(),
+            auth: AuthMethod::SshConfigAlias,
+            last_probe: None,
+            runner_installed: true,
+            runner_port: 0,
+            webhook_secret_key: None,
+        };
+        let key = vault::vps_webhook_secret_key(&srv.id);
+        let _ = vault::delete_secret(&key);
+
+        let (url_default, sec_none) = webhook_endpoint_and_secret(&srv);
+        assert_eq!(url_default, "http://203.0.113.42:8787/webhook/github");
+        assert_eq!(sec_none, None);
+
+        srv.runner_port = 9095;
+        vault::save_secret(&key, "whsec-test-123").unwrap();
+        let (url_custom, sec_some) = webhook_endpoint_and_secret(&srv);
+        assert_eq!(url_custom, "http://203.0.113.42:9095/webhook/github");
+        assert_eq!(sec_some, Some("whsec-test-123".into()));
+
+        let _ = vault::delete_secret(&key);
+    }
+
+    #[test]
+    fn purge_feedback_updates_state_logs_and_monotonic_events() {
+        let srv = VpsServer {
+            id: "vps-purge-1".into(),
+            name: "Produção".into(),
+            host: "203.0.113.50".into(),
+            port: 22,
+            user: "deploy".into(),
+            auth: AuthMethod::SshConfigAlias,
+            last_probe: None,
+            runner_installed: true,
+            runner_port: 8787,
+            webhook_secret_key: None,
+        };
+        let mut s = Shared::default();
+        s.settings.servers.push(srv);
+        s.sync_last_event = Some((4, true, "evento anterior".into()));
+
+        assert!(begin_vps_purge(&mut s, "vps-purge-1").is_some());
+        assert_eq!(s.purging_server_id.as_deref(), Some("vps-purge-1"));
+        assert_eq!(
+            s.runner_sync_status,
+            "Limpando caches e workspaces em 'Produção'..."
+        );
+        assert!(s
+            .provision_log
+            .contains("[purge] Iniciando limpeza em 'Produção'..."));
+
+        // Segunda chamada concorrente deve ser ignorada enquanto purging_server_id está preenchido
+        assert!(begin_vps_purge(&mut s, "vps-purge-1").is_none());
+
+        let (ok, ok_msg) = parse_purge_response(
+            "Produção",
+            r#"{"ok": true, "freed_mb": 420.5, "message": "workspaces: 1 removidos, 2 caches limpos"}"#,
+        );
+        assert!(ok);
+        assert_eq!(
+            ok_msg,
+            "Limpeza concluída em 'Produção': workspaces: 1 removidos, 2 caches limpos (420.5 MB liberados)"
+        );
+
+        finish_vps_purge(&mut s, ok, ok_msg.clone(), &format!("[purge] {ok_msg}"));
+        assert_eq!(s.purging_server_id, None);
+        assert_eq!(s.runner_sync_status, ok_msg);
+        assert_eq!(s.sync_last_event, Some((5, true, ok_msg.clone())));
+        assert!(s.provision_log.contains(&format!("[purge] {ok_msg}")));
+
+        let (fail_ok, fail_msg) = parse_purge_response(
+            "Produção",
+            r#"{"ok": false, "freed_mb": 0.0, "message": "docker daemon offline"}"#,
+        );
+        assert!(!fail_ok);
+        assert_eq!(
+            fail_msg,
+            "Limpeza falhou em 'Produção': docker daemon offline (0.0 MB liberados)"
+        );
+
+        finish_vps_purge(
+            &mut s,
+            false,
+            fail_msg.clone(),
+            &format!("[purge erro] {fail_msg}"),
+        );
+        assert_eq!(s.purging_server_id, None);
+        assert_eq!(s.sync_last_event, Some((6, false, fail_msg.clone())));
+        assert!(s.provision_log.contains(&format!("[purge erro] {fail_msg}")));
     }
 }

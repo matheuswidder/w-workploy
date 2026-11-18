@@ -95,6 +95,80 @@ impl StatusFilter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkflowPreset {
+    NodePnpmCi,
+    RustCargoCi,
+    DockerComposeRedeploy,
+    AuditAndSmoke,
+}
+
+impl WorkflowPreset {
+    pub const ALL: [WorkflowPreset; 4] = [
+        WorkflowPreset::NodePnpmCi,
+        WorkflowPreset::RustCargoCi,
+        WorkflowPreset::DockerComposeRedeploy,
+        WorkflowPreset::AuditAndSmoke,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkflowPreset::NodePnpmCi => "Node / pnpm CI",
+            WorkflowPreset::RustCargoCi => "Rust Cargo CI",
+            WorkflowPreset::DockerComposeRedeploy => "Docker Compose Redeploy",
+            WorkflowPreset::AuditAndSmoke => "Auditoria & Smoke",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            WorkflowPreset::NodePnpmCi => {
+                "Preenche nome e 3 passos reais de CI Node/pnpm: install, lint + typecheck e build."
+            }
+            WorkflowPreset::RustCargoCi => {
+                "Preenche nome e 3 passos reais de CI Rust: cargo check, clippy estrito e cargo test."
+            }
+            WorkflowPreset::DockerComposeRedeploy => {
+                "Preenche nome e 3 passos reais de redeploy: git pull, docker compose build e up -d."
+            }
+            WorkflowPreset::AuditAndSmoke => {
+                "Preenche nome e 3 passos reais de auditoria e smoke: git status, docker ps e curl /health."
+            }
+        }
+    }
+
+    pub fn steps(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            WorkflowPreset::NodePnpmCi => &[
+                ("Instalar dependências", "pnpm install --frozen-lockfile"),
+                ("Lint e checagem de tipos", "pnpm lint && pnpm typecheck"),
+                ("Build de produção", "pnpm build"),
+            ],
+            WorkflowPreset::RustCargoCi => &[
+                ("Verificar compilação", "cargo check --all-targets"),
+                ("Análise estática (Clippy)", "cargo clippy --no-deps -- -D warnings"),
+                ("Executar suíte de testes", "cargo test"),
+            ],
+            WorkflowPreset::DockerComposeRedeploy => &[
+                ("Atualizar código-fonte", "git pull --ff-only"),
+                ("Construir imagens", "docker compose build"),
+                ("Subir containers", "docker compose up -d --remove-orphans"),
+            ],
+            WorkflowPreset::AuditAndSmoke => &[
+                ("Verificar estado do repositório", "git status -s"),
+                (
+                    "Listar containers ativos",
+                    r#"docker ps --format 'table {{.Names}}\t{{.Status}}'"#,
+                ),
+                (
+                    "Verificar endpoint de saúde",
+                    "curl -fsS http://127.0.0.1:3000/health || true",
+                ),
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StepDraft {
     pub uid: u64,
@@ -118,6 +192,24 @@ pub struct WorkflowDraft {
 }
 
 impl WorkflowDraft {
+    pub fn apply_preset(&mut self, preset: WorkflowPreset, next_uid: &mut u64) {
+        self.name = TextEdit::new(preset.label());
+        self.steps = preset
+            .steps()
+            .iter()
+            .map(|(name, cmd)| {
+                *next_uid += 1;
+                StepDraft {
+                    uid: *next_uid,
+                    name: TextEdit::new(*name),
+                    run: TextEdit::new(*cmd),
+                    approval: false,
+                }
+            })
+            .collect();
+        self.error = None;
+    }
+
     pub fn new_empty(next_uid: &mut u64) -> Self {
         *next_uid += 1;
         Self {
@@ -839,6 +931,7 @@ impl AppState {
             || self.snapshot.probing_server_id.is_some()
             || !self.probe_queue.is_empty()
             || self.snapshot.provisioning_server_id.is_some()
+            || self.snapshot.purging_server_id.is_some()
             || self.snapshot.github_testing
             || self.snapshot.update_checking
             || self.snapshot.update_downloading
@@ -1974,6 +2067,81 @@ impl AppState {
         github::sync_repo_bindings_to_vps(&self.shared, server_id);
         self.snapshot = self.shared.lock().unwrap().clone();
         tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
+    pub fn copy_binding_webhook_url(&mut self, server_id: &str, tx: &mut Tx) {
+        let Some(srv) = self
+            .snapshot
+            .settings
+            .servers
+            .iter()
+            .find(|s| s.id == server_id)
+        else {
+            self.push_toast(
+                format!("copy-wh-url-missing-{server_id}"),
+                "VPS não encontrada",
+                Some("Selecione uma VPS válida neste vínculo antes de copiar a URL.".into()),
+                ToastKind::Warning,
+                tx,
+            );
+            return;
+        };
+        let (url, _) = vps::webhook_endpoint_and_secret(srv);
+        tx.copy(url.clone());
+        self.push_toast(
+            format!("copy-wh-url-{server_id}"),
+            "URL do Webhook copiada",
+            Some(format!(
+                "{url} — cole em Settings → Webhooks no repositório GitHub."
+            )),
+            ToastKind::Success,
+            tx,
+        );
+    }
+
+    pub fn copy_binding_webhook_secret(&mut self, server_id: &str, tx: &mut Tx) {
+        let Some(srv) = self
+            .snapshot
+            .settings
+            .servers
+            .iter()
+            .find(|s| s.id == server_id)
+        else {
+            self.push_toast(
+                format!("copy-wh-sec-missing-{server_id}"),
+                "VPS não encontrada",
+                Some("Selecione uma VPS válida neste vínculo antes de copiar o segredo.".into()),
+                ToastKind::Warning,
+                tx,
+            );
+            return;
+        };
+        let (_, secret) = vps::webhook_endpoint_and_secret(srv);
+        let resolved = if let Some(sec) = secret {
+            Some(sec)
+        } else if self.demo_mode && srv.webhook_secret_key.is_some() {
+            Some("whsec_demo_workploy_secret_8787".to_string())
+        } else {
+            None
+        };
+        if let Some(sec) = resolved {
+            tx.copy(sec);
+            self.push_toast(
+                format!("copy-wh-sec-{server_id}"),
+                "Segredo do Webhook copiado",
+                Some("Cole no campo Secret ao criar o webhook em Settings → Webhooks no GitHub.".into()),
+                ToastKind::Success,
+                tx,
+            );
+        } else {
+            self.push_toast(
+                format!("copy-wh-sec-none-{server_id}"),
+                "Segredo ainda não configurado",
+                Some("Provisione o workploy-runner ou sincronize esta VPS para gerar o segredo no Cofre.".into()),
+                ToastKind::Warning,
+                tx,
+            );
+        }
     }
 
     pub fn open_purge_rule_modal(&mut self) {

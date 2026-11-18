@@ -5,7 +5,7 @@ use workploy::model::{RunnerKind, Trigger, TriggerMode};
 
 use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{
-    AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind,
+    AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind, WorkflowPreset,
 };
 use crate::ui::components::{btn_danger, btn_icon, btn_neutral, chip, pill_badge, primary_button};
 use crate::ui::icons;
@@ -22,6 +22,34 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 "Novo fluxo de trabalho"
             };
 
+            let mut presets_row = row().gap(6.0).flex_wrap();
+            for preset in WorkflowPreset::ALL {
+                let key = match preset {
+                    WorkflowPreset::NodePnpmCi => "ed-preset-node",
+                    WorkflowPreset::RustCargoCi => "ed-preset-rust",
+                    WorkflowPreset::DockerComposeRedeploy => "ed-preset-docker",
+                    WorkflowPreset::AuditAndSmoke => "ed-preset-audit",
+                };
+                let active = draft.name.text.trim() == preset.label();
+                presets_row = presets_row.child(
+                    chip(
+                        t,
+                        key,
+                        preset.label(),
+                        active,
+                        move |s: &mut AppState, _| {
+                            s.next_uid += 1;
+                            let mut next_uid = s.next_uid;
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.apply_preset(preset, &mut next_uid);
+                            }
+                            s.next_uid = next_uid;
+                        },
+                    )
+                    .help(preset.help()),
+                );
+            }
+
             let name_input = TextInput::new(&draft.name)
                 .label("Nome do fluxo")
                 .placeholder("Ex: Deploy VPS")
@@ -31,7 +59,8 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     _ => unreachable!(),
                 })
                 .build(k)
-                .cursor(Cursor::Text);
+                .cursor(Cursor::Text)
+                .help("Nome exibido na barra lateral, no histórico de execuções e nos vínculos de repositório.");
 
             let workdir_input = TextInput::new(&draft.workdir)
                 .label("Pasta de trabalho")
@@ -42,126 +71,199 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     _ => unreachable!(),
                 })
                 .build(k)
-                .cursor(Cursor::Text);
+                .cursor(Cursor::Text)
+                .help("Diretório onde os comandos do fluxo serão executados (ex: /srv/app na VPS ou C:\\Projects\\app no Windows).");
 
             let triggers = row()
                 .gap(6.0)
                 .flex_wrap()
-                .child(chip(
-                    t,
-                    "ed-trig-manual",
-                    "Manual (botão)",
-                    draft.trigger == Trigger::Manual,
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.trigger = Trigger::Manual;
-                        }
-                    },
-                ))
-                .child(chip(
-                    t,
-                    "ed-trig-push",
-                    "push no GitHub",
-                    draft.trigger == Trigger::Push,
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.trigger = Trigger::Push;
-                        }
-                    },
-                ))
-                .child(chip(
-                    t,
-                    "ed-trig-folder",
-                    "Mudança na pasta",
-                    draft.trigger == Trigger::Folder,
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.trigger = Trigger::Folder;
-                        }
-                    },
-                ));
+                .child(
+                    chip(
+                        t,
+                        "ed-trig-manual",
+                        "Manual (botão)",
+                        draft.trigger == Trigger::Manual,
+                        |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.trigger = Trigger::Manual;
+                            }
+                        },
+                    )
+                    .help("Executa apenas quando você clicar em 'Executar fluxo' ou quando for encadeado por outro fluxo."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "ed-trig-push",
+                        "push no GitHub",
+                        draft.trigger == Trigger::Push,
+                        |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.trigger = Trigger::Push;
+                            }
+                        },
+                    )
+                    .help("Dispara automaticamente quando houver um novo push na branch monitorada de um repositório vinculado."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "ed-trig-folder",
+                        "Mudança na pasta",
+                        draft.trigger == Trigger::Folder,
+                        |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.trigger = Trigger::Folder;
+                            }
+                        },
+                    )
+                    .help("Dispara automaticamente quando o vigia de pasta local detectar alterações na pasta monitorada."),
+                );
 
             let runners = row()
                 .gap(6.0)
                 .flex_wrap()
-                .child(chip(
-                    t,
-                    "ed-run-local",
-                    "Esta máquina",
-                    draft.runner == RunnerKind::Local,
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.runner = RunnerKind::Local;
-                        }
-                    },
-                ))
-                .child(chip(
-                    t,
-                    "ed-run-ssh",
-                    "VPS via SSH",
-                    draft.runner == RunnerKind::Ssh,
-                    |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.runner = RunnerKind::Ssh;
-                        }
-                    },
-                ));
+                .child(
+                    chip(
+                        t,
+                        "ed-run-local",
+                        "Esta máquina",
+                        draft.runner == RunnerKind::Local,
+                        |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.runner = RunnerKind::Local;
+                            }
+                        },
+                    )
+                    .help("Executa os comandos diretamente nesta máquina Windows."),
+                )
+                .child(
+                    chip(
+                        t,
+                        "ed-run-ssh",
+                        "VPS via SSH",
+                        draft.runner == RunnerKind::Ssh,
+                        |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.runner = RunnerKind::Ssh;
+                            }
+                        },
+                    )
+                    .help("Executa os comandos remotamente via SSH ou pelo agente workploy-runner 24/7 na VPS de destino."),
+                );
 
-            let mut server_row = row().gap(6.0).flex_wrap().child(chip(
-                t,
-                "ed-srv-default",
-                "Alias global",
-                draft.server_id.is_none(),
-                |s: &mut AppState, _| {
-                    if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                        d.server_id = None;
-                    }
-                },
-            ));
+            let mut server_row = row().gap(6.0).flex_wrap().child(
+                chip(
+                    t,
+                    "ed-srv-default",
+                    "Qualquer VPS",
+                    draft.server_id.is_none(),
+                    |s: &mut AppState, _| {
+                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                            d.server_id = None;
+                        }
+                    },
+                )
+                .help("Usa o alias SSH global ou qualquer VPS compatível configurada no vínculo do repositório."),
+            );
             for srv in &s.snapshot.settings.servers {
                 let sid = srv.id.clone();
                 let active = draft.server_id.as_deref() == Some(srv.id.as_str());
-                server_row = server_row.child(chip(
-                    t,
-                    format!("ed-srv-{}", srv.id),
-                    srv.name.clone(),
-                    active,
-                    move |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.server_id = Some(sid.clone());
-                        }
-                    },
-                ));
+                let tip = format!(
+                    "Executa este fluxo especificamente na VPS '{}' ({}:{}).",
+                    srv.name, srv.host, srv.port
+                );
+                server_row = server_row.child(
+                    chip(
+                        t,
+                        format!("ed-srv-{}", srv.id),
+                        srv.name.clone(),
+                        active,
+                        move |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.server_id = Some(sid.clone());
+                            }
+                        },
+                    )
+                    .help(tip),
+                );
             }
 
-            let mut chain_row = row().gap(6.0).flex_wrap().child(chip(
-                t,
-                "ed-chain-none",
-                "Nenhum",
-                draft.on_success.is_none(),
-                |s: &mut AppState, _| {
-                    if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                        d.on_success = None;
-                    }
-                },
-            ));
+            let mut repo_row = row().gap(6.0).flex_wrap().child(
+                chip(
+                    t,
+                    "ed-repo-all",
+                    "Todos",
+                    draft.repo_id.is_none(),
+                    |s: &mut AppState, _| {
+                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                            d.repo_id = None;
+                        }
+                    },
+                )
+                .help("Permite que qualquer vínculo de repositório compatível acione este fluxo."),
+            );
+            for b in &s.snapshot.settings.repo_bindings {
+                let bid = b.id.clone();
+                let active = draft.repo_id.as_deref() == Some(b.id.as_str());
+                let tip = format!(
+                    "Associa este fluxo ao vínculo '{}' (branch {}).",
+                    b.full_name, b.branch
+                );
+                repo_row = repo_row.child(
+                    chip(
+                        t,
+                        format!("ed-repo-{}", b.id),
+                        format!("{} ({})", b.full_name, b.branch),
+                        active,
+                        move |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.repo_id = Some(bid.clone());
+                            }
+                        },
+                    )
+                    .help(tip),
+                );
+            }
+
+            let mut chain_row = row().gap(6.0).flex_wrap().child(
+                chip(
+                    t,
+                    "ed-chain-none",
+                    "Nenhum",
+                    draft.on_success.is_none(),
+                    |s: &mut AppState, _| {
+                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                            d.on_success = None;
+                        }
+                    },
+                )
+                .help("Encerra o pipeline ao concluir todos os passos, sem disparar outro fluxo."),
+            );
             for wf in &s.snapshot.workflows {
                 if draft.id.as_deref() == Some(wf.id.as_str()) {
                     continue;
                 }
                 let target_id = wf.id.clone();
                 let active = draft.on_success.as_deref() == Some(wf.id.as_str());
-                chain_row = chain_row.child(chip(
-                    t,
-                    format!("ed-chain-{}", wf.id),
-                    wf.name.clone(),
-                    active,
-                    move |s: &mut AppState, _| {
-                        if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                            d.on_success = Some(target_id.clone());
-                        }
-                    },
-                ));
+                let tip = format!(
+                    "Se este fluxo terminar com sucesso, inicia automaticamente '{}'.",
+                    wf.name
+                );
+                chain_row = chain_row.child(
+                    chip(
+                        t,
+                        format!("ed-chain-{}", wf.id),
+                        wf.name.clone(),
+                        active,
+                        move |s: &mut AppState, _| {
+                            if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                d.on_success = Some(target_id.clone());
+                            }
+                        },
+                    )
+                    .help(tip),
+                );
             }
 
             let step_count = draft.steps.len();
@@ -177,18 +279,20 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                         _ => unreachable!(),
                     })
                     .build(k)
-                    .cursor(Cursor::Text);
+                    .cursor(Cursor::Text)
+                    .help("Título curto do passo exibido nos logs e no resumo visual do pipeline.");
 
                 let step_cmd_in = TextInput::new(&st.run)
                     .label(format!("Comando do passo {}", idx + 1))
-                    .placeholder("echo ok")
+                    .placeholder("pnpm test")
                     .width(None)
                     .on_edit(move |s: &mut AppState| match &mut s.modal {
                         ModalState::WorkflowEditor(d) => &mut d.steps[idx].run,
                         _ => unreachable!(),
                     })
                     .build(k)
-                    .cursor(Cursor::Text);
+                    .cursor(Cursor::Text)
+                    .help("Comando shell executado nesta etapa. Se falhar, o fluxo para aqui.");
 
                 let mut controls = row().gap(4.0).center_y();
                 if idx > 0 {
@@ -287,7 +391,8 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                         }
                                     })
                                     .build(k)
-                                    .cursor(Cursor::Pointer),
+                                    .cursor(Cursor::Pointer)
+                                    .help("Pausa a execução antes deste passo e aguarda aprovação manual na aba Aprovações."),
                             ),
                     );
 
@@ -297,6 +402,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
             let mut form = col()
                 .w_full()
                 .gap(12.0)
+                .child(labeled(t, "Presets rápidos", presets_row))
                 .child(labeled(t, "Nome do fluxo", name_input))
                 .child(
                     row()
@@ -308,7 +414,9 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 );
 
             if draft.runner == RunnerKind::Ssh {
-                form = form.child(labeled(t, "Servidor VPS cadastrado", server_row));
+                form = form
+                    .child(labeled(t, "VPS de destino", server_row))
+                    .child(labeled(t, "Repositório vinculado (opcional)", repo_row));
             }
 
             form = form
@@ -324,28 +432,31 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                 .font(ty::SMALL_MED)
                                 .color(t.text_primary),
                         )
-                        .child(btn_neutral(
-                            t,
-                            "btn-add-step",
-                            "Adicionar passo",
-                            Some(&icons::PLUS),
-                            28.0,
-                            |s: &mut AppState, _| {
-                                s.next_uid += 1;
-                                let uid = s.next_uid;
-                                if let ModalState::WorkflowEditor(d) = &mut s.modal {
-                                    d.steps.push(StepDraft {
-                                        uid,
-                                        name: rune::TextEdit::new(format!(
-                                            "Passo {}",
-                                            d.steps.len() + 1
-                                        )),
-                                        run: rune::TextEdit::new("echo ok"),
-                                        approval: false,
-                                    });
-                                }
-                            },
-                        )),
+                        .child(
+                            btn_neutral(
+                                t,
+                                "btn-add-step",
+                                "Adicionar passo",
+                                Some(&icons::PLUS),
+                                28.0,
+                                |s: &mut AppState, _| {
+                                    s.next_uid += 1;
+                                    let uid = s.next_uid;
+                                    if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                        d.steps.push(StepDraft {
+                                            uid,
+                                            name: rune::TextEdit::new(format!(
+                                                "Passo {}",
+                                                d.steps.len() + 1
+                                            )),
+                                            run: rune::TextEdit::new("echo ok"),
+                                            approval: false,
+                                        });
+                                    }
+                                },
+                            )
+                            .help("Adiciona um novo passo sequencial ao final deste fluxo."),
+                        ),
                 )
                 .child(steps_col);
 
@@ -357,24 +468,30 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .w_full()
                 .justify_end()
                 .gap(10.0)
-                .child(btn_neutral(
-                    t,
-                    "ed-cancel",
-                    "Cancelar",
-                    None,
-                    34.0,
-                    |s: &mut AppState, _| {
-                        s.modal = ModalState::None;
-                    },
-                ))
-                .child(primary_button(
-                    t,
-                    "ed-save",
-                    "Salvar fluxo",
-                    Some(&icons::CHECK_CIRCLE),
-                    34.0,
-                    |s: &mut AppState, tx: &mut Tx| s.save_workflow_draft(tx),
-                ));
+                .child(
+                    btn_neutral(
+                        t,
+                        "ed-cancel",
+                        "Cancelar",
+                        None,
+                        34.0,
+                        |s: &mut AppState, _| {
+                            s.modal = ModalState::None;
+                        },
+                    )
+                    .help("Descarta as alterações e fecha o editor."),
+                )
+                .child(
+                    primary_button(
+                        t,
+                        "ed-save",
+                        "Salvar fluxo",
+                        Some(&icons::CHECK_CIRCLE),
+                        34.0,
+                        |s: &mut AppState, tx: &mut Tx| s.save_workflow_draft(tx),
+                    )
+                    .help("Salva a definição do fluxo e atualiza os gatilhos configurados."),
+                );
 
             mount_shell_dialog(t, "editor", title, 720.0, form, footer, layer);
         }

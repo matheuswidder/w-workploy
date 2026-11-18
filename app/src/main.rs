@@ -1477,4 +1477,279 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn workflow_editor_presets_ssh_targets_and_tooltips_work() {
+        let mut state = AppState::init_demo();
+        state.open_edit_workflow_modal("wf-deploy-vps");
+        if let ModalState::WorkflowEditor(d) = &state.modal {
+            assert_eq!(d.server_id.as_deref(), Some("vps-prod"));
+            assert_eq!(d.repo_id.as_deref(), Some("rb-erp"));
+        } else {
+            panic!("expected WorkflowEditor");
+        }
+
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        let els = rt.elements();
+        for key in [
+            "ed-preset-node",
+            "ed-preset-rust",
+            "ed-preset-docker",
+            "ed-preset-audit",
+            "ed-trig-manual",
+            "ed-trig-push",
+            "ed-trig-folder",
+            "ed-run-local",
+            "ed-run-ssh",
+            "ed-srv-default",
+            "ed-srv-vps-prod",
+            "ed-repo-all",
+            "ed-repo-rb-erp",
+            "ed-chain-none",
+            "btn-add-step",
+        ] {
+            let el = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("expected WorkflowEditor control {key}"));
+            assert!(
+                el.help.as_deref().is_some_and(|h| !h.is_empty()),
+                "expected tooltip (.help) on {key}"
+            );
+        }
+
+        // Click each quick preset and verify real steps without `echo`
+        for (key, expected_name, expected_first_cmd) in [
+            ("ed-preset-node", "Node / pnpm CI", "pnpm install --frozen-lockfile"),
+            ("ed-preset-rust", "Rust Cargo CI", "cargo check --all-targets"),
+            ("ed-preset-docker", "Docker Compose Redeploy", "git pull --ff-only"),
+            ("ed-preset-audit", "Auditoria & Smoke", "git status -s"),
+        ] {
+            let (px, py) = rt.find(key).unwrap_or_else(|| panic!("{key} exists"));
+            rt.pointer_down(px, py);
+            rt.pointer_up(px, py);
+            rt.frame(1.0 / 60.0);
+            if let ModalState::WorkflowEditor(d) = &rt.state.modal {
+                assert_eq!(d.name.text, expected_name);
+                assert_eq!(d.steps.len(), 3);
+                assert_eq!(d.steps[0].run.text, expected_first_cmd);
+                for st in &d.steps {
+                    assert!(
+                        !st.run.text.contains("echo "),
+                        "preset {key} should not contain echo: {}",
+                        st.run.text
+                    );
+                }
+            } else {
+                panic!("expected WorkflowEditor");
+            }
+        }
+
+        // Select VPS Staging + repo rb-landing and save
+        let (sx, sy) = rt
+            .find("ed-srv-vps-staging")
+            .expect("ed-srv-vps-staging exists");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(1.0 / 60.0);
+
+        let (rx, ry) = rt
+            .find("ed-repo-rb-landing")
+            .expect("ed-repo-rb-landing exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+
+        let (svx, svy) = rt.find("ed-save").expect("ed-save exists");
+        rt.pointer_down(svx, svy);
+        rt.pointer_up(svx, svy);
+        rt.frame(1.0 / 60.0);
+
+        assert!(matches!(rt.state.modal, ModalState::None));
+        let saved = rt
+            .state
+            .snapshot
+            .workflows
+            .iter()
+            .find(|w| w.id == "wf-deploy-vps")
+            .unwrap();
+        assert_eq!(saved.server_id.as_deref(), Some("vps-staging"));
+        assert_eq!(saved.repo_id.as_deref(), Some("rb-landing"));
+    }
+
+    #[test]
+    fn workflow_runs_pipeline_summary_and_local_vps_warning_work() {
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            // Add an active automatic VPS binding so the smart warning triggers on wf-ci-principal (Local + Push)
+            state.snapshot.settings.repo_bindings.push(workploy::model::RepoBinding {
+                id: "rb-auto-vps".into(),
+                full_name: "widder/portal-cliente".into(),
+                target_server_id: Some("vps-prod".into()),
+                branch: "main".into(),
+                trigger_mode: workploy::model::TriggerMode::PollOnVps,
+                workflow_id: None,
+                enabled: true,
+                last_sha: String::new(),
+                last_status: String::new(),
+            });
+            state.navigate_to(NavTarget::WorkflowRuns("wf-ci-principal".into()));
+
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            for key in ["btn-run-wf", "btn-edit-wf", "btn-yaml-wf", "btn-del-wf"] {
+                let el = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("expected header button {key}"));
+                assert!(
+                    el.help.as_deref().is_some_and(|h| !h.is_empty()),
+                    "expected tooltip on {key}"
+                );
+            }
+            let summary = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("wf-pipeline-summary"))
+                .expect("wf-pipeline-summary exists");
+            let warn = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("wf-local-vps-warning"))
+                .expect("wf-local-vps-warning exists");
+            assert!(
+                summary.rect[0] + summary.rect[2] <= vw + 0.5,
+                "pipeline summary overflowed {vw}px: {:?}",
+                summary.rect
+            );
+            assert!(
+                warn.rect[0] + warn.rect[2] <= vw + 0.5,
+                "warning banner overflowed {vw}px: {:?}",
+                warn.rect
+            );
+
+            // Clicking "Editar fluxo" on warning banner opens WorkflowEditor
+            let (ex, ey) = rt
+                .find("btn-warn-edit-wf")
+                .expect("btn-warn-edit-wf exists");
+            rt.pointer_down(ex, ey);
+            rt.pointer_up(ex, ey);
+            rt.frame(1.0 / 60.0);
+            assert!(matches!(rt.state.modal, ModalState::WorkflowEditor(_)));
+        }
+    }
+
+    #[test]
+    fn settings_webhook_binding_copy_buttons_work() {
+        let mut state = AppState::init_demo();
+        state.open_settings(SettingsTab::GitHub);
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        for _ in 0..8 {
+            let Some((_, by)) = rt.find("btn-copy-wh-url-rb-erp") else {
+                break;
+            };
+            if by > 120.0 && by < 780.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+
+        // Only WebhookOnVps binding with VPS has copy buttons; PollOnDesktop does not
+        assert!(rt.find("btn-copy-wh-url-rb-erp").is_some());
+        assert!(rt.find("btn-copy-wh-sec-rb-erp").is_some());
+        assert!(rt.find("btn-copy-wh-url-rb-landing").is_none());
+
+        let els = rt.elements();
+        for key in ["btn-copy-wh-url-rb-erp", "btn-copy-wh-sec-rb-erp"] {
+            let el = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap();
+            let help = el.help.as_deref().unwrap_or("");
+            assert!(
+                help.contains("Webhooks") && help.contains("Sondagem 24/7 na VPS"),
+                "expected GitHub Webhooks + zero-config hint in tooltip of {key}: {help}"
+            );
+        }
+
+        let (ux, uy) = rt.find("btn-copy-wh-url-rb-erp").unwrap();
+        rt.pointer_down(ux, uy);
+        rt.pointer_up(ux, uy);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.title == "URL do Webhook copiada")
+        );
+
+        let (sx, sy) = rt.find("btn-copy-wh-sec-rb-erp").unwrap();
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.title == "Segredo do Webhook copiado")
+        );
+    }
+
+    #[test]
+    fn vps_purge_busy_state_disables_buttons_and_updates_label() {
+        let mut state = AppState::init_demo();
+        state.snapshot.runs.clear();
+        assert!(!state.has_active_runs());
+        state.snapshot.purging_server_id = Some("vps-prod".into());
+        assert!(state.has_active_runs());
+
+        // Connections screen: vps-prod shows "Limpando...", vps-staging disabled too
+        state.navigate_to(NavTarget::Connections);
+        let mut rt_conn = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt_conn.frame(0.0);
+        rt_conn.frame(1.0 / 60.0);
+        let els_conn = rt_conn.elements();
+        let prod_conn = els_conn
+            .iter()
+            .find(|e| e.key.as_deref() == Some("conn-purge-vps-vps-prod"))
+            .expect("conn-purge-vps-vps-prod exists");
+        assert_eq!(prod_conn.label.as_deref(), Some("Limpando..."));
+        assert!(!prod_conn.focusable);
+        let stg_conn = els_conn
+            .iter()
+            .find(|e| e.key.as_deref() == Some("conn-purge-vps-vps-staging"))
+            .expect("conn-purge-vps-vps-staging exists");
+        assert_eq!(stg_conn.label.as_deref(), Some("Limpar agora"));
+        assert!(!stg_conn.focusable);
+
+        // Settings -> VPS & Motor tab: same disabled / "Limpando..." behavior
+        rt_conn.update(|s, _| s.open_settings(SettingsTab::Vps));
+        rt_conn.frame(1.0 / 60.0);
+        let els_set = rt_conn.elements();
+        let prod_set = els_set
+            .iter()
+            .find(|e| e.key.as_deref() == Some("btn-purge-vps-vps-prod"))
+            .expect("btn-purge-vps-vps-prod exists");
+        assert_eq!(prod_set.label.as_deref(), Some("Limpando..."));
+        assert!(!prod_set.focusable);
+        let stg_set = els_set
+            .iter()
+            .find(|e| e.key.as_deref() == Some("btn-purge-vps-vps-staging"))
+            .expect("btn-purge-vps-vps-staging exists");
+        assert_eq!(stg_set.label.as_deref(), Some("Limpar agora"));
+        assert!(!stg_set.focusable);
+    }
 }

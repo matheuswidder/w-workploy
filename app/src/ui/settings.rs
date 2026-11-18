@@ -1,6 +1,6 @@
 use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::{Kit, Switch, TextInput};
-use workploy::model::{CapacityTier, GithubRepoSummary, VpsServer};
+use workploy::model::{CapacityTier, GithubRepoSummary, TriggerMode, VpsServer};
 
 use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{AppState, ModalState, SettingsTab};
@@ -586,6 +586,39 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
             let srv_sync = b.target_server_id.clone();
 
             let mut row_actions = row().gap(6.0).center_y().flex_wrap();
+            if b.trigger_mode == TriggerMode::WebhookOnVps
+                && let Some(sid_wh) = srv_sync.clone()
+            {
+                let sid_url = sid_wh.clone();
+                let sid_sec = sid_wh;
+                row_actions = row_actions
+                    .child(
+                        btn_neutral(
+                            t,
+                            format!("btn-copy-wh-url-{}", b.id),
+                            "Copiar URL Webhook",
+                            Some(&icons::COPY),
+                            28.0,
+                            move |s: &mut AppState, tx: &mut Tx| {
+                                s.copy_binding_webhook_url(&sid_url, tx);
+                            },
+                        )
+                        .help("Copia a URL do endpoint na VPS para colar em Settings → Webhooks no GitHub (ou use 'Sondagem 24/7 na VPS' para zero-config)."),
+                    )
+                    .child(
+                        btn_neutral(
+                            t,
+                            format!("btn-copy-wh-sec-{}", b.id),
+                            "Copiar Segredo",
+                            Some(&icons::SHIELD),
+                            28.0,
+                            move |s: &mut AppState, tx: &mut Tx| {
+                                s.copy_binding_webhook_secret(&sid_sec, tx);
+                            },
+                        )
+                        .help("Copia o segredo HMAC da VPS para colar no campo Secret em Settings → Webhooks no GitHub (ou use 'Sondagem 24/7 na VPS' para zero-config)."),
+                    );
+            }
             if let Some(sid) = srv_sync {
                 row_actions = row_actions.child(
                     btn_neutral(
@@ -1046,6 +1079,8 @@ fn servers_card(s: &AppState, t: UiTheme) -> El {
 fn vps_server_item(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
     let is_probing = s.snapshot.probing_server_id.as_deref() == Some(srv.id.as_str());
     let is_provisioning = s.snapshot.provisioning_server_id.as_deref() == Some(srv.id.as_str());
+    let is_purging = s.snapshot.purging_server_id.as_deref() == Some(srv.id.as_str());
+    let any_purging = s.snapshot.purging_server_id.is_some();
     let probe_ok = srv.last_probe.as_ref().is_some_and(|p| p.ok);
     let runner_online = srv
         .last_probe
@@ -1053,7 +1088,7 @@ fn vps_server_item(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
         .is_some_and(|p| p.ok && (p.runner_active || srv.runner_installed))
         || probe_ok;
 
-    let status_dot = if is_probing || is_provisioning {
+    let status_dot = if is_probing || is_provisioning || is_purging {
         el().size(8.0, 8.0)
             .center()
             .child(
@@ -1151,11 +1186,20 @@ fn vps_server_item(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
             btn_neutral(
                 t,
                 format!("btn-purge-vps-{}", srv.id),
-                "Limpar agora",
+                if is_purging {
+                    "Limpando..."
+                } else {
+                    "Limpar agora"
+                },
                 Some(&icons::TRASH),
                 30.0,
-                move |s: &mut AppState, tx: &mut Tx| s.purge_server(&id_purge, tx),
+                move |s: &mut AppState, tx: &mut Tx| {
+                    if !any_purging {
+                        s.purge_server(&id_purge, tx);
+                    }
+                },
             )
+            .disabled(any_purging)
             .help("Executa imediatamente a limpeza de workspaces antigos e cache Docker nesta VPS."),
         )
         .child(

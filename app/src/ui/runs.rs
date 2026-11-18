@@ -8,7 +8,7 @@ use workploy::model::{self, Run, RunStatus};
 
 use crate::state::{AppState, ModalState, StatusFilter};
 use crate::ui::components::{
-    btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card,
+    btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card, pill_badge,
     primary_button, run_status_icon, status_pill,
 };
 use crate::ui::icons;
@@ -66,72 +66,93 @@ pub fn view(
         let wid_del = w.id.clone();
         let wname_del = w.name.clone();
         header_actions = header_actions
-            .child(primary_button(
-                t,
-                "btn-run-wf",
-                "Executar fluxo",
-                Some(&icons::PLAY),
-                34.0,
-                move |s: &mut AppState, tx| s.start_workflow(&wid_run, "manual", tx),
-            ))
-            .child(btn_neutral(
-                t,
-                "btn-edit-wf",
-                "Editar fluxo",
-                Some(&icons::EDIT),
-                34.0,
-                move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
-            ))
-            .child(btn_neutral(
-                t,
-                "btn-yaml-wf",
-                "Arquivo YAML",
-                Some(&icons::CODE),
-                34.0,
-                move |s: &mut AppState, _| s.open_yaml_modal(Some(&wid_yaml)),
-            ))
-            .child(btn_danger(
-                t,
-                "btn-del-wf",
-                "Excluir",
-                Some(&icons::TRASH),
-                34.0,
-                move |s: &mut AppState, _| {
-                    s.modal = ModalState::DeleteConfirm {
-                        wf_id: wid_del.clone(),
-                        wf_name: wname_del.clone(),
-                    };
-                },
-            ));
+            .child(
+                primary_button(
+                    t,
+                    "btn-run-wf",
+                    "Executar fluxo",
+                    Some(&icons::PLAY),
+                    34.0,
+                    move |s: &mut AppState, tx| s.start_workflow(&wid_run, "manual", tx),
+                )
+                .help("Dispara imediatamente uma execução manual deste fluxo de trabalho."),
+            )
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-edit-wf",
+                    "Editar fluxo",
+                    Some(&icons::EDIT),
+                    34.0,
+                    move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
+                )
+                .help("Abre o editor para alterar gatilho, runner, VPS de destino, repositório e passos."),
+            )
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-yaml-wf",
+                    "Arquivo YAML",
+                    Some(&icons::CODE),
+                    34.0,
+                    move |s: &mut AppState, _| s.open_yaml_modal(Some(&wid_yaml)),
+                )
+                .help("Visualiza, copia ou edita a definição deste fluxo em formato YAML."),
+            )
+            .child(
+                btn_danger(
+                    t,
+                    "btn-del-wf",
+                    "Excluir",
+                    Some(&icons::TRASH),
+                    34.0,
+                    move |s: &mut AppState, _| {
+                        s.modal = ModalState::DeleteConfirm {
+                            wf_id: wid_del.clone(),
+                            wf_name: wname_del.clone(),
+                        };
+                    },
+                )
+                .help("Remove este fluxo de trabalho (o histórico de execuções anteriores é mantido)."),
+            );
     } else {
         if let Some(primary) = s.snapshot.workflows.first() {
             let wid = primary.id.clone();
-            header_actions = header_actions.child(primary_button(
-                t,
-                "btn-run-primary",
-                "Executar fluxo",
-                Some(&icons::PLAY),
-                34.0,
-                move |s: &mut AppState, tx| s.start_workflow(&wid, "manual", tx),
-            ));
+            header_actions = header_actions.child(
+                primary_button(
+                    t,
+                    "btn-run-primary",
+                    "Executar fluxo",
+                    Some(&icons::PLAY),
+                    34.0,
+                    move |s: &mut AppState, tx| s.start_workflow(&wid, "manual", tx),
+                )
+                .help("Dispara imediatamente uma execução manual do fluxo principal."),
+            );
         }
         header_actions = header_actions
-            .child(btn_neutral(
-                t,
-                "btn-new-wf-top",
-                "Novo fluxo",
-                Some(&icons::PLUS),
-                34.0,
-                |s: &mut AppState, _| s.open_new_workflow_modal(),
-            ))
-            .child(btn_neutral(
-                t,
-                "btn-yaml-import",
-                "Importar YAML",
-                Some(&icons::CODE),
-                34.0,
-                |s: &mut AppState, _| s.open_yaml_modal(None),
-            ));
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-new-wf-top",
+                    "Novo fluxo",
+                    Some(&icons::PLUS),
+                    34.0,
+                    |s: &mut AppState, _| s.open_new_workflow_modal(),
+                )
+                .help("Abre o editor para criar um novo fluxo de trabalho."),
+            )
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-yaml-import",
+                    "Importar YAML",
+                    Some(&icons::CODE),
+                    34.0,
+                    |s: &mut AppState, _| s.open_yaml_modal(None),
+                )
+                .help("Cria ou atualiza um fluxo colando uma definição YAML."),
+            );
     }
 
     let hdr_card = header_card(
@@ -442,7 +463,7 @@ pub fn view(
         stack
     };
 
-    col()
+    let mut page = col()
         .key("runs-page")
         .w_full()
         .h_full()
@@ -452,19 +473,241 @@ pub fn view(
         .pb(16.0)
         .gap(14.0)
         .transition(Transition::opacity())
-        .child(hdr_card)
-        .child(filter_bar)
-        .child(
-            col()
-                .key("runs-scroll")
-                .grow(1.0)
-                .min_h(0.0)
-                .w_full()
-                .scroll(ScrollSpec { stick_bottom: false })
-                .scroll_edge_fade(16.0)
-                .pb(16.0)
-                .child(list_body),
-        )
+        .child(hdr_card);
+
+    if let Some(w) = wf {
+        page = page.child(workflow_pipeline_summary(s, t, w));
+        if let Some(warn) = local_vps_warning(s, t, w) {
+            page = page.child(warn);
+        }
+    }
+
+    page.child(filter_bar).child(
+        col()
+            .key("runs-scroll")
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(ScrollSpec { stick_bottom: false })
+            .scroll_edge_fade(16.0)
+            .pb(16.0)
+            .child(list_body),
+    )
+}
+
+fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> El {
+    let mut chain = row().w_full().min_w(0.0).gap(6.0).center_y().flex_wrap();
+    chain = chain.child(
+        row()
+            .gap(5.0)
+            .center_y()
+            .child(icon(&icons::ACTIVITY, 13.0).color(t.accent))
+            .child(
+                text("Pipeline:")
+                    .font(ty::CAPTION)
+                    .color(t.text_muted),
+            ),
+    );
+
+    if w.steps.is_empty() {
+        chain = chain.child(
+            text("Nenhum passo configurado")
+                .font(ty::CAPTION)
+                .color(t.text_muted),
+        );
+    } else {
+        for (idx, st) in w.steps.iter().enumerate() {
+            if idx > 0 {
+                chain = chain.child(icon(&icons::CHEVRON_RIGHT, 12.0).color(t.text_muted));
+            }
+            let mut step_pill = row()
+                .px(8.0)
+                .py(4.0)
+                .gap(5.0)
+                .center_y()
+                .radius(6.0)
+                .fill(t.surface_2)
+                .border(
+                    1.0,
+                    if st.approval {
+                        t.warning.alpha(0.42)
+                    } else {
+                        t.border_subtle
+                    },
+                )
+                .child(
+                    text(format!("{}. {}", idx + 1, st.name))
+                        .font(ty::SMALL_MED)
+                        .color(t.text_primary),
+                );
+            if st.approval {
+                step_pill = step_pill.child(
+                    row()
+                        .px(5.0)
+                        .py(1.0)
+                        .radius(4.0)
+                        .fill(t.warning_bg)
+                        .border(1.0, t.warning.alpha(0.38))
+                        .child(
+                            text("[Aprovação]")
+                                .font(ty::CAPTION)
+                                .color(t.warning),
+                        ),
+                );
+            }
+            chain = chain.child(step_pill);
+        }
+    }
+
+    if let Some(next_id) = &w.on_success {
+        let next_name = s
+            .snapshot
+            .workflows
+            .iter()
+            .find(|nw| nw.id == *next_id)
+            .map(|nw| nw.name.as_str())
+            .unwrap_or(next_id.as_str());
+        chain = chain
+            .child(icon(&icons::CHEVRON_RIGHT, 12.0).color(t.accent))
+            .child(
+                row()
+                    .px(8.0)
+                    .py(4.0)
+                    .gap(5.0)
+                    .center_y()
+                    .radius(6.0)
+                    .fill(t.accent_soft)
+                    .border(1.0, t.accent.alpha(0.38))
+                    .child(
+                        text(format!("Encadeado: {next_name}"))
+                            .font(ty::SMALL_MED)
+                            .color(t.accent),
+                    ),
+            );
+    }
+
+    let matching_bindings: Vec<&model::RepoBinding> = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .filter(|b| {
+            workploy::engine::matching_workflows_for_binding(&s.snapshot.workflows, b)
+                .iter()
+                .any(|wid| wid == &w.id)
+        })
+        .collect();
+
+    let mut triggers_row = row().w_full().min_w(0.0).gap(6.0).center_y().flex_wrap().child(
+        row()
+            .gap(5.0)
+            .center_y()
+            .child(icon(&icons::BRANCH, 12.5).color(t.text_muted))
+            .child(
+                text("Disparado por:")
+                    .font(ty::CAPTION)
+                    .color(t.text_muted),
+            ),
+    );
+
+    if matching_bindings.is_empty() {
+        let empty_msg = match w.trigger {
+            model::Trigger::Manual => "Somente execução manual ou por encadeamento.",
+            model::Trigger::Folder => "Vigia de pasta local configurado.",
+            model::Trigger::Push => "Nenhum vínculo de repositório aponta para este fluxo.",
+        };
+        triggers_row = triggers_row.child(
+            text(empty_msg)
+                .font(ty::CAPTION)
+                .color(t.text_muted)
+                .wrap(),
+        );
+    } else {
+        for b in matching_bindings {
+            let srv_label = s.server_label(b.target_server_id.as_deref());
+            let state_suffix = if b.enabled { "" } else { " · pausado" };
+            let fg = if b.enabled { t.text_secondary } else { t.warning };
+            triggers_row = triggers_row.child(pill_badge(
+                t,
+                &format!("{} ({}) · {}{}", b.full_name, b.branch, srv_label, state_suffix),
+                fg,
+                t.surface_2,
+            ));
+        }
+    }
+
+    col()
+        .key("wf-pipeline-summary")
+        .w_full()
+        .min_w(0.0)
+        .px(16.0)
+        .py(12.0)
+        .gap(8.0)
+        .radius(10.0)
+        .fill(t.surface_1)
+        .border(1.0, t.border_subtle)
+        .child(chain)
+        .child(triggers_row)
+}
+
+fn local_vps_warning(s: &AppState, t: UiTheme, w: &model::Workflow) -> Option<El> {
+    if w.runner != model::RunnerKind::Local || w.trigger != model::Trigger::Push {
+        return None;
+    }
+    let has_vps_binding = s.snapshot.settings.repo_bindings.iter().any(|b| {
+        b.enabled
+            && b.target_server_id.is_some()
+            && (b.workflow_id.is_none() || b.workflow_id.as_deref() == Some(w.id.as_str()))
+    });
+    if !has_vps_binding {
+        return None;
+    }
+
+    let wid_edit = w.id.clone();
+    Some(
+        row()
+            .key("wf-local-vps-warning")
+            .w_full()
+            .min_w(0.0)
+            .px(14.0)
+            .py(10.0)
+            .gap(10.0)
+            .center_y()
+            .justify_between()
+            .flex_wrap()
+            .radius(10.0)
+            .fill(t.warning_bg)
+            .border(1.0, t.warning.alpha(0.38))
+            .child(
+                row()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(190.0)
+                    .gap(8.0)
+                    .center_y()
+                    .child(icon(&icons::BOLT, 14.0).color(t.warning))
+                    .child(
+                        text("Este fluxo está configurado para rodar nesta máquina (Local). Para rodar 24/7 na VPS, edite o fluxo e selecione 'VPS via SSH' + a VPS de destino.")
+                            .font(ty::SMALL)
+                            .color(t.text_primary)
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .wrap(),
+                    ),
+            )
+            .child(
+                btn_neutral(
+                    t,
+                    "btn-warn-edit-wf",
+                    "Editar fluxo",
+                    Some(&icons::EDIT),
+                    28.0,
+                    move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
+                )
+                .help("Abre o editor do fluxo para trocar o runner para 'VPS via SSH' e escolher a VPS de destino."),
+            ),
+    )
 }
 
 fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {

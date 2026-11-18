@@ -663,6 +663,8 @@ fn mini_usage_bar(t: UiTheme, label: &str, detail: String, pct: u8) -> El {
 fn vps_telemetry_card(s: &AppState, t: UiTheme, srv: &VpsServer, main_w: f32) -> El {
     let is_probing = s.snapshot.probing_server_id.as_deref() == Some(srv.id.as_str());
     let is_provisioning = s.snapshot.provisioning_server_id.as_deref() == Some(srv.id.as_str());
+    let is_purging = s.snapshot.purging_server_id.as_deref() == Some(srv.id.as_str());
+    let any_purging = s.snapshot.purging_server_id.is_some();
     let (srv_health, srv_alerts) = vps_health_status(srv);
     let probe_ok = srv.last_probe.as_ref().is_some_and(|p| p.ok);
     let runner_online = srv
@@ -670,7 +672,7 @@ fn vps_telemetry_card(s: &AppState, t: UiTheme, srv: &VpsServer, main_w: f32) ->
         .as_ref()
         .is_some_and(|p| p.ok && (!p.has_widder_runner || p.runner_active));
 
-    let status_dot = if is_probing || is_provisioning {
+    let status_dot = if is_probing || is_provisioning || is_purging {
         el().size(8.0, 8.0)
             .center()
             .child(
@@ -745,11 +747,20 @@ fn vps_telemetry_card(s: &AppState, t: UiTheme, srv: &VpsServer, main_w: f32) ->
             btn_neutral(
                 t,
                 format!("conn-purge-vps-{}", srv.id),
-                "Limpar agora",
+                if is_purging {
+                    "Limpando..."
+                } else {
+                    "Limpar agora"
+                },
                 Some(&icons::TRASH),
                 28.0,
-                move |s: &mut AppState, tx: &mut Tx| s.purge_server(&id_purge, tx),
+                move |s: &mut AppState, tx: &mut Tx| {
+                    if !any_purging {
+                        s.purge_server(&id_purge, tx);
+                    }
+                },
             )
+            .disabled(any_purging)
             .help("Executa imediatamente a limpeza manual de workspaces antigos e cache Docker nesta VPS."),
         );
 
