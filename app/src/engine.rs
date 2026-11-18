@@ -127,8 +127,52 @@ pub fn approve(sh: &SharedHandle, run_id: &str) {
     update_run(sh, run_id, |r| r.approved = true);
 }
 
+/// Destino do cancelamento na VPS para uma execução espelhada no desktop:
+/// `(servidor dono, id da execução no runner)`. `None` quando a execução não
+/// tem origem no runner de uma VPS — nesses casos o cancelamento local basta
+/// (execuções que rodam passos via SSH direto morrem quando o loop de
+/// `exec_step`/`ssh_run_streaming` derruba o cliente ssh ativo).
+fn vps_cancel_target(s: &Shared, run_id: &str) -> Option<(VpsServer, String)> {
+    let r = s.runs.iter().find(|r| r.id == run_id)?;
+    let vps_run_id = r.vps_run_id.clone()?;
+    let srv = s
+        .settings
+        .servers
+        .iter()
+        .find(|v| Some(&v.id) == r.vps_server_id.as_ref())?;
+    Some((srv.clone(), vps_run_id))
+}
+
+/// Dispara, cada qual em sua thread, o `POST /runs/{id}/cancel` no runner da
+/// VPS para cada destino resolvido. Falhas só registram status — nunca
+/// bloqueiam o cancelamento local já marcado.
+fn spawn_vps_cancel(sh: &SharedHandle, cancels: Vec<(VpsServer, String)>) {
+    for (server, vps_run_id) in cancels {
+        let sh2 = sh.clone();
+        std::thread::spawn(move || {
+            let _ = vps::cancel_vps_run(&sh2, &server, &vps_run_id);
+        });
+    }
+}
+
 pub fn cancel(sh: &SharedHandle, run_id: &str) {
-    update_run(sh, run_id, |r| r.cancel_requested = true);
+    // Cancelar uma execução espelhada precisa avisar a VPS: só a flag local
+    // deixaria o run remoto rodando até o fim. A flag é marcada primeiro
+    // (efeito imediato na UI), e o pedido viaja ao runner em segundo plano.
+    let target = {
+        let mut s = sh.lock().unwrap();
+        let target = vps_cancel_target(&s, run_id);
+        if let Some(r) = s.runs.iter_mut().find(|r| r.id == run_id) {
+            r.cancel_requested = true;
+        }
+        save_runs(&s);
+        drop(s);
+        target
+    };
+    notify(sh);
+    if let Some((server, vps_run_id)) = target {
+        spawn_vps_cancel(sh, vec![(server, vps_run_id)]);
+    }
 }
 
 pub fn clear_finished_runs(sh: &SharedHandle) -> usize {
@@ -228,11 +272,16 @@ pub fn start_run_with_target(
         branch: clean_branch.clone(),
         summary: String::new(),
         annotations: Vec::new(),
+        vps_run_id: None,
+        vps_server_id: None,
     };
     let run_id = run.id.clone();
     let commit_sha_for_exec = run.commit.clone();
+    let mut vps_cancels: Vec<(VpsServer, String)> = Vec::new();
     {
-        let mut s = sh.lock().unwrap();
+        let mut guard = sh.lock().unwrap();
+        // Split borrow: s.runs mutável + s.settings somente leitura.
+        let s = &mut *guard;
         if let Some(ref repo) = clean_repo {
             for r in &mut s.runs {
                 if r.status.active()
@@ -243,13 +292,21 @@ pub fn start_run_with_target(
                     && r.branch == clean_branch
                 {
                     r.cancel_requested = true;
+                    // Execução espelhada: o aviso precisa chegar ao runner da
+                    // VPS, senão ela continua rodando lá.
+                    if let (Some(sid), Some(vid)) = (r.vps_server_id.clone(), r.vps_run_id.clone())
+                        && let Some(srv) = s.settings.servers.iter().find(|v| v.id == sid)
+                    {
+                        vps_cancels.push((srv.clone(), vid));
+                    }
                 }
             }
         }
         s.runs.insert(0, run);
-        save_runs(&s);
+        save_runs(s);
     }
     notify(sh);
+    spawn_vps_cancel(sh, vps_cancels);
     let sh2 = sh.clone();
     let rid = run_id.clone();
     std::thread::spawn(move || {
@@ -1586,6 +1643,125 @@ mod tests {
         assert!(wait_status(&sh, &rid, RunStatus::Cancelled, 20_000));
     }
 
+    fn mk_mirror_run(id: &str, status: RunStatus, vps_server_id: Option<&str>) -> Run {
+        Run {
+            id: id.into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "CI VPS".into(),
+            status,
+            trigger_label: "webhook".into(),
+            title: "run vps".into(),
+            number: 1,
+            commit: None,
+            started_at: "18/11/2026 09:00".into(),
+            started_ts: None,
+            finished_at: None,
+            steps: Vec::new(),
+            approved: false,
+            cancel_requested: false,
+            secs: 0.0,
+            actor: "workploy-runner".into(),
+            repo_name: None,
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: Vec::new(),
+            vps_run_id: Some(id.into()),
+            vps_server_id: vps_server_id.map(str::to_string),
+        }
+    }
+
+    fn test_server(id: &str) -> VpsServer {
+        VpsServer {
+            id: id.into(),
+            name: format!("VPS {id}"),
+            // Host vazio: o SSH falha na hora, sem nenhum acesso de rede no teste.
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            auth: AuthMethod::SshConfigAlias,
+            last_probe: None,
+            runner_installed: true,
+            runner_port: 8787,
+            webhook_secret_key: None,
+        }
+    }
+
+    #[test]
+    fn cancel_resolves_vps_target_and_marks_flag_immediately() {
+        let sh: SharedHandle = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            s.settings.servers.push(test_server("vps-x"));
+            s.runs
+                .push(mk_mirror_run("run-vps-abc-1", RunStatus::Running, Some("vps-x")));
+            s.runs.push(Run {
+                id: "run-local-1".into(),
+                vps_run_id: None,
+                vps_server_id: None,
+                ..mk_mirror_run("run-local-1", RunStatus::Running, None)
+            });
+        }
+
+        // Run espelhado resolve o destino do cancelamento na VPS.
+        let (srv, rid) = {
+            let s = sh.lock().unwrap();
+            vps_cancel_target(&s, "run-vps-abc-1").expect("espelho deve resolver destino")
+        };
+        assert_eq!(srv.id, "vps-x");
+        assert_eq!(rid, "run-vps-abc-1");
+
+        // Run puramente local (mesmo rodando passos via SSH direto) não tem
+        // destino no runner: o cancel local já mata o cliente ssh do passo.
+        {
+            let s = sh.lock().unwrap();
+            assert!(vps_cancel_target(&s, "run-local-1").is_none());
+        }
+
+        // Cancel marca a flag imediatamente; a propagação à VPS roda em thread.
+        cancel(&sh, "run-vps-abc-1");
+        let s = sh.lock().unwrap();
+        assert!(s
+            .runs
+            .iter()
+            .find(|r| r.id == "run-vps-abc-1")
+            .unwrap()
+            .cancel_requested);
+    }
+
+    #[test]
+    fn start_run_superseding_mirror_requests_vps_cancel_too() {
+        let sh: SharedHandle = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            s.workflows.push(echo_workflow("wf-vps-ci", false, None));
+            s.settings.servers.push(test_server("vps-y"));
+            let mut mirror = mk_mirror_run("run-vps-m1", RunStatus::Running, Some("vps-y"));
+            mirror.workflow_id = "wf-vps-ci".into();
+            mirror.repo_name = Some("widder/erp".into());
+            mirror.branch = "main".into();
+            s.runs.push(mirror);
+        }
+
+        let rid = start_run_with_target(
+            &sh,
+            "wf-vps-ci",
+            "push",
+            None,
+            None,
+            Some("widder/erp".into()),
+            Some("main".into()),
+        )
+        .expect("nova execução deve iniciar");
+
+        let s = sh.lock().unwrap();
+        let mirror = s.runs.iter().find(|r| r.id == "run-vps-m1").unwrap();
+        assert!(
+            mirror.cancel_requested,
+            "espelho ativo da mesma repo/branch deve receber o pedido de cancelamento"
+        );
+        assert!(s.runs.iter().any(|r| r.id == rid));
+    }
+
     #[test]
     fn yaml_roundtrip() {
         let wf = echo_workflow("wf-y", true, None);
@@ -2071,6 +2247,8 @@ mod tests {
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
+            vps_run_id: None,
+            vps_server_id: None,
         };
 
         {

@@ -344,6 +344,16 @@ pub struct Run {
     pub summary: String,
     #[serde(default)]
     pub annotations: Vec<Annotation>,
+    /// Vínculo com a execução no runner da VPS quando esta `Run` é espelho de
+    /// uma execução criada pelo `workploy-runner` (o id remoto é a própria
+    /// chave de vinculação). `#[serde(default)]` mantém o `runs.json` legado
+    /// abrindo sem migração.
+    #[serde(default)]
+    pub vps_run_id: Option<String>,
+    /// Servidor dono da execução espelhada (id em `settings.servers`), para
+    /// onde o cancelamento do desktop é propagado.
+    #[serde(default)]
+    pub vps_server_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
@@ -1217,6 +1227,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             Annotation { kind: AnnKind::Notice, job: "Typecheck + Tests + Smoke".into(), msg: "Lockfile passes supply-chain policies (996 entries in 4.5s).".into() },
             Annotation { kind: AnnKind::Notice, job: "Readiness smoke".into(), msg: "api, web and worker responded 200.".into() },
         ],
+        vps_run_id: None,
+        vps_server_id: None,
     };
     let ci_ok_id = ci_ok.id.clone();
 
@@ -1262,6 +1274,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             Annotation { kind: AnnKind::Error, job: "Contracts typecheck (Zod)".into(), msg: ts_err.into() },
             Annotation { kind: AnnKind::Error, job: "Secret scan (repo-local)".into(), msg: "O passo não iniciou: o comando retornou erro (exit 1).".into() },
         ],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     let mut deploy_job = sr("Deploy & Validate VPS", 590.0, "");
@@ -1294,6 +1308,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
         annotations: vec![
             Annotation { kind: AnnKind::Notice, job: "Deploy & Validate VPS".into(), msg: "Healthchecks 200 em api e web; worker ok.".into() },
         ],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     let deploy_ok_id = deploy_ok.id.clone();
@@ -1352,6 +1368,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
+            vps_run_id: None,
+            vps_server_id: None,
         });
     }
     for (k, (num, hh, mm)) in [
@@ -1392,6 +1410,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
+            vps_run_id: None,
+            vps_server_id: None,
         });
     }
     let deploy_stamps = [
@@ -1437,6 +1457,8 @@ pub fn seed_photo_samples(s: &mut Shared) -> Option<String> {
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
+            vps_run_id: None,
+            vps_server_id: None,
         });
     }
     let _ = (deploy_ok_id, ci_ok_id_copy);
@@ -1595,6 +1617,32 @@ mod duration_tests {
         assert_eq!(step.elapsed_secs(), 1.25);
     }
 
+    #[test]
+    fn legacy_runs_json_opens_without_vps_link_and_roundtrips_when_set() {
+        // runs.json gravado antes dos campos de vínculo com a VPS.
+        let raw = r#"[{
+            "id": "run-vps-abc-1",
+            "workflow_id": "wf-1",
+            "workflow_name": "CI",
+            "status": "Success",
+            "trigger_label": "push",
+            "started_at": "17/11/2026 10:00",
+            "steps": []
+        }]"#;
+        let runs: Vec<Run> = serde_json::from_str(raw).expect("runs.json legado deve abrir");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].vps_run_id, None);
+        assert_eq!(runs[0].vps_server_id, None);
+
+        // Preenchidos, os campos sobrevivem a um ciclo de gravação/leitura.
+        let mut linked = runs[0].clone();
+        linked.vps_run_id = Some("run-vps-abc-1".into());
+        linked.vps_server_id = Some("vps-1".into());
+        let back: Run = serde_json::from_str(&serde_json::to_string(&linked).unwrap()).unwrap();
+        assert_eq!(back.vps_run_id.as_deref(), Some("run-vps-abc-1"));
+        assert_eq!(back.vps_server_id.as_deref(), Some("vps-1"));
+    }
+
     fn phase_step(status: StepStatus) -> StepRun {
         StepRun {
             name: "passo".into(),
@@ -1628,6 +1676,8 @@ mod duration_tests {
             branch: "main".into(),
             summary: String::new(),
             annotations: Vec::new(),
+            vps_run_id: None,
+            vps_server_id: None,
         }
     }
 
@@ -2088,6 +2138,8 @@ mod duration_tests {
             branch: "main".into(),
             summary: String::new(),
             annotations: vec![],
+            vps_run_id: None,
+            vps_server_id: None,
         };
 
         let runs = vec![

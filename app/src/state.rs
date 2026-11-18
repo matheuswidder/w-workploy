@@ -1164,6 +1164,8 @@ impl AppState {
                     branch: "main".into(),
                     summary: String::new(),
                     annotations: Vec::new(),
+                    vps_run_id: None,
+                    vps_server_id: None,
                 };
                 let rid = run.id.clone();
                 self.snapshot.runs.insert(0, run);
@@ -1314,6 +1316,8 @@ impl AppState {
                 branch,
                 summary: String::new(),
                 annotations: Vec::new(),
+                vps_run_id: None,
+                vps_server_id: None,
             };
             let rid = run.id.clone();
             self.snapshot.runs.insert(0, run);
@@ -2736,6 +2740,8 @@ impl AppState {
                 branch: clean_branch,
                 summary: String::new(),
                 annotations: Vec::new(),
+                vps_run_id: None,
+                vps_server_id: None,
             };
             let rid = run.id.clone();
             self.snapshot.runs.insert(0, run);

@@ -8,6 +8,8 @@ use crate::gfx::{
     MARK_PULSE_BREATHE, MARK_PULSE_RADAR, MARK_SPINNER_BLOCKS_SCALE, MARK_SPINNER_BLOCKS_SHUFFLE_2,
     MARK_SPINNER_BLOCKS_SHUFFLE_3, MARK_SPINNER_BLOCKS_WAVE, MARK_SPINNER_PULSE_MULTIPLE,
     MARK_SPINNER_PULSE_RINGS_2, MARK_SPINNER_PULSE_RINGS_3, MARK_SPINNER_PULSE_SOFT,
+    PULSE_INTENSITY_ACTIVE, PULSE_INTENSITY_ALERT, PULSE_INTENSITY_CALM, PULSE_TEMPO_ACTIVE,
+    PULSE_TEMPO_CALM, spinner_intensity, spinner_period,
 };
 use crate::state::{AppState, ConnectionsHealth, ToastKind};
 use crate::ui::icons;
@@ -277,7 +279,7 @@ pub fn run_status_icon(t: UiTheme, status: RunStatus, size: f32) -> El {
                         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                         .radius(dot_side * 0.5)
                         .effect_bleed(8.0)
-                        .effect_data([4.0, 8.0, 1.8, 0.7]),
+                        .effect_data([4.0, 8.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
                 )
                 .child(
                     el().size(dot_side, dot_side)
@@ -296,7 +298,7 @@ pub fn run_status_icon(t: UiTheme, status: RunStatus, size: f32) -> El {
                         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                         .radius(dot_side * 0.5)
                         .effect_bleed(6.0)
-                        .effect_data([2.0, 6.0, 2.2, 0.55]),
+                        .effect_data([2.0, 6.0, PULSE_TEMPO_CALM, PULSE_INTENSITY_CALM]),
                 )
                 .child(icon(&icons::BOLT, size).color(t.warning));
             box_el.child(gate_dot)
@@ -322,7 +324,7 @@ pub fn step_status_icon(t: UiTheme, status: StepStatus, size: f32) -> El {
                         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                         .radius(dot_side * 0.5)
                         .effect_bleed(8.0)
-                        .effect_data([4.0, 8.0, 1.8, 0.7]),
+                        .effect_data([4.0, 8.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
                 )
                 .child(
                     el().size(dot_side, dot_side)
@@ -370,7 +372,7 @@ pub fn runner_connected_dot(t: UiTheme, connected: bool) -> El {
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                     .radius(4.0)
                     .effect_bleed(6.0)
-                    .effect_data([1.0, 6.0, 2.6, 0.55]),
+                    .effect_data([1.0, 6.0, PULSE_TEMPO_CALM, PULSE_INTENSITY_CALM]),
             )
             .child(el().size(8.0, 8.0).radius(4.0).fill(t.success));
     } else {
@@ -387,8 +389,8 @@ pub fn health_pulse_dot(t: UiTheme, health: ConnectionsHealth) -> El {
             1.0,
             t.success,
             6.0,
-            2.6,
-            0.55,
+            PULSE_TEMPO_CALM,
+            PULSE_INTENSITY_CALM,
         ),
         ConnectionsHealth::Warning => (
             "sidebar-conn-pulse-warning",
@@ -396,17 +398,17 @@ pub fn health_pulse_dot(t: UiTheme, health: ConnectionsHealth) -> El {
             2.0,
             t.warning,
             7.0,
-            2.0,
-            0.65,
+            PULSE_TEMPO_ACTIVE,
+            PULSE_INTENSITY_ACTIVE,
         ),
         ConnectionsHealth::Danger => (
             "sidebar-conn-pulse-danger",
             MARK_PULSE_RADAR,
             3.0,
             t.danger,
-            8.0,
-            1.5,
-            0.75,
+            7.0,
+            PULSE_TEMPO_ACTIVE,
+            PULSE_INTENSITY_ALERT,
         ),
     };
     el().key(key)
@@ -444,13 +446,17 @@ pub fn phase_spinner(t: UiTheme, kind: SpinnerKind, size: f32, key: impl Into<St
         | SpinnerKind::PulseRings2
         | SpinnerKind::PulseRings3 => {
             // Família pulse-*: um ponto central de onde os pulsos emanam.
-            let (mark, reach, period, intensity) = match kind {
-                SpinnerKind::PulseSoft => (MARK_SPINNER_PULSE_SOFT, 6.5, 1.2, 0.60),
-                SpinnerKind::PulseMultiple => (MARK_SPINNER_PULSE_MULTIPLE, 8.0, 1.5, 0.66),
-                SpinnerKind::PulseRings2 => (MARK_SPINNER_PULSE_RINGS_2, 10.5, 1.8, 0.72),
-                SpinnerKind::PulseRings3 => (MARK_SPINNER_PULSE_RINGS_3, 11.5, 1.2, 0.78),
+            // Período e intensidade vêm do ritmo central (`gfx`): ciclo
+            // visível de 2,5–4 s, sem ofuscar o texto ao lado.
+            let (mark, reach) = match kind {
+                SpinnerKind::PulseSoft => (MARK_SPINNER_PULSE_SOFT, 6.5),
+                SpinnerKind::PulseMultiple => (MARK_SPINNER_PULSE_MULTIPLE, 8.0),
+                SpinnerKind::PulseRings2 => (MARK_SPINNER_PULSE_RINGS_2, 10.5),
+                SpinnerKind::PulseRings3 => (MARK_SPINNER_PULSE_RINGS_3, 11.5),
                 _ => unreachable!("família pulse coberta acima"),
             };
+            let period = spinner_period(kind);
+            let intensity = spinner_intensity(kind);
             let dot = (size * 0.40).max(5.0);
             el()
                 .key(key)
@@ -477,11 +483,8 @@ pub fn phase_spinner(t: UiTheme, kind: SpinnerKind, size: f32, key: impl Into<St
         | SpinnerKind::BlocksWave => {
             // Família blocks-*: grade de blocos que acendem em sequência.
             // A geometria espelha o compositor (blocos em 10% e 60% do lado).
-            let period = match kind {
-                SpinnerKind::BlocksScale => 0.75,
-                SpinnerKind::BlocksShuffle2 => 0.8,
-                _ => 0.9,
-            };
+            let period = spinner_period(kind);
+            let intensity = spinner_intensity(kind);
             let bs = size * 0.30;
             let gap = size * 0.20;
             let block = || {
@@ -527,7 +530,7 @@ pub fn phase_spinner(t: UiTheme, kind: SpinnerKind, size: f32, key: impl Into<St
                     effect(mark)
                         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                         .effect_bleed(bs)
-                        .effect_data([4.0, 0.0, period, 0.9]),
+                        .effect_data([4.0, 0.0, period, intensity]),
                 )
                 .child(grid)
         }

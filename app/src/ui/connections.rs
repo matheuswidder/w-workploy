@@ -2,7 +2,7 @@ use rune::color::Color;
 use rune::{El, Icon, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use workploy::model::{TriggerMode, VpsServer};
 
-use crate::gfx::MARK_PULSE_RADAR;
+use crate::gfx::{MARK_PULSE_RADAR, PULSE_INTENSITY_ACTIVE, PULSE_TEMPO_ACTIVE};
 use crate::state::{
     AppState, ConnectionsHealth, SettingsTab, vps_health_status, vps_ram_used_pct,
 };
@@ -680,7 +680,7 @@ fn vps_telemetry_card(s: &AppState, t: UiTheme, srv: &VpsServer, main_w: f32) ->
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                     .radius(4.0)
                     .effect_bleed(10.0)
-                    .effect_data([4.0, 10.0, 1.4, 0.0]),
+                    .effect_data([4.0, 10.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
             )
             .child(el().size(8.0, 8.0).radius(4.0).fill(t.info))
     } else if srv.last_probe.is_some() && srv_health != ConnectionsHealth::Healthy {

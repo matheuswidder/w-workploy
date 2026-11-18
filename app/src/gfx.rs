@@ -3,6 +3,7 @@ use std::ops::Range;
 use rune::compose::{Compositor, Frame};
 use rune::render::{EffectPhase, EffectSite, KIND_EFFECT};
 use rune_fx::{Fx, FxFrame, FxLayer, FxOptions, FxRenderer, FxSlot, PulseParams, PulseStyle, Rgb, Shape, rgb};
+use workploy::model::SpinnerKind;
 
 use crate::state::AppState;
 
@@ -19,6 +20,71 @@ pub const MARK_SPINNER_BLOCKS_SCALE: u32 = 8;
 pub const MARK_SPINNER_BLOCKS_SHUFFLE_2: u32 = 9;
 pub const MARK_SPINNER_BLOCKS_SHUFFLE_3: u32 = 10;
 pub const MARK_SPINNER_BLOCKS_WAVE: u32 = 11;
+
+// ——————————————————————————————————————————————————————————————————————
+// Ritmo central dos efeitos de pulso — todo tuning de período (s por
+// ciclo) e intensidade vive aqui, em um único lugar.
+//
+// Regra do maestro: batida lenta e legível, nunca intermitência rápida.
+// Spinners de fase com ciclo visível de 2,5–4 s; pulsos contínuos de
+// status em ≥ 3 s; intensidade baixa o bastante para não ofuscar o
+// texto ao lado. Os sítios de UI passam estes valores via `effect_data`
+// e os fallbacks dos braços do compositor leem as mesmas constantes.
+// ——————————————————————————————————————————————————————————————————————
+
+/// Ciclo (s) dos spinners de fase — família `pulse-*` (CI).
+pub const SPINNER_PERIOD_PULSE_SOFT: f32 = 3.2;
+pub const SPINNER_PERIOD_PULSE_MULTIPLE: f32 = 3.6;
+pub const SPINNER_PERIOD_PULSE_RINGS_2: f32 = 4.0;
+pub const SPINNER_PERIOD_PULSE_RINGS_3: f32 = 4.0;
+/// Ciclo (s) dos spinners de fase — família `blocks-*` (deploy).
+pub const SPINNER_PERIOD_BLOCKS_SCALE: f32 = 2.8;
+pub const SPINNER_PERIOD_BLOCKS_SHUFFLE_2: f32 = 2.9;
+pub const SPINNER_PERIOD_BLOCKS_SHUFFLE_3: f32 = 3.0;
+pub const SPINNER_PERIOD_BLOCKS_WAVE: f32 = 3.0;
+/// Intensidade do spinner na fase inicial; cresce com a fase até o máximo.
+pub const SPINNER_INTENSITY_MIN: f32 = 0.34;
+/// Intensidade máxima do spinner: presença firme sem ofuscar o texto.
+pub const SPINNER_INTENSITY_MAX: f32 = 0.50;
+/// Batida calma (s) dos pulsos contínuos de status (conectado, saudável,
+/// aprovação pendente).
+pub const PULSE_TEMPO_CALM: f32 = 3.4;
+/// Batida ativa (s) dos pulsos contínuos (execução, inspeção, aviso).
+pub const PULSE_TEMPO_ACTIVE: f32 = 3.0;
+/// Intensidade discreta para estados calmos.
+pub const PULSE_INTENSITY_CALM: f32 = 0.38;
+/// Intensidade para trabalho ativo.
+pub const PULSE_INTENSITY_ACTIVE: f32 = 0.42;
+/// Radar de alerta (conexão com problema): um ponto mais visível.
+pub const PULSE_INTENSITY_ALERT: f32 = 0.46;
+
+/// Período (s) de um ciclo do spinner de fase — 2,5–4 s, suave.
+pub fn spinner_period(kind: SpinnerKind) -> f32 {
+    use SpinnerKind as K;
+    match kind {
+        K::PulseSoft => SPINNER_PERIOD_PULSE_SOFT,
+        K::PulseMultiple => SPINNER_PERIOD_PULSE_MULTIPLE,
+        K::PulseRings2 => SPINNER_PERIOD_PULSE_RINGS_2,
+        K::PulseRings3 => SPINNER_PERIOD_PULSE_RINGS_3,
+        K::BlocksScale => SPINNER_PERIOD_BLOCKS_SCALE,
+        K::BlocksShuffle2 => SPINNER_PERIOD_BLOCKS_SHUFFLE_2,
+        K::BlocksShuffle3 => SPINNER_PERIOD_BLOCKS_SHUFFLE_3,
+        K::BlocksWave => SPINNER_PERIOD_BLOCKS_WAVE,
+    }
+}
+
+/// Intensidade do spinner: progride com a fase da execução (iniciando →
+/// finalizando) sem passar de [`SPINNER_INTENSITY_MAX`].
+pub fn spinner_intensity(kind: SpinnerKind) -> f32 {
+    use SpinnerKind as K;
+    let step = match kind {
+        K::PulseSoft | K::BlocksScale => 0.0,
+        K::PulseMultiple | K::BlocksShuffle2 => 0.05,
+        K::PulseRings2 | K::BlocksShuffle3 => 0.11,
+        K::PulseRings3 | K::BlocksWave => 0.16,
+    };
+    (SPINNER_INTENSITY_MIN + step).min(SPINNER_INTENSITY_MAX)
+}
 
 fn color_by_idx(idx: f32) -> Rgb {
     match idx.round() as u32 {
@@ -74,14 +140,14 @@ impl Compositor<AppState> for WorkployGfx {
                 MARK_PULSE_BREATHE => {
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 8.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 2.6 };
+                    let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_CALM };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Breathe,
                             color: col,
                             reach,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.55 },
+                            intensity: if d[3] > 0.0 { d[3] } else { PULSE_INTENSITY_CALM },
                             ..Default::default()
                         })
                         .on(shape)
@@ -93,7 +159,7 @@ impl Compositor<AppState> for WorkployGfx {
                 MARK_PULSE_RADAR => {
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 10.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 1.8 };
+                    let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_ACTIVE };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Radar,
@@ -102,7 +168,7 @@ impl Compositor<AppState> for WorkployGfx {
                             reach,
                             period,
                             width: 1.2,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.72 },
+                            intensity: if d[3] > 0.0 { d[3] } else { PULSE_INTENSITY_ACTIVE },
                             ..Default::default()
                         })
                         .on(shape)
@@ -114,14 +180,14 @@ impl Compositor<AppState> for WorkployGfx {
                 MARK_PULSE_HEARTBEAT => {
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 10.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 2.0 };
+                    let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_ACTIVE };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Heartbeat,
                             color: col,
                             reach,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.65 },
+                            intensity: if d[3] > 0.0 { d[3] } else { PULSE_INTENSITY_CALM },
                             ..Default::default()
                         })
                         .on(shape)
@@ -131,11 +197,12 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_SOFT => {
-                    // `pulse-2`: dois pontos suaves que crescem e somem, com a
-                    // mesma defasagem do SVG original (0.6 s em ciclo de 1.2 s).
+                    // `pulse-2`: dois pontos suaves que crescem e somem. A
+                    // defasagem entre os pontos é uma fração do período no
+                    // shader (`1/n`), então alongar o ciclo mantém o ritmo.
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 7.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 1.2 };
+                    let period = if d[2] > 0.0 { d[2] } else { spinner_period(SpinnerKind::PulseSoft) };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Radar,
@@ -144,7 +211,11 @@ impl Compositor<AppState> for WorkployGfx {
                             reach,
                             width: reach * 0.42,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.6 },
+                            intensity: if d[3] > 0.0 {
+                                d[3]
+                            } else {
+                                spinner_intensity(SpinnerKind::PulseSoft)
+                            },
                             ..Default::default()
                         })
                         .on(shape)
@@ -158,7 +229,11 @@ impl Compositor<AppState> for WorkployGfx {
                     // iniciando pouco depois do anterior (stagger = período/3).
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 8.5 };
-                    let period = if d[2] > 0.0 { d[2] } else { 1.5 };
+                    let period = if d[2] > 0.0 {
+                        d[2]
+                    } else {
+                        spinner_period(SpinnerKind::PulseMultiple)
+                    };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Radar,
@@ -167,7 +242,11 @@ impl Compositor<AppState> for WorkployGfx {
                             reach,
                             width: reach * 0.34,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.66 },
+                            intensity: if d[3] > 0.0 {
+                                d[3]
+                            } else {
+                                spinner_intensity(SpinnerKind::PulseMultiple)
+                            },
                             ..Default::default()
                         })
                         .on(shape)
@@ -180,7 +259,11 @@ impl Compositor<AppState> for WorkployGfx {
                     // `pulse-rings-2`: dois anéis finos que expandem e somem.
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 11.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 1.8 };
+                    let period = if d[2] > 0.0 {
+                        d[2]
+                    } else {
+                        spinner_period(SpinnerKind::PulseRings2)
+                    };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Radar,
@@ -189,7 +272,11 @@ impl Compositor<AppState> for WorkployGfx {
                             reach,
                             width: 1.1,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.72 },
+                            intensity: if d[3] > 0.0 {
+                                d[3]
+                            } else {
+                                spinner_intensity(SpinnerKind::PulseRings2)
+                            },
                             ..Default::default()
                         })
                         .on(shape)
@@ -199,10 +286,14 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_RINGS_3 => {
-                    // `pulse-rings-3`: três anéis acelerando (defasagem 0.4 s).
+                    // `pulse-rings-3`: três anéis acelerando.
                     let col = color_by_idx(d[0]);
                     let reach = if d[1] > 0.0 { d[1] } else { 12.0 };
-                    let period = if d[2] > 0.0 { d[2] } else { 1.2 };
+                    let period = if d[2] > 0.0 {
+                        d[2]
+                    } else {
+                        spinner_period(SpinnerKind::PulseRings3)
+                    };
                     layers.push(
                         Fx::pulse(PulseParams {
                             style: PulseStyle::Radar,
@@ -211,7 +302,11 @@ impl Compositor<AppState> for WorkployGfx {
                             reach,
                             width: 1.1,
                             period,
-                            intensity: if d[3] > 0.0 { d[3] } else { 0.78 },
+                            intensity: if d[3] > 0.0 {
+                                d[3]
+                            } else {
+                                spinner_intensity(SpinnerKind::PulseRings3)
+                            },
                             ..Default::default()
                         })
                         .on(shape)
@@ -226,35 +321,42 @@ impl Compositor<AppState> for WorkployGfx {
                 | MARK_SPINNER_BLOCKS_WAVE => {
                     // Família `blocks-*`: grade de blocos em que cada bloco
                     // respira com defasagem própria, recriando o ritmo do SVG.
+                    let sk = match kind {
+                        MARK_SPINNER_BLOCKS_SCALE => SpinnerKind::BlocksScale,
+                        MARK_SPINNER_BLOCKS_SHUFFLE_2 => SpinnerKind::BlocksShuffle2,
+                        MARK_SPINNER_BLOCKS_SHUFFLE_3 => SpinnerKind::BlocksShuffle3,
+                        _ => SpinnerKind::BlocksWave,
+                    };
                     let col = color_by_idx(d[0]);
-                    let period = if d[2] > 0.0 { d[2] } else { 0.9 };
-                    let inten = if d[3] > 0.0 { d[3] } else { 0.9 };
+                    let period = if d[2] > 0.0 { d[2] } else { spinner_period(sk) };
+                    let inten = if d[3] > 0.0 { d[3] } else { spinner_intensity(sk) };
                     let bs = w.min(h) * 0.30;
-                    // (fração x, fração y, defasagem em s) de cada bloco.
+                    // (fração x, fração y, defasagem como fração do período)
+                    // de cada bloco: alongar o ciclo preserva a sequência.
                     let cells: &[(f32, f32, f32)] = match kind {
                         // `blocks-scale`: 2x2 subindo em sequência (horário).
                         MARK_SPINNER_BLOCKS_SCALE => &[
                             (0.10, 0.10, 0.0),
-                            (0.60, 0.10, 0.15),
-                            (0.60, 0.60, 0.30),
-                            (0.10, 0.60, 0.45),
+                            (0.60, 0.10, 0.20),
+                            (0.60, 0.60, 0.40),
+                            (0.10, 0.60, 0.60),
                         ],
                         // `blocks-shuffle-2`: diagonais alternando (troca).
                         MARK_SPINNER_BLOCKS_SHUFFLE_2 => {
-                            &[(0.10, 0.10, 0.0), (0.60, 0.60, period * 0.5)]
+                            &[(0.10, 0.10, 0.0), (0.60, 0.60, 0.5)]
                         }
                         // `blocks-shuffle-3`: três cantos em rodízio.
                         MARK_SPINNER_BLOCKS_SHUFFLE_3 => &[
                             (0.10, 0.10, 0.0),
-                            (0.10, 0.60, period * 0.33),
-                            (0.60, 0.60, period * 0.67),
+                            (0.10, 0.60, 0.33),
+                            (0.60, 0.60, 0.67),
                         ],
                         // `blocks-wave`: 2x2 com defasagem diagonal (col+linha).
                         _ => &[
                             (0.10, 0.10, 0.0),
-                            (0.60, 0.10, 0.13),
-                            (0.10, 0.60, 0.13),
-                            (0.60, 0.60, 0.26),
+                            (0.60, 0.10, 0.15),
+                            (0.10, 0.60, 0.15),
+                            (0.60, 0.60, 0.30),
                         ],
                     };
                     // Nota: `placements` alinha 1:1 com `layers` — um slot por
@@ -276,7 +378,7 @@ impl Compositor<AppState> for WorkployGfx {
                                 bs,
                                 bs * 0.28,
                             ))
-                            .at(phase_t + lag)
+                            .at(phase_t + lag * period)
                             .reduced(rm),
                         );
                         placements.push(slot);

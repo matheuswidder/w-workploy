@@ -269,6 +269,10 @@ where
     }
     drop(tx);
 
+    // Polling temporal independente de linhas: o cancelamento é checado a
+    // cada ~80 ms mesmo que o comando remoto fique minutos sem emitir nada.
+    // Ao cancelar, o cliente ssh local é morto na hora — a sessão remota
+    // recebe SIGHUP quando a conexão cai e o run não continua até o fim.
     let mut cancelled = false;
     let status = loop {
         while let Ok(line) = rx.try_recv() {
@@ -522,6 +526,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socketserver
 import subprocess
 import threading
@@ -948,6 +953,10 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                 append_step_log(run_id, idx, "[passo sem comando — nada a fazer]\n")
             else:
                 shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+                # start_new_session: o comando ganha seu próprio grupo de
+                # processos, permitindo matar shell + subprocessos de uma vez
+                # no cancelamento (sem isso, filhos como cargo/node sobrevivem
+                # órfãos à morte do shell).
                 proc = subprocess.Popen(
                     [shell_bin, "-lc", cmd],
                     cwd=workdir,
@@ -955,6 +964,7 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
+                    start_new_session=True,
                 )
                 with STATE_LOCK:
                     PROCESSES[run_id] = proc
@@ -972,11 +982,19 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                         if r and r.get("cancel_requested"):
                             cancelled = True
                     if cancelled:
-                        proc.terminate()
+                        # Mata o grupo inteiro (shell + subprocessos): builds
+                        # longos não continuam rodando na VPS após o cancel.
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except OSError:
+                            proc.terminate()
                         try:
                             proc.wait(timeout=3)
                         except subprocess.TimeoutExpired:
-                            proc.kill()
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            except OSError:
+                                proc.kill()
                         break
                     time.sleep(0.2)
                 t_pump.join(timeout=2)
@@ -1633,12 +1651,26 @@ where
     Ok(status.is_some_and(|s| s.success()))
 }
 
-pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>) {
+pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_id: &str) {
     for r in remote {
-        if let Some(slot) = existing.iter_mut().find(|e| e.id == r.id) {
-            *slot = r;
+        // O espelho carrega o vínculo com o runner da VPS: o id remoto é a
+        // própria chave de vinculação e o servidor dono é quem sincronizou.
+        // O JSON do runner não traz esses campos — `#[serde(default)]` os
+        // entrega como `None` e eles são preenchidos aqui.
+        let remote_cancel = r.cancel_requested;
+        let mut incoming = r;
+        incoming.vps_run_id = Some(incoming.id.clone());
+        incoming.vps_server_id = Some(vps_server_id.to_string());
+        if let Some(slot) = existing.iter_mut().find(|e| e.id == incoming.id) {
+            // Cancelamento é pedido, não estado consolidado: um pedido já
+            // registrado em qualquer um dos lados permanece até o runner
+            // confirmar na sincronização seguinte. Sem isso, uma sincronização
+            // apagaria o pedido feito no desktop antes do runner processar.
+            let local_cancel = slot.cancel_requested;
+            *slot = incoming;
+            slot.cancel_requested = local_cancel || remote_cancel;
         } else {
-            existing.push(r);
+            existing.push(incoming);
         }
     }
     existing.sort_by(|a, b| {
@@ -1647,6 +1679,70 @@ pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>) {
             .cmp(&a.started_ts.unwrap_or(0))
             .then(b.number.cmp(&a.number))
     });
+}
+
+/// Porta HTTP do runner na VPS (`runner_port` 0 = padrão 8787).
+fn runner_http_port(server: &VpsServer) -> u16 {
+    if server.runner_port == 0 {
+        8787
+    } else {
+        server.runner_port
+    }
+}
+
+/// Id de execução seguro para interpolar num comando ssh (sem shell metachars).
+fn sanitize_run_id(run_id: &str) -> String {
+    run_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+/// Monta o comando ssh que faz `POST /runs/{id}/{action}` no runner da VPS
+/// via curl local à máquina (o token nunca trafega pelo desktop).
+fn build_runner_action_cmd(port: u16, safe_run_id: &str, action: &str) -> String {
+    format!(
+        "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -X POST -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/runs/{safe_run_id}/{action}'"
+    )
+}
+
+/// Envia o cancelamento de uma execução ao runner da VPS
+/// (`POST /runs/{id}/cancel`). Bloqueante — chame numa thread separada.
+/// Marca `cancel_requested` no run remoto; o runner derruba o processo do
+/// passo atual em até ~0,2 s e encerra o run como "Cancelled".
+/// O resultado é registrado em `runner_sync_status` e, em sucesso, uma
+/// sincronização puxa o estado atualizado do runner.
+pub fn cancel_vps_run(sh: &SharedHandle, server: &VpsServer, vps_run_id: &str) -> Result<(), String> {
+    let safe_rid = sanitize_run_id(vps_run_id);
+    let result = if safe_rid.is_empty() {
+        Err("Cancelamento na VPS ignorado: id de execução inválido.".into())
+    } else {
+        let cmd = build_runner_action_cmd(runner_http_port(server), &safe_rid, "cancel");
+        match ssh_run_capture(server, &cmd) {
+            Ok((true, _, _)) => Ok(()),
+            Ok((false, _, stderr)) => Err(format!(
+                "Falha ao cancelar a execução na VPS '{}': {}",
+                server.name,
+                stderr.trim()
+            )),
+            Err(e) => Err(format!(
+                "Falha ao cancelar a execução na VPS '{}': {e}",
+                server.name
+            )),
+        }
+    };
+    {
+        let mut s = sh.lock().unwrap();
+        s.runner_sync_status = match &result {
+            Ok(()) => format!("Cancelamento enviado ao runner da '{}'.", server.name),
+            Err(msg) => msg.clone(),
+        };
+    }
+    engine::notify(sh);
+    if result.is_ok() {
+        sync_vps_runs(sh, &server.id);
+    }
+    result
 }
 
 pub fn sync_vps_runs(sh: &SharedHandle, server_id: &str) {
@@ -1673,7 +1769,7 @@ pub fn sync_vps_runs(sh: &SharedHandle, server_id: &str) {
                 Ok(remote_runs) => {
                     let count = remote_runs.len();
                     let mut s = sh2.lock().unwrap();
-                    merge_remote_runs(&mut s.runs, remote_runs);
+                    merge_remote_runs(&mut s.runs, remote_runs, &server.id);
                     save_runs(&s);
                     format!("Sincronizadas {count} execuções de '{}'.", server.name)
                 }
@@ -1709,19 +1805,8 @@ pub fn remote_approve_or_cancel(sh: &SharedHandle, server_id: &str, run_id: &str
     let rid = run_id.to_string();
     let sid = server_id.to_string();
     std::thread::spawn(move || {
-        let port = if server.runner_port == 0 {
-            8787
-        } else {
-            server.runner_port
-        };
         let action = if approve { "approve" } else { "cancel" };
-        let safe_rid: String = rid
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        let cmd = format!(
-            "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -X POST -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/runs/{safe_rid}/{action}'"
-        );
+        let cmd = build_runner_action_cmd(runner_http_port(&server), &sanitize_run_id(&rid), action);
         let status_msg = match ssh_run_capture(&server, &cmd) {
             Ok((true, _, _)) => {
                 let mut s = sh2.lock().unwrap();
@@ -2088,6 +2173,8 @@ RUNNER_ACTIVE=1\r\n";
             branch: "main".into(),
             summary: String::new(),
             annotations: vec![],
+            vps_run_id: None,
+            vps_server_id: None,
         }];
 
         let remote = vec![
@@ -2104,10 +2191,87 @@ RUNNER_ACTIVE=1\r\n";
             },
         ];
 
-        merge_remote_runs(&mut local, remote);
+        merge_remote_runs(&mut local, remote, "vps-a");
         assert_eq!(local.len(), 2);
         assert_eq!(local[0].id, "run-vps-2");
         assert_eq!(local[1].status, RunStatus::Success);
+        // O espelho carrega o vínculo com a VPS após a sincronização.
+        assert_eq!(local[0].vps_run_id.as_deref(), Some("run-vps-2"));
+        assert_eq!(local[0].vps_server_id.as_deref(), Some("vps-a"));
+        assert_eq!(local[1].vps_run_id.as_deref(), Some("run-vps-1"));
+    }
+
+    fn run_for_merge(id: &str, status: RunStatus, cancel_requested: bool) -> Run {
+        Run {
+            id: id.into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "CI".into(),
+            status,
+            trigger_label: "webhook".into(),
+            title: "run".into(),
+            number: 1,
+            commit: None,
+            started_at: "18/11/2026 10:00".into(),
+            started_ts: Some(100),
+            finished_at: None,
+            steps: vec![],
+            approved: false,
+            cancel_requested,
+            secs: 0.0,
+            actor: "workploy-runner".into(),
+            repo_name: None,
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: vec![],
+            vps_run_id: None,
+            vps_server_id: None,
+        }
+    }
+
+    #[test]
+    fn merge_remote_runs_propagates_cancel_and_keeps_local_request() {
+        // Desktop pediu cancelamento; o runner ainda não processou (false).
+        let mut local = vec![run_for_merge("run-vps-1", RunStatus::Running, true)];
+        let remote = vec![run_for_merge("run-vps-1", RunStatus::Running, false)];
+        merge_remote_runs(&mut local, remote, "vps-a");
+        assert!(
+            local[0].cancel_requested,
+            "pedido de cancelamento local não pode ser apagado pela sincronização"
+        );
+        assert_eq!(local[0].vps_run_id.as_deref(), Some("run-vps-1"));
+        assert_eq!(local[0].vps_server_id.as_deref(), Some("vps-a"));
+
+        // VPS → desktop: cancelamento confirmado no runner chega ao espelho.
+        let remote_cancelled = vec![run_for_merge("run-vps-2", RunStatus::Cancelled, true)];
+        merge_remote_runs(&mut local, remote_cancelled, "vps-a");
+        let mirror = local.iter().find(|r| r.id == "run-vps-2").unwrap();
+        assert!(mirror.cancel_requested);
+        assert_eq!(mirror.status, RunStatus::Cancelled);
+        assert_eq!(mirror.vps_run_id.as_deref(), Some("run-vps-2"));
+        assert_eq!(mirror.vps_server_id.as_deref(), Some("vps-a"));
+    }
+
+    #[test]
+    fn cancel_vps_run_builds_expected_curl_command_with_sanitized_id() {
+        let mut srv = VpsServer::default();
+        assert_eq!(runner_http_port(&srv), 8787);
+        srv.runner_port = 9090;
+        assert_eq!(runner_http_port(&srv), 9090);
+
+        let dirty = sanitize_run_id("run-vps-1; rm -rf /");
+        assert_eq!(dirty, "run-vps-1rm-rf");
+        assert!(!dirty.contains(';'));
+        assert!(!dirty.contains(char::is_whitespace));
+
+        let cmd = build_runner_action_cmd(8787, &sanitize_run_id("run-vps-abc_1"), "cancel");
+        assert!(cmd.contains("curl -fsS -X POST"));
+        assert!(cmd.contains("-H \"Authorization: Bearer $TOKEN\""));
+        assert!(cmd.contains("$(cat /etc/workploy/token"));
+        assert!(cmd.contains("http://127.0.0.1:8787/runs/run-vps-abc_1/cancel"));
+
+        // Mesma montagem usada pela aprovação — só a ação muda.
+        let approve_cmd = build_runner_action_cmd(8787, "run-vps-abc_1", "approve");
+        assert!(approve_cmd.contains("http://127.0.0.1:8787/runs/run-vps-abc_1/approve"));
     }
 
     #[test]
@@ -2138,6 +2302,9 @@ RUNNER_ACTIVE=1\r\n";
         assert!(script.contains("::workploy-substep::"));
         assert!(script.contains("def _finalize_running_substep("));
         assert!(script.contains("\"repo_name\": repo_full_name or None"));
+        assert!(script.contains("start_new_session=True"));
+        assert!(script.contains("os.killpg(os.getpgid(proc.pid), signal.SIGTERM)"));
+        assert!(script.contains("os.killpg(os.getpgid(proc.pid), signal.SIGKILL)"));
         assert!(!script.contains("widder"));
         assert!(!script.contains("docker.io"));
 

@@ -388,6 +388,8 @@ pub fn populate_demo(s: &mut Shared) {
             job: "Reconstruir containers".into(),
             msg: "Portão obrigatório antes de reiniciar api, web e worker na VPS.".into(),
         }],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 2. Running — CI Principal #692 (ao vivo, no projeto widder/landing)
@@ -434,6 +436,8 @@ pub fn populate_demo(s: &mut Shared) {
         branch: "feat/pix-recibo".into(),
         summary: String::new(),
         annotations: Vec::new(),
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 2b. Running — Deploy VPS #39 (última etapa, no projeto widder/erp-central)
@@ -477,6 +481,8 @@ pub fn populate_demo(s: &mut Shared) {
         branch: "main".into(),
         summary: String::new(),
         annotations: Vec::new(),
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 3. AwaitingApproval 2 — Isolamento RLS #114
@@ -519,6 +525,8 @@ pub fn populate_demo(s: &mut Shared) {
             job: "Aplicar políticas em homologação".into(),
             msg: "Altera políticas SELECT/INSERT na tabela medicoes_capex.".into(),
         }],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 4. Failed — CI Principal #689
@@ -575,6 +583,8 @@ pub fn populate_demo(s: &mut Shared) {
             job: "Verificação de tipos e testes".into(),
             msg: ts_err.into(),
         }],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 5. Featured Success — CI Principal #671 (used in summary & logs scenes)
@@ -674,6 +684,8 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
                 msg: "148 contratos Zod validados sem alterações incompatíveis.".into(),
             },
         ],
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 6. Deploy VPS #37 Success
@@ -706,6 +718,8 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
         branch: "main".into(),
         summary: "Deploy VPS concluído em 9 min 53 s · todos os serviços saudáveis.".into(),
         annotations: Vec::new(),
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     // 7. Build Mobile #24 Cancelled
@@ -737,6 +751,8 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
         branch: "feat/mobile-offline".into(),
         summary: String::new(),
         annotations: Vec::new(),
+        vps_run_id: None,
+        vps_server_id: None,
     };
 
     s.runs = vec![

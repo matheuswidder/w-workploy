@@ -15,6 +15,8 @@ const ROW_PITCH: f32 = 38.0;
 const SUB_ROW_H: f32 = 28.0;
 const SUB_ROW_PITCH: f32 = 30.0;
 const SECTION_H: f32 = 24.0;
+/// Largura do alvo de clique da seta de projeto (altura = linha toda).
+const CHEV_HIT_W: f32 = 30.0;
 
 fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) -> String {
     let has_active_binding = s
@@ -276,9 +278,13 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     },
                 ));
             } else {
+                // Dois alvos de clique independentes: a seta alterna o
+                // colapso das receitas; o título abre o painel do projeto.
+                let bid_toggle = bid.clone();
+                let bid_open = bid.clone();
                 items.push(project_header_row(
                     t,
-                    proj_key,
+                    bid.clone(),
                     b.full_name.clone(),
                     expanded,
                     is_proj_sel,
@@ -287,9 +293,14 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     y,
                     pill_w,
                     move |s: &mut AppState| {
-                        if !s.collapsed_projects.remove(&bid) {
-                            s.collapsed_projects.insert(bid.clone());
+                        if !s.collapsed_projects.remove(&bid_toggle) {
+                            s.collapsed_projects.insert(bid_toggle.clone());
                         }
+                    },
+                    move |s: &mut AppState| {
+                        s.selected_project_id = Some(bid_open.clone());
+                        s.selected_workflow_id = None;
+                        s.navigate_to(NavTarget::Runs);
                     },
                 ));
             }
@@ -882,13 +893,15 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         .child(el().key("sidebar-border").w(t.hair).h_full().fill(t.border_subtle))
 }
 
-/// Cabeçalho de projeto da sidebar: alterna a expansão das receitas aninhadas.
-/// A seta à esquerda gira (vira para baixo) quando o grupo está expandido; à
-/// direita ficam o spinner de fase (execução ativa) ou o ponto de status.
+/// Cabeçalho de projeto da sidebar com dois alvos de clique independentes:
+/// a seta à esquerda (`proj-chevron-{id}`) alterna a expansão das receitas
+/// aninhadas (gira para baixo quando expandida); o título (`proj-title-{id}`)
+/// abre o painel do projeto (Dashboard). À direita do título ficam o spinner
+/// de fase (execução ativa) ou o ponto de status.
 #[allow(clippy::too_many_arguments)]
 fn project_header_row(
     t: UiTheme,
-    key: impl Into<String>,
+    id: impl Into<String>,
     name: impl Into<String>,
     expanded: bool,
     selected: bool,
@@ -896,8 +909,10 @@ fn project_header_row(
     x: f32,
     y: f32,
     w: f32,
-    on_press: impl Fn(&mut AppState) + 'static,
+    on_chevron: impl Fn(&mut AppState) + 'static,
+    on_title: impl Fn(&mut AppState) + 'static,
 ) -> El {
+    let id = id.into();
     let name = name.into();
     let chev = if expanded {
         &icons::CHEVRON_DOWN
@@ -909,37 +924,34 @@ fn project_header_row(
     } else {
         t.text_secondary
     };
-    let mut r = row()
-        .key(key)
-        .role("button")
-        .label(if expanded {
-            format!("Recolher fluxos de {name}")
-        } else {
-            format!("Expandir fluxos de {name}")
-        })
-        .help("Expande ou recolhe as receitas deste projeto na barra lateral.")
-        .absolute(x, y)
-        .size(w, ROW_H)
-        .px(10.0)
-        .gap(7.0)
+    // Rótulo da seta calculado antes de mover `name` para o título.
+    let chev_label = if expanded {
+        format!("Recolher fluxos de {name}")
+    } else {
+        format!("Expandir fluxos de {name}")
+    };
+    // Título: botão de navegação que carrega o spinner/ponto à direita.
+    let mut title = row()
+        .key(format!("proj-title-{id}"))
+        .role("tab")
+        .label(name.clone())
+        .checked(selected)
+        .help("Abre o resumo, análises e dados do projeto.")
+        .grow(1.0)
+        .h(ROW_H)
+        .pr(10.0)
         .center_y()
-        .radius(6.0)
         .cursor(Cursor::Pointer)
         .focusable(true)
         .focus_ring(2.0, 2.0, t.accent)
-        .hover(t.hover)
+        .hover(if selected {
+            Color::TRANSPARENT
+        } else {
+            t.hover
+        })
         .press(t.press)
         .press_scale(0.98)
-        .on_press(on_press)
-        .child(
-            icon(chev, 13.0)
-                .color(if expanded {
-                    t.text_muted
-                } else {
-                    t.accent
-                })
-                .a11y_hidden(),
-        )
+        .on_press(on_title)
         .child(
             text(name)
                 .font(if selected { ty::BODY_MED } else { ty::BODY })
@@ -950,9 +962,40 @@ fn project_header_row(
                 .a11y_hidden(),
         );
     if let Some(tr) = trailing {
-        r = r.child(tr);
+        title = title.child(tr);
     }
-    r
+    row()
+        .key(format!("nav-proj-{id}"))
+        .absolute(x, y)
+        .size(w, ROW_H)
+        .radius(6.0)
+        .child(
+            row()
+                .key(format!("proj-chevron-{id}"))
+                .role("button")
+                .label(chev_label)
+                .expanded(expanded)
+                .help("Expande ou recolhe as receitas deste projeto na barra lateral.")
+                .size(CHEV_HIT_W, ROW_H)
+                .center()
+                .cursor(Cursor::Pointer)
+                .focusable(true)
+                .focus_ring(2.0, 2.0, t.accent)
+                .hover(t.hover)
+                .press(t.press)
+                .press_scale(0.94)
+                .on_press(on_chevron)
+                .child(
+                    icon(chev, 13.0)
+                        .color(if expanded {
+                            t.text_muted
+                        } else {
+                            t.accent
+                        })
+                        .a11y_hidden(),
+                ),
+        )
+        .child(title)
 }
 
 #[allow(clippy::too_many_arguments)]

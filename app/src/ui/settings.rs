@@ -2,7 +2,7 @@ use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, t
 use rune_kit::{Kit, Switch, TextInput};
 use workploy::model::{CapacityTier, GithubRepoSummary, PlatformTarget, TriggerMode, VpsServer};
 
-use crate::gfx::MARK_PULSE_RADAR;
+use crate::gfx::{MARK_PULSE_RADAR, PULSE_INTENSITY_ACTIVE, PULSE_TEMPO_ACTIVE};
 use crate::state::{AppState, ModalState, SettingsTab, platform_compat_warning};
 use crate::ui::components::{
     btn_danger, btn_ghost, btn_neutral, chip, field_box, header_card, pill_badge,
@@ -1157,7 +1157,7 @@ fn vps_server_item(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                     .radius(4.0)
                     .effect_bleed(10.0)
-                    .effect_data([4.0, 10.0, 1.4, 0.0]),
+                    .effect_data([4.0, 10.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
             )
             .child(el().size(8.0, 8.0).radius(4.0).fill(t.info))
     } else {

@@ -3,7 +3,7 @@ use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, t
 use rune_kit::{Kit, Progress, Switch, TextArea, TextInput};
 use workploy::model::{PlatformTarget, Trigger, TriggerMode};
 
-use crate::gfx::MARK_PULSE_RADAR;
+use crate::gfx::{MARK_PULSE_RADAR, PULSE_INTENSITY_ACTIVE, PULSE_TEMPO_ACTIVE};
 use crate::state::{
     AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind, WorkflowPreset,
     platform_compat_warning,
@@ -1571,7 +1571,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                             .radius(4.0)
                             .effect_bleed(7.0)
-                            .effect_data([4.0, 7.0, 1.4, 0.7]),
+                            .effect_data([4.0, 7.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
                     )
                     .child(el().size(8.0, 8.0).radius(4.0).fill(t.info));
                 form = form.child(
@@ -2133,7 +2133,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                             .radius(4.0)
                             .effect_bleed(8.0)
-                            .effect_data([4.0, 8.0, 1.6, 0.7]),
+                            .effect_data([4.0, 8.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
                     )
                     .child(el().size(8.0, 8.0).radius(4.0).fill(t.info));
 

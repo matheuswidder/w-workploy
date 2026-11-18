@@ -6,7 +6,7 @@ use rune_kit::Placement;
 use rune_kit::{Kit, Select, SelectAppearance, TextInput};
 use workploy::model::{self, PlatformTarget, RepoBinding, Run, RunStatus, StepStatus, TriggerMode};
 
-use crate::gfx::MARK_PULSE_RADAR;
+use crate::gfx::{MARK_PULSE_RADAR, PULSE_INTENSITY_ACTIVE, PULSE_TEMPO_ACTIVE};
 use crate::state::{AppState, ModalState, SettingsTab, StatusFilter, platform_compat_warning};
 use crate::ui::components::{
     btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card, pill_badge,
@@ -862,7 +862,7 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                     .radius(4.0)
                     .effect_bleed(7.0)
-                    .effect_data([4.0, 7.0, 1.8, 0.7]),
+                    .effect_data([4.0, 7.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
             )
             .child(el().size(7.0, 7.0).radius(3.5).fill(t.info));
         row()
@@ -1185,7 +1185,7 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                     .radius(4.0)
                     .effect_bleed(7.0)
-                    .effect_data([4.0, 7.0, 1.8, 0.7]),
+                    .effect_data([4.0, 7.0, PULSE_TEMPO_ACTIVE, PULSE_INTENSITY_ACTIVE]),
             )
             .child(el().size(7.0, 7.0).radius(3.5).fill(t.info));
         row()
@@ -2084,19 +2084,38 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
                 );
         }
         RunStatus::Running | RunStatus::Queued => {
-            right_actions = right_actions.child(
-                btn_danger(
-                    t,
-                    format!("row-cancel-{}", r.id),
-                    "Cancelar",
-                    None,
-                    28.0,
-                    move |s: &mut AppState, tx: &mut Tx| {
-                        s.cancel_or_reject_run(&rid_cancel, false, tx)
-                    },
-                )
-                .hover_alone(),
-            );
+            // Cancelamento já solicitado e execução ainda ativa: o botão
+            // vira estado de espera, sem clique repetido.
+            if r.cancel_requested && r.status.active() {
+                right_actions = right_actions.child(
+                    btn_danger(
+                        t,
+                        format!("row-cancel-{}", r.id),
+                        "Cancelando...",
+                        None,
+                        28.0,
+                        |_: &mut AppState, _| {},
+                    )
+                    .disabled(true)
+                    .opacity(0.6)
+                    .cursor(Cursor::Default)
+                    .hover_alone(),
+                );
+            } else {
+                right_actions = right_actions.child(
+                    btn_danger(
+                        t,
+                        format!("row-cancel-{}", r.id),
+                        "Cancelar",
+                        None,
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.cancel_or_reject_run(&rid_cancel, false, tx)
+                        },
+                    )
+                    .hover_alone(),
+                );
+            }
         }
         _ => {
             right_actions = right_actions

@@ -2384,8 +2384,10 @@ mod tests {
         assert!(rt.find("nav-proj-wf-rb-landing-wf-ci-principal").is_some());
         assert!(rt.find("nav-proj-wf-rb-landing-wf-deploy-vps").is_some());
 
-        // 1b. Project header toggles the nested flows (collapse + expand)
-        let (px, py) = rt.find("nav-proj-rb-erp").expect("nav-proj-rb-erp exists");
+        // 1b. The chevron hit-target toggles the nested flows (collapse + expand)
+        let (px, py) = rt
+            .find("proj-chevron-rb-erp")
+            .expect("proj-chevron-rb-erp exists");
         rt.pointer_down(px, py);
         rt.pointer_up(px, py);
         rt.frame(1.0 / 60.0);
@@ -2539,6 +2541,250 @@ mod tests {
                 .any(|e| e.text.as_deref() == Some("▸ Varredura profunda")),
             "expected ::workploy-substep:: line rendered as '▸ Varredura profunda' while active substep stays open"
         );
+    }
+
+    #[test]
+    fn sidebar_project_title_opens_dashboard_and_chevron_only_toggles() {
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // A linha de projeto expõe dois alvos independentes.
+        assert!(rt.find("proj-chevron-rb-erp").is_some());
+        assert!(rt.find("proj-title-rb-erp").is_some());
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_some());
+
+        // 1. Clique na seta alterna o colapso sem navegar.
+        let (cx, cy) = rt
+            .find("proj-chevron-rb-erp")
+            .expect("proj-chevron-rb-erp exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_none());
+        assert!(
+            rt.state.selected_project_id.is_none(),
+            "chevron click must not select the project"
+        );
+        assert_eq!(rt.state.nav, NavTarget::Runs);
+        // Expande de volta para o estado original.
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(rt.state.selected_project_id.is_none());
+
+        // 2. Clique no título abre o Dashboard do Projeto.
+        let (tx, ty) = rt
+            .find("proj-title-rb-erp")
+            .expect("proj-title-rb-erp exists");
+        rt.pointer_down(tx, ty);
+        rt.pointer_up(tx, ty);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-erp"));
+        assert_eq!(rt.state.selected_workflow_id, None);
+        assert_eq!(rt.state.nav, NavTarget::Runs);
+        for key in [
+            "project-dashboard-hdr",
+            "proj-back-all",
+            "proj-kpi-grid",
+            "proj-kpi-where",
+            "proj-kpi-resources",
+            "proj-kpi-avg-dur",
+            "proj-kpi-success",
+            "proj-workflows-section",
+            "proj-wf-card-wf-deploy-vps",
+        ] {
+            assert!(
+                rt.find(key).is_some(),
+                "expected {key} in project dashboard after title click"
+            );
+        }
+        // Navegar pelo título não mexe no estado de colapso.
+        assert!(!rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_some());
+
+        // 3. Com o painel aberto, a seta continua alternando o colapso
+        //    sem perder a seleção do projeto.
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.collapsed_projects.contains("rb-erp"));
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-erp"));
+        assert!(rt.find("proj-kpi-grid").is_some());
+    }
+
+    #[test]
+    fn pulse_effects_keep_smooth_slow_cadence() {
+        use workploy::model::SpinnerKind as K;
+
+        // Spinners de fase: ciclo visível entre 2,5 s e 4 s (batida lenta).
+        for kind in [
+            K::PulseSoft,
+            K::PulseMultiple,
+            K::PulseRings2,
+            K::PulseRings3,
+            K::BlocksScale,
+            K::BlocksShuffle2,
+            K::BlocksShuffle3,
+            K::BlocksWave,
+        ] {
+            let period = gfx::spinner_period(kind);
+            assert!(
+                (2.5..=4.0).contains(&period),
+                "{kind:?} period {period}s outside the smooth 2.5–4 s range"
+            );
+            let intensity = gfx::spinner_intensity(kind);
+            assert!(
+                (gfx::SPINNER_INTENSITY_MIN..=gfx::SPINNER_INTENSITY_MAX).contains(&intensity),
+                "{kind:?} intensity {intensity} outside the discreet range"
+            );
+        }
+        // A fase final é a mais intensa, mas nunca ofusca o texto ao lado.
+        assert!(gfx::spinner_intensity(K::PulseRings3) <= 0.5);
+        assert!(gfx::spinner_intensity(K::PulseSoft) <= gfx::spinner_intensity(K::PulseRings3));
+
+        // Pulsos contínuos de status (health dot, execução, aprovação,
+        // runner, inspeção): ≥ 3 s por ciclo e intensidade discreta.
+        // Constantes puras → checagem em tempo de compilação.
+        const {
+            assert!(
+                gfx::PULSE_TEMPO_CALM >= 3.0 && gfx::PULSE_TEMPO_ACTIVE >= 3.0,
+                "status pulses must beat at most once every ~3 s"
+            );
+            assert!(gfx::PULSE_INTENSITY_CALM <= 0.4);
+            assert!(gfx::PULSE_INTENSITY_ACTIVE <= 0.45);
+            assert!(gfx::PULSE_INTENSITY_ALERT <= 0.5);
+        }
+    }
+
+    #[test]
+    fn cancel_button_shows_cancelando_while_request_pending_and_blocks_repeat() {
+        // 1. Lista de execuções: caminho ativo — um clique cancela (demo
+        //    encerra na hora) e o pedido não fica pendente.
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        for _ in 0..12 {
+            let Some((_, by)) = rt.find("row-cancel-run-demo-running") else {
+                break;
+            };
+            if by > 100.0 && by < 780.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (rx, ry) = rt
+            .find("row-cancel-run-demo-running")
+            .expect("row cancel button exists");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+        let cancelled = rt
+            .state
+            .snapshot
+            .runs
+            .iter()
+            .find(|r| r.id == "run-demo-running")
+            .expect("run-demo-running exists");
+        assert_eq!(cancelled.status, RunStatus::Cancelled);
+
+        // 2. Estado de espera: o backend marcou `cancel_requested` e o run
+        //    segue ativo — o botão vira "Cancelando..." e desabilita.
+        let mut rt2 = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt2.frame(0.0);
+        rt2.frame(1.0 / 60.0);
+        rt2.update(|s, _| {
+            let r = s
+                .snapshot
+                .runs
+                .iter_mut()
+                .find(|r| r.id == "run-demo-running")
+                .expect("run exists");
+            r.cancel_requested = true;
+        });
+        rt2.frame(1.0 / 60.0);
+        for _ in 0..12 {
+            let Some((_, by)) = rt2.find("row-cancel-run-demo-running") else {
+                break;
+            };
+            if by > 100.0 && by < 780.0 {
+                break;
+            }
+            rt2.wheel(640.0, 400.0, -240.0);
+            rt2.frame(1.0 / 60.0);
+        }
+        let row_el = rt2
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("row-cancel-run-demo-running"))
+            .expect("row cancel button rendered");
+        assert_eq!(
+            row_el.label.as_deref(),
+            Some("Cancelando..."),
+            "pending cancel must relabel the row button"
+        );
+        assert!(
+            !row_el.focusable,
+            "Cancelando... row button must be disabled"
+        );
+
+        // Segundo clique não refaz a ação: o run continua Running.
+        let (rx2, ry2) = rt2
+            .find("row-cancel-run-demo-running")
+            .expect("row cancel button exists");
+        rt2.pointer_down(rx2, ry2);
+        rt2.pointer_up(rx2, ry2);
+        rt2.frame(1.0 / 60.0);
+        let r_after = rt2
+            .state
+            .snapshot
+            .runs
+            .iter()
+            .find(|r| r.id == "run-demo-running")
+            .expect("run exists");
+        assert_eq!(r_after.status, RunStatus::Running);
+        assert!(r_after.cancel_requested);
+
+        // 3. Mesmo estado de espera na tela de detalhe do run.
+        rt2.update(|s, _| s.open_run_logs("run-demo-running", 1));
+        rt2.frame(1.0 / 60.0);
+        let det_el = rt2
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("detail-cancel"))
+            .expect("detail cancel button rendered");
+        assert_eq!(det_el.label.as_deref(), Some("Cancelando..."));
+        assert!(!det_el.focusable, "Cancelando... detail button must be disabled");
+        let (dx, dy) = rt2.find("detail-cancel").expect("detail cancel button exists");
+        rt2.pointer_down(dx, dy);
+        rt2.pointer_up(dx, dy);
+        rt2.frame(1.0 / 60.0);
+        let r_det = rt2
+            .state
+            .snapshot
+            .runs
+            .iter()
+            .find(|r| r.id == "run-demo-running")
+            .expect("run exists");
+        assert_eq!(r_det.status, RunStatus::Running);
     }
 
     #[test]

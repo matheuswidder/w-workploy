@@ -124,16 +124,37 @@ pub fn view(
                 ));
         }
         RunStatus::Running | RunStatus::Queued => {
-            header_actions = header_actions.child(btn_danger(
-                t,
-                "detail-cancel",
-                "Cancelar execução",
-                Some(&icons::X_CIRCLE),
-                34.0,
-                move |s: &mut AppState, tx: &mut Tx| {
-                    s.cancel_or_reject_run(&rid_cancel, false, tx)
-                },
-            ));
+            // Cancelamento já solicitado e execução ainda ativa: o botão
+            // vira estado de espera, sem clique repetido.
+            if run.cancel_requested && run.status.active() {
+                header_actions = header_actions.child(
+                    btn_danger(
+                        t,
+                        "detail-cancel",
+                        "Cancelando...",
+                        Some(&icons::X_CIRCLE),
+                        34.0,
+                        |_: &mut AppState, _| {},
+                    )
+                    .disabled(true)
+                    .opacity(0.6)
+                    .cursor(Cursor::Default)
+                    .help(
+                        "O cancelamento já foi solicitado. A execução será encerrada em instantes.",
+                    ),
+                );
+            } else {
+                header_actions = header_actions.child(btn_danger(
+                    t,
+                    "detail-cancel",
+                    "Cancelar execução",
+                    Some(&icons::X_CIRCLE),
+                    34.0,
+                    move |s: &mut AppState, tx: &mut Tx| {
+                        s.cancel_or_reject_run(&rid_cancel, false, tx)
+                    },
+                ));
+            }
         }
         _ => {
             header_actions = header_actions.child(primary_button(
