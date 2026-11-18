@@ -624,12 +624,12 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
                     btn_neutral(
                         t,
                         format!("btn-sync-bind-{}", b.id),
-                        "Sincronizar na VPS",
+                        "Re-sincronizar",
                         Some(&icons::REFRESH),
                         28.0,
                         move |s: &mut AppState, tx: &mut Tx| s.sync_bindings_to_vps(&sid, tx),
                     )
-                    .help("Envia este vínculo e suas regras para o agente workploy-runner na VPS."),
+                    .help("O Workploy já sincroniza automaticamente ao salvar vínculos e fluxos. Clique aqui para reenviar manualmente à VPS."),
                 );
             }
             row_actions = row_actions

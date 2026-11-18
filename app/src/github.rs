@@ -1152,6 +1152,855 @@ pub fn build_rust_ci_steps() -> Vec<Step> {
     ]
 }
 
+fn unquote_yaml_scalar(raw: &str) -> String {
+    let t = raw.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let inner = &t[1..t.len() - 1];
+        return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        let inner = &t[1..t.len() - 1];
+        return inner.replace("''", "'");
+    }
+    if let Some((before, _)) = t.split_once(" #") {
+        before.trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn split_yaml_key_val(text: &str) -> Option<(&str, &str)> {
+    let colon = text.find(':')?;
+    let key = text[..colon].trim();
+    if key.is_empty() || key.contains(' ') {
+        return None;
+    }
+    let after = &text[colon + 1..];
+    if after.is_empty() || after.starts_with(' ') || after.starts_with('\t') {
+        Some((key, after.trim()))
+    } else {
+        None
+    }
+}
+
+fn line_has_remote_eof_heredoc(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(pos) = rest.find("<<") {
+        let after = rest[pos + 2..].trim_start_matches('-').trim_start();
+        let cand = after
+            .strip_prefix("'REMOTE_EOF'")
+            .or_else(|| after.strip_prefix("\"REMOTE_EOF\""))
+            .or_else(|| after.strip_prefix("REMOTE_EOF"));
+        if let Some(tail) = cand
+            && (tail.is_empty()
+                || tail
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_'))
+        {
+            return true;
+        }
+        rest = &rest[pos + 2..];
+    }
+    false
+}
+
+fn rewrite_repo_root_line(line: &str) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim();
+    if let Some(rhs) = trimmed.strip_prefix("REPO_ROOT=") {
+        let clean_rhs = rhs.trim();
+        let val = if (clean_rhs.starts_with('"') && clean_rhs.ends_with('"') && clean_rhs.len() >= 2)
+            || (clean_rhs.starts_with('\'') && clean_rhs.ends_with('\'') && clean_rhs.len() >= 2)
+        {
+            &clean_rhs[1..clean_rhs.len() - 1]
+        } else {
+            clean_rhs.split_once(" #").map(|(a, _)| a.trim()).unwrap_or(clean_rhs)
+        };
+        if val.starts_with("/root/Projects/") {
+            return format!(
+                "{indent}if [ -d \"{val}\" ]; then REPO_ROOT=\"{val}\"; else REPO_ROOT=\"${{REPO_ROOT_OVERRIDE:-$(pwd)}}\"; fi"
+            );
+        }
+    }
+    line.to_string()
+}
+
+pub fn extract_remote_eof_and_normalize(script: &str) -> String {
+    let lines: Vec<&str> = script.lines().collect();
+    let mut extracted: Option<Vec<&str>> = None;
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        if line_has_remote_eof_heredoc(lines[i])
+            && let Some(end_rel) = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == "REMOTE_EOF")
+        {
+            extracted = Some(lines[i + 1..i + 1 + end_rel].to_vec());
+            break;
+        }
+        i += 1;
+    }
+
+    let body_lines: Vec<String> = match extracted {
+        Some(inner) => {
+            let min_indent = inner
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.len() - l.trim_start().len())
+                .min()
+                .unwrap_or(0);
+            inner
+                .into_iter()
+                .map(|l| {
+                    if l.trim().is_empty() {
+                        String::new()
+                    } else {
+                        let cut = min_indent.min(l.len());
+                        l[cut..].to_string()
+                    }
+                })
+                .collect()
+        }
+        None => lines.into_iter().map(str::to_string).collect(),
+    };
+
+    let normalized: Vec<String> = body_lines
+        .into_iter()
+        .map(|l| rewrite_repo_root_line(&l))
+        .collect();
+    normalized.join("\n").trim().to_string()
+}
+
+pub fn parse_gha_workflow_jobs(yaml_text: &str) -> Vec<(String, Vec<(String, String)>)> {
+    #[derive(Default)]
+    struct RawStep {
+        name: Option<String>,
+        run: Option<String>,
+        working_dir: Option<String>,
+    }
+
+    let mut jobs: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut in_jobs = false;
+    let mut jobs_indent: Option<usize> = None;
+    let mut job_indent: Option<usize> = None;
+    let mut job_prop_indent: Option<usize> = None;
+
+    let mut cur_job_id: Option<String> = None;
+    let mut cur_job_name: Option<String> = None;
+    let mut cur_steps: Vec<(String, String)> = Vec::new();
+
+    let mut in_steps = false;
+    let mut steps_indent: Option<usize> = None;
+    let mut step_item_indent: Option<usize> = None;
+    let mut step_key_indent: Option<usize> = None;
+    let mut cur_step: Option<RawStep> = None;
+
+    let mut in_block = false;
+    let mut block_base_indent = 0usize;
+    let mut block_content_indent: Option<usize> = None;
+    let mut block_folded = false;
+    let mut block_lines: Vec<String> = Vec::new();
+
+    let flush_step = |cur_step: &mut Option<RawStep>, cur_steps: &mut Vec<(String, String)>| {
+        if let Some(st) = cur_step.take()
+            && let Some(raw_run) = st.run
+        {
+            let mut script = extract_remote_eof_and_normalize(&raw_run);
+            if script.is_empty() {
+                return;
+            }
+            if let Some(wd) = st.working_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let wd_q = wd.replace('\'', "'\"'\"'");
+                script = format!("(cd '{wd_q}' &&\n{script}\n)");
+            }
+            let step_name = st
+                .name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    let first = script
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("Passo");
+                    let trunc: String = first.chars().take(48).collect();
+                    if first.chars().count() > 48 {
+                        format!("{trunc}…")
+                    } else {
+                        trunc
+                    }
+                });
+            cur_steps.push((step_name, script));
+        }
+    };
+
+    let flush_job = |cur_job_id: &mut Option<String>,
+                     cur_job_name: &mut Option<String>,
+                     cur_steps: &mut Vec<(String, String)>,
+                     cur_step: &mut Option<RawStep>,
+                     jobs: &mut Vec<(String, Vec<(String, String)>)>| {
+        flush_step(cur_step, cur_steps);
+        if let Some(jid) = cur_job_id.take() {
+            let jname = cur_job_name
+                .take()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(jid);
+            let steps = std::mem::take(cur_steps);
+            if !steps.is_empty() {
+                jobs.push((jname, steps));
+            }
+        } else {
+            cur_job_name.take();
+            cur_steps.clear();
+        }
+    };
+
+    let finish_block = |block_lines: &mut Vec<String>,
+                        block_folded: bool,
+                        cur_step: &mut Option<RawStep>| {
+        while block_lines.last().is_some_and(|l| l.is_empty()) {
+            block_lines.pop();
+        }
+        let joined = if block_folded {
+            block_lines
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            block_lines.join("\n")
+        };
+        block_lines.clear();
+        if let Some(st) = cur_step.as_mut() {
+            st.run = Some(joined);
+        }
+    };
+
+    for raw in yaml_text.lines() {
+        let line = raw.trim_end_matches('\r');
+        let trimmed = line.trim();
+
+        if in_block {
+            if trimmed.is_empty() {
+                block_lines.push(String::new());
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if indent > block_base_indent {
+                let ci = *block_content_indent.get_or_insert(indent);
+                let cut = ci.min(line.len() - line.trim_start().len());
+                block_lines.push(line[cut..].to_string());
+                continue;
+            }
+            finish_block(&mut block_lines, block_folded, &mut cur_step);
+            in_block = false;
+            block_content_indent = None;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+
+        if !in_jobs {
+            if let Some((k, v)) = split_yaml_key_val(trimmed)
+                && k == "jobs"
+                && (v.is_empty() || v.starts_with('#'))
+            {
+                in_jobs = true;
+                jobs_indent = Some(indent);
+            }
+            continue;
+        }
+
+        if let Some(ji) = jobs_indent
+            && indent <= ji
+        {
+            flush_job(
+                &mut cur_job_id,
+                &mut cur_job_name,
+                &mut cur_steps,
+                &mut cur_step,
+                &mut jobs,
+            );
+            in_jobs = false;
+            in_steps = false;
+            continue;
+        }
+
+        if job_indent.is_none() {
+            job_indent = Some(indent);
+        }
+
+        if Some(indent) == job_indent && !trimmed.starts_with('-') {
+            if let Some((k, _)) = split_yaml_key_val(trimmed) {
+                flush_job(
+                    &mut cur_job_id,
+                    &mut cur_job_name,
+                    &mut cur_steps,
+                    &mut cur_step,
+                    &mut jobs,
+                );
+                cur_job_id = Some(k.to_string());
+                job_prop_indent = None;
+                in_steps = false;
+                steps_indent = None;
+                step_item_indent = None;
+                step_key_indent = None;
+            }
+            continue;
+        }
+
+        if cur_job_id.is_none() {
+            continue;
+        }
+
+        if in_steps
+            && let Some(si) = steps_indent
+            && indent <= si
+            && !trimmed.starts_with('-')
+        {
+            flush_step(&mut cur_step, &mut cur_steps);
+            in_steps = false;
+            steps_indent = None;
+            step_item_indent = None;
+            step_key_indent = None;
+        }
+
+        if !in_steps {
+            if job_prop_indent.is_none() {
+                job_prop_indent = Some(indent);
+            }
+            if Some(indent) == job_prop_indent
+                && let Some((k, v)) = split_yaml_key_val(trimmed)
+            {
+                if k == "name" {
+                    cur_job_name = Some(unquote_yaml_scalar(v));
+                } else if k == "steps" && (v.is_empty() || v.starts_with('#')) {
+                    in_steps = true;
+                    steps_indent = Some(indent);
+                    step_item_indent = None;
+                    step_key_indent = None;
+                }
+            }
+            continue;
+        }
+
+        // Inside `steps:`
+        let is_list_item = trimmed == "-" || trimmed.starts_with("- ");
+        if is_list_item {
+            if step_item_indent.is_none() {
+                step_item_indent = Some(indent);
+            }
+            if Some(indent) == step_item_indent {
+                flush_step(&mut cur_step, &mut cur_steps);
+                cur_step = Some(RawStep::default());
+                step_key_indent = None;
+                let rest = trimmed.strip_prefix('-').unwrap_or("").trim();
+                if !rest.is_empty() {
+                    let key_col = indent + 2;
+                    step_key_indent = Some(key_col);
+                    if let Some((k, v)) = split_yaml_key_val(rest) {
+                        match k {
+                            "name" => {
+                                if let Some(st) = cur_step.as_mut() {
+                                    st.name = Some(unquote_yaml_scalar(v));
+                                }
+                            }
+                            "working-directory" => {
+                                if let Some(st) = cur_step.as_mut() {
+                                    st.working_dir = Some(unquote_yaml_scalar(v));
+                                }
+                            }
+                            "run" => {
+                                let style = v.split_once(" #").map(|(a, _)| a.trim()).unwrap_or(v);
+                                if matches!(style, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
+                                    in_block = true;
+                                    block_base_indent = key_col;
+                                    block_content_indent = None;
+                                    block_folded = style.starts_with('>');
+                                    block_lines.clear();
+                                } else if let Some(st) = cur_step.as_mut() {
+                                    st.run = Some(unquote_yaml_scalar(v));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        if cur_step.is_some() {
+            if step_key_indent.is_none() {
+                step_key_indent = Some(indent);
+            }
+            if Some(indent) == step_key_indent
+                && let Some((k, v)) = split_yaml_key_val(trimmed)
+            {
+                match k {
+                    "name" => {
+                        if let Some(st) = cur_step.as_mut() {
+                            st.name = Some(unquote_yaml_scalar(v));
+                        }
+                    }
+                    "working-directory" => {
+                        if let Some(st) = cur_step.as_mut() {
+                            st.working_dir = Some(unquote_yaml_scalar(v));
+                        }
+                    }
+                    "run" => {
+                        let style = v.split_once(" #").map(|(a, _)| a.trim()).unwrap_or(v);
+                        if matches!(style, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
+                            in_block = true;
+                            block_base_indent = indent;
+                            block_content_indent = None;
+                            block_folded = style.starts_with('>');
+                            block_lines.clear();
+                        } else if let Some(st) = cur_step.as_mut() {
+                            st.run = Some(unquote_yaml_scalar(v));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if in_block {
+        finish_block(&mut block_lines, block_folded, &mut cur_step);
+    }
+    flush_job(
+        &mut cur_job_id,
+        &mut cur_job_name,
+        &mut cur_steps,
+        &mut cur_step,
+        &mut jobs,
+    );
+
+    jobs
+}
+
+fn parse_gha_workflow_top_name(yaml_text: &str) -> Option<String> {
+    for raw in yaml_text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        if indent == 0
+            && let Some((k, v)) = split_yaml_key_val(trimmed)
+            && k == "name"
+        {
+            let name = unquote_yaml_scalar(v);
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+pub fn build_step_command_from_substeps(substeps: &[(String, String)]) -> String {
+    let mut out = String::from("set -e");
+    for (name, cmd) in substeps {
+        let escaped_name = name
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`");
+        out.push_str(&format!("\necho \"::workploy-substep::{escaped_name}\""));
+        let trimmed_cmd = cmd.trim();
+        if !trimmed_cmd.is_empty() {
+            out.push('\n');
+            out.push_str(trimmed_cmd);
+        }
+    }
+    out
+}
+
+pub fn replace_generated_workflows(
+    s: &mut Shared,
+    binding_id: &str,
+    generated: Vec<Workflow>,
+) {
+    let new_names: Vec<String> = generated.iter().map(|w| w.name.clone()).collect();
+    s.workflows.retain(|existing| {
+        if existing.repo_id.as_deref() == Some(binding_id) {
+            return false;
+        }
+        if new_names.iter().any(|n| n == &existing.name) {
+            return false;
+        }
+        true
+    });
+    s.workflows.extend(generated);
+}
+
+pub struct RepoInspectionInput<'a> {
+    pub binding: &'a RepoBinding,
+    pub gha_files: &'a [(String, String)],
+    pub package_json: Option<&'a serde_json::Value>,
+    pub has_pnpm_lock: bool,
+    pub has_cargo_toml: bool,
+    pub infra_compose_files: &'a [String],
+    pub has_compose: bool,
+    pub has_dockerfile: bool,
+}
+
+fn build_deploy_fallback_steps(
+    repo_short: &str,
+    package_json: Option<&serde_json::Value>,
+    has_pnpm_lock: bool,
+    infra_compose_files: &[String],
+    has_compose: bool,
+    has_dockerfile: bool,
+    has_vps_target: bool,
+) -> Option<Vec<Step>> {
+    let dir_guard = format!(
+        "DEPLOY_DIR=\"$(pwd)\"\nif [ -d \"/root/Projects/{repo_short}\" ]; then DEPLOY_DIR=\"/root/Projects/{repo_short}\"; fi\ncd \"$DEPLOY_DIR\""
+    );
+
+    if !infra_compose_files.is_empty() {
+        let substeps: Vec<(String, String)> = infra_compose_files
+            .iter()
+            .map(|f| {
+                let fname = f.trim();
+                (
+                    format!("Deploy {fname}"),
+                    format!(
+                        "{dir_guard}\ndocker compose -f \"{fname}\" up -d --build --remove-orphans"
+                    ),
+                )
+            })
+            .collect();
+        return Some(vec![Step {
+            name: "Subir serviços (infra docker-compose)".into(),
+            run: build_step_command_from_substeps(&substeps),
+            approval: true,
+        }]);
+    }
+
+    if let Some(pkg) = package_json
+        && pkg
+            .get("scripts")
+            .and_then(|s| s.get("deploy:vps"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        let uses_pnpm = has_pnpm_lock
+            || pkg
+                .get("packageManager")
+                .and_then(|v| v.as_str())
+                .is_some_and(|pm| pm.trim().to_ascii_lowercase().starts_with("pnpm"));
+        let pm = if uses_pnpm { "pnpm" } else { "npm" };
+        let cmd = build_step_command_from_substeps(&[(
+            "Executar script deploy:vps".into(),
+            format!("{dir_guard}\n{pm} run deploy:vps"),
+        )]);
+        return Some(vec![Step {
+            name: "Deploy VPS (package.json deploy:vps)".into(),
+            run: cmd,
+            approval: true,
+        }]);
+    }
+
+    if has_compose {
+        let cmd = format!(
+            "set -e\n{dir_guard}\ndocker compose build\ndocker compose up -d --remove-orphans"
+        );
+        return Some(vec![Step {
+            name: "Construir e subir containers (docker compose)".into(),
+            run: cmd,
+            approval: true,
+        }]);
+    }
+
+    if has_dockerfile {
+        let slug = engine::safe_slug(repo_short);
+        return Some(vec![Step {
+            name: "Construir imagem Docker".into(),
+            run: format!("set -e\n{dir_guard}\ndocker build -t {slug} ."),
+            approval: true,
+        }]);
+    }
+
+    if has_vps_target {
+        let cmd = format!(
+            "set -e\n{dir_guard}\n\
+             COMPOSE_FILE=$(find . -maxdepth 3 \\( -name \"docker-compose.yml\" -o -name \"docker-compose.yaml\" -o -name \"compose.yml\" -o -name \"compose.yaml\" \\) | head -n 1)\n\
+             if [ -n \"$COMPOSE_FILE\" ]; then\n\
+               docker compose -f \"$COMPOSE_FILE\" build\n\
+               docker compose -f \"$COMPOSE_FILE\" up -d --remove-orphans\n\
+             else\n\
+               echo \"Nenhum arquivo docker-compose encontrado em $DEPLOY_DIR.\"\n\
+             fi"
+        );
+        return Some(vec![Step {
+            name: "Detectar Compose e subir serviços na VPS".into(),
+            run: cmd,
+            approval: true,
+        }]);
+    }
+
+    None
+}
+
+pub fn build_workflows_from_repo_inspection(
+    input: &RepoInspectionInput<'_>,
+) -> Result<(Workflow, Option<Workflow>, Vec<Workflow>), String> {
+    let binding = input.binding;
+    let clean_repo = binding.full_name.trim();
+    let repo_short = clean_repo.rsplit('/').next().unwrap_or(clean_repo);
+    let runner = if binding.target_server_id.is_some() {
+        RunnerKind::Ssh
+    } else {
+        RunnerKind::Local
+    };
+    let base_id = new_id("wf");
+
+    type ParsedGhaJob = (String, Vec<(String, String)>);
+    type ParsedGhaFile<'a> = (&'a str, &'a str, Vec<ParsedGhaJob>);
+    let mut parsed_gha: Vec<ParsedGhaFile<'_>> = Vec::new();
+    for (fname, content) in input.gha_files {
+        let jobs = parse_gha_workflow_jobs(content);
+        if !jobs.is_empty() {
+            parsed_gha.push((fname.as_str(), content.as_str(), jobs));
+        }
+    }
+
+    let is_deploy_name = |fname: &str| {
+        let lower = fname.rsplit('/').next().unwrap_or(fname).to_ascii_lowercase();
+        lower.contains("deploy")
+    };
+    let is_ci_name = |fname: &str| {
+        let lower = fname.rsplit('/').next().unwrap_or(fname).to_ascii_lowercase();
+        lower == "ci.yml" || lower == "ci.yaml"
+    };
+
+    let ci_idx = parsed_gha
+        .iter()
+        .position(|(f, _, _)| is_ci_name(f))
+        .or_else(|| parsed_gha.iter().position(|(f, _, _)| !is_deploy_name(f)));
+
+    let deploy_idx = parsed_gha.iter().position(|(f, _, _)| is_deploy_name(f));
+
+    let deploy_wf = if let Some(didx) = deploy_idx {
+        let (_, _, jobs) = &parsed_gha[didx];
+        let mut steps: Vec<Step> = jobs
+            .iter()
+            .map(|(job_name, substeps)| Step {
+                name: job_name.clone(),
+                run: build_step_command_from_substeps(substeps),
+                approval: false,
+            })
+            .collect();
+        if let Some(last) = steps.last_mut() {
+            last.approval = true;
+        }
+        Some(Workflow {
+            id: format!("{base_id}-deploy"),
+            name: format!("Deploy — {repo_short}"),
+            trigger: Trigger::Manual,
+            runner,
+            workdir: String::new(),
+            steps,
+            on_success: None,
+            server_id: binding.target_server_id.clone(),
+            repo_id: Some(binding.id.clone()),
+        })
+    } else {
+        build_deploy_fallback_steps(
+            repo_short,
+            input.package_json,
+            input.has_pnpm_lock,
+            input.infra_compose_files,
+            input.has_compose,
+            input.has_dockerfile,
+            binding.target_server_id.is_some(),
+        )
+        .map(|steps| Workflow {
+            id: format!("{base_id}-deploy"),
+            name: format!("Deploy — {repo_short}"),
+            trigger: Trigger::Manual,
+            runner,
+            workdir: String::new(),
+            steps,
+            on_success: None,
+            server_id: binding.target_server_id.clone(),
+            repo_id: Some(binding.id.clone()),
+        })
+    };
+
+    let ci_steps: Vec<Step> = if let Some(cidx) = ci_idx {
+        parsed_gha[cidx]
+            .2
+            .iter()
+            .map(|(job_name, substeps)| Step {
+                name: job_name.clone(),
+                run: build_step_command_from_substeps(substeps),
+                approval: false,
+            })
+            .collect()
+    } else {
+        let mut fallback = Vec::new();
+        if let Some(pkg) = input.package_json {
+            fallback.extend(build_steps_from_package_json_scripts(
+                pkg,
+                input.has_pnpm_lock,
+            ));
+        }
+        if input.has_cargo_toml {
+            fallback.extend(build_rust_ci_steps());
+        }
+        if fallback.is_empty() {
+            if input.has_compose {
+                fallback.push(Step {
+                    name: "Validar Docker Compose".into(),
+                    run: "docker compose config -q".into(),
+                    approval: false,
+                });
+            } else if input.has_dockerfile {
+                fallback.push(Step {
+                    name: "Validar build Docker".into(),
+                    run: "docker build -t workploy-ci .".into(),
+                    approval: false,
+                });
+            }
+        }
+        fallback
+    };
+
+    if ci_steps.is_empty() {
+        return Err(format!(
+            "Não foi possível detectar .github/workflows, package.json, Cargo.toml ou Docker em '{}'.",
+            binding.full_name
+        ));
+    }
+
+    let ci_wf = Workflow {
+        id: format!("{base_id}-ci"),
+        name: format!("CI — {repo_short}"),
+        trigger: Trigger::Push,
+        runner,
+        workdir: String::new(),
+        steps: ci_steps,
+        on_success: deploy_wf.as_ref().map(|d| d.id.clone()),
+        server_id: binding.target_server_id.clone(),
+        repo_id: Some(binding.id.clone()),
+    };
+
+    let mut extra_wfs = Vec::new();
+    for (idx, (fname, content, jobs)) in parsed_gha.iter().enumerate() {
+        if Some(idx) == ci_idx || Some(idx) == deploy_idx {
+            continue;
+        }
+        let stem = fname
+            .rsplit('/')
+            .next()
+            .unwrap_or(fname)
+            .trim_end_matches(".yaml")
+            .trim_end_matches(".yml");
+        let label = parse_gha_workflow_top_name(content).unwrap_or_else(|| stem.to_string());
+        let steps = jobs
+            .iter()
+            .map(|(job_name, substeps)| Step {
+                name: job_name.clone(),
+                run: build_step_command_from_substeps(substeps),
+                approval: false,
+            })
+            .collect();
+        extra_wfs.push(Workflow {
+            id: format!("{base_id}-extra-{idx}"),
+            name: format!("{label} — {repo_short}"),
+            trigger: Trigger::Manual,
+            runner,
+            workdir: String::new(),
+            steps,
+            on_success: None,
+            server_id: binding.target_server_id.clone(),
+            repo_id: Some(binding.id.clone()),
+        });
+    }
+
+    Ok((ci_wf, deploy_wf, extra_wfs))
+}
+
+fn fetch_github_raw_file(
+    repo: &str,
+    path: &str,
+    ref_query: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let clean_path = path.trim().trim_start_matches('/');
+    let url = format!("https://api.github.com/repos/{repo}/contents/{clean_path}{ref_query}");
+    let req = github_get_request(&url, token).set("Accept", "application/vnd.github.raw+json");
+    let resp = req.call().ok()?;
+    let raw = resp.into_string().ok()?;
+    decode_github_file_response(&raw).ok()
+}
+
+fn detect_infra_compose_files(
+    repo: &str,
+    ref_query: &str,
+    token: Option<&str>,
+    root_entries: &serde_json::Value,
+) -> Vec<String> {
+    let has_infra_dir = root_entries
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("type").and_then(|x| x.as_str()) == Some("dir")
+                && item.get("name").and_then(|x| x.as_str()) == Some("infra")
+        });
+    if !has_infra_dir {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    let candidates = [
+        "infra/api/docker-compose.yml",
+        "infra/api/docker-compose.yaml",
+        "infra/web/docker-compose.yml",
+        "infra/web/docker-compose.yaml",
+        "infra/worker/docker-compose.yml",
+        "infra/worker/docker-compose.yaml",
+    ];
+    for service_dir in ["api", "web", "worker"] {
+        let dir_url =
+            format!("https://api.github.com/repos/{repo}/contents/infra/{service_dir}{ref_query}");
+        if let Ok(resp) = github_get_request(&dir_url, token).call()
+            && let Ok(v) = resp.into_json::<serde_json::Value>()
+            && let Some(arr) = v.as_array()
+        {
+            for item in arr {
+                if item.get("type").and_then(|x| x.as_str()).unwrap_or("file") != "file" {
+                    continue;
+                }
+                if let Some(name) = item.get("name").and_then(|x| x.as_str()).map(str::trim)
+                    && matches!(
+                        name,
+                        "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml"
+                    )
+                {
+                    let p = format!("infra/{service_dir}/{name}");
+                    if !found.contains(&p) {
+                        found.push(p);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let _ = candidates;
+    found
+}
+
 pub fn build_generated_workflows_for_repo(
     binding: &RepoBinding,
     package_json: Option<&serde_json::Value>,
@@ -1374,6 +2223,19 @@ pub fn generate_workflow_from_repo(sh: &SharedHandle, binding_id: String) {
             gh_workflows = parse_github_workflows_dir_json(&v);
         }
 
+        let mut gha_files: Vec<(String, String)> = Vec::new();
+        for wf_entry in &gh_workflows {
+            if let Some(yaml_body) =
+                fetch_github_raw_file(&repo, &wf_entry.path, &ref_query, token.as_deref())
+            {
+                gha_files.push((wf_entry.name.clone(), yaml_body));
+            }
+        }
+
+        let infra_compose_files =
+            detect_infra_compose_files(&repo, &ref_query, token.as_deref(), &root_entries);
+        all_paths.extend(infra_compose_files.iter().cloned());
+
         let root_names: Vec<String> = root_entries
             .as_array()
             .into_iter()
@@ -1448,15 +2310,18 @@ pub fn generate_workflow_from_repo(sh: &SharedHandle, binding_id: String) {
             }
         }
 
-        let (ci_wf, deploy_wf) = match build_generated_workflows_for_repo(
-            &binding,
-            package_json.as_ref(),
+        let inspection = RepoInspectionInput {
+            binding: &binding,
+            gha_files: &gha_files,
+            package_json: package_json.as_ref(),
             has_pnpm_lock,
             has_cargo_toml,
+            infra_compose_files: &infra_compose_files,
             has_compose,
             has_dockerfile,
-        ) {
-            Ok(pair) => pair,
+        };
+        let (ci_wf, deploy_wf, extra_wfs) = match build_workflows_from_repo_inspection(&inspection) {
+            Ok(tuple) => tuple,
             Err(err) => {
                 finish_generate_workflow_error(&sh2, &binding_id, err);
                 return;
@@ -1471,10 +2336,12 @@ pub fn generate_workflow_from_repo(sh: &SharedHandle, binding_id: String) {
 
         {
             let mut s = sh2.lock().unwrap();
-            s.workflows.push(ci_wf);
+            let mut generated = vec![ci_wf];
             if let Some(dwf) = deploy_wf {
-                s.workflows.push(dwf);
+                generated.push(dwf);
             }
+            generated.extend(extra_wfs);
+            replace_generated_workflows(&mut s, &binding_id, generated);
             save_workflows(&s);
 
             if let Some(entry) = s
@@ -1537,6 +2404,65 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+pub fn select_release_asset_url(
+    assets: Option<&Vec<serde_json::Value>>,
+    is_linux: bool,
+) -> Option<String> {
+    let list = assets?;
+    let picked = if is_linux {
+        list.iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| {
+                        let lower = n.to_ascii_lowercase();
+                        lower.contains("linux") && lower.ends_with(".tar.gz")
+                    })
+            })
+            .or_else(|| {
+                list.iter().find(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".tar.gz"))
+                })
+            })
+    } else {
+        list.iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| {
+                        let lower = n.to_ascii_lowercase();
+                        lower.starts_with("workploy-setup") && lower.ends_with(".exe")
+                    })
+            })
+            .or_else(|| {
+                list.iter().find(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".exe"))
+                })
+            })
+    };
+    picked
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn default_installer_url_for_tag(tag_name: &str, version: &str, is_linux: bool) -> String {
+    if is_linux {
+        format!(
+            "https://github.com/matheuswidder/w-workploy/releases/download/{tag_name}/workploy-{version}-linux-x86_64.tar.gz"
+        )
+    } else {
+        format!(
+            "https://github.com/matheuswidder/w-workploy/releases/download/{tag_name}/Workploy-Setup-{version}.exe"
+        )
+    }
+}
+
 pub fn parse_release_json(v: &serde_json::Value, current_version: &str) -> Result<ReleaseInfo, String> {
     let tag_name = v
         .get("tag_name")
@@ -1564,29 +2490,7 @@ pub fn parse_release_json(v: &serde_json::Value, current_version: &str) -> Resul
         .to_string();
 
     let assets = v.get("assets").and_then(|x| x.as_array());
-    let installer_url = assets
-        .and_then(|list| {
-            list.iter()
-                .find(|a| {
-                    a.get("name")
-                        .and_then(|n| n.as_str())
-                        .is_some_and(|n| {
-                            let lower = n.to_ascii_lowercase();
-                            lower.starts_with("workploy-setup") && lower.ends_with(".exe")
-                        })
-                })
-                .or_else(|| {
-                    list.iter().find(|a| {
-                        a.get("name")
-                            .and_then(|n| n.as_str())
-                            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".exe"))
-                    })
-                })
-                .and_then(|a| a.get("browser_download_url"))
-                .and_then(|u| u.as_str())
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let installer_url = select_release_asset_url(assets, cfg!(target_os = "linux"))
         .unwrap_or_else(|| html_url.clone());
 
     let has_update = is_newer_version(current_version, &tag_name);
@@ -1632,9 +2536,8 @@ pub fn parse_release_from_redirect_location(
 
     let version = tag_name.trim_start_matches(['v', 'V']).to_string();
     let html_url = format!("https://github.com/matheuswidder/w-workploy/releases/tag/{tag_name}");
-    let installer_url = format!(
-        "https://github.com/matheuswidder/w-workploy/releases/download/{tag_name}/Workploy-Setup-{version}.exe"
-    );
+    let installer_url =
+        default_installer_url_for_tag(&tag_name, &version, cfg!(target_os = "linux"));
     let has_update = is_newer_version(current_version, &tag_name);
 
     Ok(Some(ReleaseInfo {
@@ -1815,6 +2718,25 @@ pub fn validate_downloaded_installer(path: &Path) -> Result<u64, String> {
             );
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
+        {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| format!("Falha ao abrir pacote baixado: {e}"))?;
+            let mut magic = [0u8; 2];
+            file.read_exact(&mut magic)
+                .map_err(|e| format!("Falha ao validar cabeçalho do pacote: {e}"))?;
+            if magic != [0x1f, 0x8b] {
+                return Err(
+                    "O arquivo baixado não é um pacote .tar.gz válido.".into(),
+                );
+            }
+        }
+    }
     Ok(len)
 }
 
@@ -1888,7 +2810,7 @@ pub fn download_installer_stream(
             .map_err(|e| format!("Falha ao criar pasta temporária: {e}"))?;
     }
 
-    let part_path = dest_path.with_extension("exe.part");
+    let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.display()));
     let file = std::fs::File::create(&part_path)
         .map_err(|e| format!("Falha ao criar arquivo temporário da atualização: {e}"))?;
     let mut writer = BufWriter::new(file);
@@ -1976,20 +2898,105 @@ pub fn download_and_install_update(sh: &SharedHandle, installer_url: String, ver
             return;
         }
 
-        let clean_ver = sanitize_installer_version(&version);
-        let temp_exe = std::env::temp_dir().join(format!("Workploy-Setup-{clean_ver}.exe"));
         let token = resolve_github_token(&sh2, None);
 
-        if let Err(err) = download_installer_stream(&sh2, &url, &version, &temp_exe, token.as_deref()) {
-            finish_update_download_error(&sh2, err);
-            return;
-        }
-
-        #[cfg(target_os = "windows")]
+        #[cfg(target_os = "linux")]
         {
-            let current_exe = std::env::current_exe().ok();
-            let args = build_installer_args(current_exe.as_deref());
-            match std::process::Command::new(&temp_exe).args(&args).spawn() {
+            let tar_path = std::path::PathBuf::from("/tmp/workploy-update.tar.gz");
+            if let Err(err) =
+                download_installer_stream(&sh2, &url, &version, &tar_path, token.as_deref())
+            {
+                finish_update_download_error(&sh2, err);
+                return;
+            }
+
+            let extract_dir = std::path::PathBuf::from("/tmp/workploy-update");
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            if let Err(e) = std::fs::create_dir_all(&extract_dir) {
+                finish_update_download_error(
+                    &sh2,
+                    format!("Falha ao preparar pasta de extração: {e}"),
+                );
+                return;
+            }
+
+            let tar_status = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(&tar_path)
+                .arg("-C")
+                .arg(&extract_dir)
+                .status();
+            match tar_status {
+                Ok(st) if st.success() => {}
+                Ok(st) => {
+                    finish_update_download_error(
+                        &sh2,
+                        format!("Falha ao extrair atualização (tar exit {st})."),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    finish_update_download_error(
+                        &sh2,
+                        format!("Não foi possível executar tar: {e}"),
+                    );
+                    return;
+                }
+            }
+
+            let direct_install = extract_dir.join("install.sh");
+            let install_sh = if direct_install.is_file() {
+                Some(direct_install)
+            } else {
+                std::fs::read_dir(&extract_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path().join("install.sh"))
+                    .find(|p| p.is_file())
+            };
+
+            let Some(install_script) = install_sh else {
+                finish_update_download_error(
+                    &sh2,
+                    "Pacote de atualização Linux sem script install.sh.".into(),
+                );
+                return;
+            };
+            let install_dir = install_script
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| extract_dir.clone());
+
+            match std::process::Command::new("bash")
+                .arg(&install_script)
+                .current_dir(&install_dir)
+                .status()
+            {
+                Ok(st) if st.success() => {}
+                Ok(st) => {
+                    finish_update_download_error(
+                        &sh2,
+                        format!("Falha ao executar install.sh (exit {st})."),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    finish_update_download_error(
+                        &sh2,
+                        format!("Não foi possível executar bash install.sh: {e}"),
+                    );
+                    return;
+                }
+            }
+
+            let bin_path = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".local").join("bin").join("workploy"))
+                .unwrap_or_else(|| std::path::PathBuf::from("workploy"));
+
+            match std::process::Command::new(&bin_path).spawn() {
                 Ok(_) => {
                     {
                         let mut s = sh2.lock().unwrap();
@@ -2003,26 +3010,64 @@ pub fn download_and_install_update(sh: &SharedHandle, installer_url: String, ver
                 Err(e) => {
                     finish_update_download_error(
                         &sh2,
-                        format!("Não foi possível iniciar o instalador da atualização: {e}"),
+                        format!("Atualização instalada, mas falhou ao reabrir {}: {e}", bin_path.display()),
                     );
                 }
             }
+            return;
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(target_os = "linux"))]
         {
+            let clean_ver = sanitize_installer_version(&version);
+            let temp_exe = std::env::temp_dir().join(format!("Workploy-Setup-{clean_ver}.exe"));
+
+            if let Err(err) =
+                download_installer_stream(&sh2, &url, &version, &temp_exe, token.as_deref())
             {
-                let mut s = sh2.lock().unwrap();
-                s.update_downloading = false;
-                s.update_progress = 1.0;
-                let msg = format!(
-                    "Atualização v{version} baixada em {}.",
-                    temp_exe.display()
-                );
-                s.update_status = msg.clone();
-                record_update_event(&mut s, true, msg);
+                finish_update_download_error(&sh2, err);
+                return;
             }
-            engine::notify(&sh2);
+
+            #[cfg(target_os = "windows")]
+            {
+                let current_exe = std::env::current_exe().ok();
+                let args = build_installer_args(current_exe.as_deref());
+                match std::process::Command::new(&temp_exe).args(&args).spawn() {
+                    Ok(_) => {
+                        {
+                            let mut s = sh2.lock().unwrap();
+                            s.update_progress = 1.0;
+                            s.update_status = "Reiniciando para concluir atualização...".into();
+                        }
+                        engine::notify(&sh2);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        finish_update_download_error(
+                            &sh2,
+                            format!("Não foi possível iniciar o instalador da atualização: {e}"),
+                        );
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                {
+                    let mut s = sh2.lock().unwrap();
+                    s.update_downloading = false;
+                    s.update_progress = 1.0;
+                    let msg = format!(
+                        "Atualização v{version} baixada em {}.",
+                        temp_exe.display()
+                    );
+                    s.update_status = msg.clone();
+                    record_update_event(&mut s, true, msg);
+                }
+                engine::notify(&sh2);
+            }
         }
     });
 }
@@ -2926,6 +3971,269 @@ mod tests {
         assert_eq!(
             decode_github_file_response(&b64_payload).unwrap(),
             r#"{"scripts":{"build":"vite build"}}"#
+        );
+    }
+
+    #[test]
+    fn parse_gha_workflow_jobs_extracts_jobs_substeps_and_remote_eof() {
+        let ci_yaml = r#"
+name: CI
+on: [push]
+jobs:
+  typecheck_test:
+    name: Typecheck + Tests + Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint (if configured)
+        run: pnpm -r --if-present lint
+      - name: Typecheck & Test
+        run: |
+          pnpm -r typecheck
+
+          # roda testes unitários
+          pnpm test:ci
+
+  secret_scan:
+    name: Secret scan (repo-local)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gitleaks
+        run: gitleaks detect --source . --no-banner
+
+  contracts_typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm --filter contracts typecheck
+"#;
+
+        let jobs = parse_gha_workflow_jobs(ci_yaml);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].0, "Typecheck + Tests + Smoke");
+        assert_eq!(jobs[0].1.len(), 3);
+        assert_eq!(jobs[0].1[0].0, "Install dependencies");
+        assert_eq!(jobs[0].1[0].1, "pnpm install --frozen-lockfile");
+        assert_eq!(jobs[0].1[1].0, "Lint (if configured)");
+        assert_eq!(jobs[0].1[1].1, "pnpm -r --if-present lint");
+        assert_eq!(jobs[0].1[2].0, "Typecheck & Test");
+        assert!(jobs[0].1[2].1.contains("pnpm -r typecheck"));
+        assert!(jobs[0].1[2].1.contains("pnpm test:ci"));
+
+        assert_eq!(jobs[1].0, "Secret scan (repo-local)");
+        assert_eq!(jobs[1].1.len(), 1);
+        assert_eq!(jobs[1].1[0].0, "Run gitleaks");
+
+        // Job sem `name:` usa o id do job
+        assert_eq!(jobs[2].0, "contracts_typecheck");
+        assert_eq!(jobs[2].1.len(), 1);
+        assert_eq!(jobs[2].1[0].1, "pnpm --filter contracts typecheck");
+
+        let step_cmd = build_step_command_from_substeps(&jobs[0].1);
+        assert!(step_cmd.starts_with("set -e\n"));
+        assert!(step_cmd.contains("echo \"::workploy-substep::Install dependencies\""));
+        assert!(step_cmd.contains("echo \"::workploy-substep::Lint (if configured)\""));
+
+        let deploy_yaml = r#"
+name: Deploy VPS
+on: [workflow_dispatch]
+jobs:
+  deploy:
+    name: Deploy & Validate VPS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull, rebuild & validate healthchecks on VPS
+        run: |
+          ssh -o BatchMode=yes root@203.0.113.10 <<'REMOTE_EOF'
+          set -euo pipefail
+          REPO_ROOT="/root/Projects/w-erp-central"
+          cd "$REPO_ROOT"
+          git pull --ff-only origin main
+          docker compose -f infra/api/docker-compose.yml up -d --build
+          REMOTE_EOF
+"#;
+        let d_jobs = parse_gha_workflow_jobs(deploy_yaml);
+        assert_eq!(d_jobs.len(), 1);
+        assert_eq!(d_jobs[0].0, "Deploy & Validate VPS");
+        assert_eq!(d_jobs[0].1.len(), 1);
+        let script = &d_jobs[0].1[0].1;
+        assert!(!script.contains("ssh -o BatchMode=yes"));
+        assert!(!script.contains("REMOTE_EOF"));
+        assert!(script.contains("/root/Projects/w-erp-central"));
+        assert!(script.contains("REPO_ROOT=\"${REPO_ROOT_OVERRIDE:-$(pwd)}\""));
+        assert!(script.contains("docker compose -f infra/api/docker-compose.yml up -d --build"));
+    }
+
+    #[test]
+    fn repo_inspection_handles_gha_infra_compose_deploy_vps_and_deduplication() {
+        let binding = RepoBinding {
+            id: "rb-erp".into(),
+            full_name: "matheuswidder/w-erp-central".into(),
+            target_server_id: Some("vps-prod".into()),
+            branch: "main".into(),
+            ..RepoBinding::default()
+        };
+
+        let ci_yml = r#"
+jobs:
+  build:
+    name: Typecheck + Tests + Smoke
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        run: pnpm test:ci
+"#;
+        let deploy_yml = r#"
+jobs:
+  deploy:
+    name: Deploy & Validate VPS
+    steps:
+      - name: Deploy remoto
+        run: |
+          ssh root@1.2.3.4 <<'REMOTE_EOF'
+          REPO_ROOT="/root/Projects/w-erp-central"
+          cd "$REPO_ROOT"
+          docker compose -f infra/api/docker-compose.yml up -d
+          REMOTE_EOF
+"#;
+        let rls_yml = r#"
+name: Isolamento RLS
+jobs:
+  rls:
+    name: Testes RLS
+    steps:
+      - name: Run RLS suite
+        run: pnpm test:rls
+"#;
+
+        let gha_files = vec![
+            ("ci.yml".to_string(), ci_yml.to_string()),
+            ("deploy-vps.yml".to_string(), deploy_yml.to_string()),
+            ("rls-isolation.yml".to_string(), rls_yml.to_string()),
+        ];
+
+        let (ci_wf, deploy_opt, extra_wfs) = build_workflows_from_repo_inspection(&RepoInspectionInput {
+            binding: &binding,
+            gha_files: &gha_files,
+            package_json: None,
+            has_pnpm_lock: true,
+            has_cargo_toml: false,
+            infra_compose_files: &[],
+            has_compose: false,
+            has_dockerfile: false,
+        })
+        .unwrap();
+
+        let deploy_wf = deploy_opt.expect("deploy_wf deve ser gerado");
+        assert_eq!(ci_wf.name, "CI — w-erp-central");
+        assert_eq!(ci_wf.on_success.as_deref(), Some(deploy_wf.id.as_str()));
+        assert_eq!(ci_wf.steps[0].name, "Typecheck + Tests + Smoke");
+        assert!(ci_wf.steps[0].run.contains("::workploy-substep::Install"));
+        assert!(ci_wf.steps[0].run.contains("::workploy-substep::Test"));
+        assert_eq!(deploy_wf.name, "Deploy — w-erp-central");
+        assert!(deploy_wf.steps[0].approval);
+        assert!(deploy_wf.steps[0].run.contains("REPO_ROOT_OVERRIDE"));
+        assert_eq!(extra_wfs.len(), 1);
+        assert_eq!(extra_wfs[0].name, "Isolamento RLS — w-erp-central");
+
+        // Fallback sem deploy-vps.yml mas com infra/* docker-compose
+        let infra_files = vec![
+            "infra/api/docker-compose.yml".to_string(),
+            "infra/web/docker-compose.yml".to_string(),
+            "infra/worker/docker-compose.yml".to_string(),
+        ];
+        let pkg = serde_json::json!({
+            "scripts": { "typecheck": "tsc", "deploy:vps": "bash scripts/deploy.sh" }
+        });
+        let (_ci2, dep_infra, _) = build_workflows_from_repo_inspection(&RepoInspectionInput {
+            binding: &binding,
+            gha_files: &[("ci.yml".into(), ci_yml.into())],
+            package_json: Some(&pkg),
+            has_pnpm_lock: true,
+            has_cargo_toml: false,
+            infra_compose_files: &infra_files,
+            has_compose: false,
+            has_dockerfile: false,
+        })
+        .unwrap();
+        let dep_infra = dep_infra.unwrap();
+        assert!(dep_infra.steps[0].run.contains("infra/api/docker-compose.yml"));
+        assert!(dep_infra.steps[0].run.contains("infra/web/docker-compose.yml"));
+        assert!(dep_infra.steps[0].run.contains("infra/worker/docker-compose.yml"));
+
+        // Fallback sem deploy-vps.yml e sem infra/*, usando package.json scripts["deploy:vps"]
+        let (_ci3, dep_pkg, _) = build_workflows_from_repo_inspection(&RepoInspectionInput {
+            binding: &binding,
+            gha_files: &[],
+            package_json: Some(&pkg),
+            has_pnpm_lock: true,
+            has_cargo_toml: false,
+            infra_compose_files: &[],
+            has_compose: false,
+            has_dockerfile: false,
+        })
+        .unwrap();
+        let dep_pkg = dep_pkg.unwrap();
+        assert!(dep_pkg.steps[0].run.contains("pnpm run deploy:vps"));
+
+        // Deduplicação ao salvar receitas no Shared
+        let mut s = Shared::default();
+        s.workflows.push(Workflow {
+            id: "old-ci".into(),
+            name: "CI — w-erp-central".into(),
+            repo_id: Some("rb-erp".into()),
+            ..Workflow::default()
+        });
+        s.workflows.push(Workflow {
+            id: "old-deploy-orphan".into(),
+            name: "Deploy — w-erp-central".into(),
+            repo_id: None,
+            ..Workflow::default()
+        });
+        s.workflows.push(Workflow {
+            id: "other-project".into(),
+            name: "CI — outro".into(),
+            repo_id: Some("rb-other".into()),
+            ..Workflow::default()
+        });
+        replace_generated_workflows(&mut s, "rb-erp", vec![ci_wf, deploy_wf]);
+        assert_eq!(s.workflows.len(), 3);
+        assert!(!s.workflows.iter().any(|w| w.id == "old-ci"));
+        assert!(!s.workflows.iter().any(|w| w.id == "old-deploy-orphan"));
+        assert!(s.workflows.iter().any(|w| w.id == "other-project"));
+    }
+
+    #[test]
+    fn linux_release_asset_selection_prioritizes_tar_gz() {
+        let assets = vec![
+            serde_json::json!({
+                "name": "Workploy-Setup-0.1.10.exe",
+                "browser_download_url": "https://example.com/Workploy-Setup-0.1.10.exe"
+            }),
+            serde_json::json!({
+                "name": "workploy-0.1.10-linux-x86_64.tar.gz",
+                "browser_download_url": "https://example.com/workploy-0.1.10-linux-x86_64.tar.gz"
+            }),
+        ];
+        assert_eq!(
+            select_release_asset_url(Some(&assets), true).as_deref(),
+            Some("https://example.com/workploy-0.1.10-linux-x86_64.tar.gz")
+        );
+        assert_eq!(
+            select_release_asset_url(Some(&assets), false).as_deref(),
+            Some("https://example.com/Workploy-Setup-0.1.10.exe")
+        );
+        assert_eq!(
+            default_installer_url_for_tag("v0.1.10", "0.1.10", true),
+            "https://github.com/matheuswidder/w-workploy/releases/download/v0.1.10/workploy-0.1.10-linux-x86_64.tar.gz"
         );
     }
 }

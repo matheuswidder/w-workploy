@@ -1304,6 +1304,85 @@ impl StepRun {
     }
 }
 
+pub fn compute_project_kpis(
+    runs: &[Run],
+    repo_full_name: &str,
+    platform: PlatformTarget,
+) -> (usize, usize, f64, &'static str) {
+    let target = repo_full_name.trim();
+    let matching: Vec<&Run> = if target.is_empty() {
+        Vec::new()
+    } else {
+        runs.iter()
+            .filter(|r| {
+                r.repo_name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|rn| rn.eq_ignore_ascii_case(target))
+            })
+            .collect()
+    };
+
+    let total_runs = matching.len();
+    let finished: Vec<&Run> = matching
+        .iter()
+        .copied()
+        .filter(|r| !r.status.active())
+        .collect();
+
+    let success_pct = if finished.is_empty() {
+        0
+    } else {
+        let ok_count = finished
+            .iter()
+            .filter(|r| r.status == RunStatus::Success)
+            .count();
+        ((ok_count as f64 / finished.len() as f64) * 100.0).round() as usize
+    };
+
+    let avg_duration_secs = if finished.is_empty() {
+        0.0
+    } else {
+        let sum: f64 = finished
+            .iter()
+            .map(|r| {
+                if r.secs.is_finite() {
+                    r.secs.max(0.0)
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        sum / finished.len() as f64
+    };
+
+    let estimated_resources_label = match platform {
+        PlatformTarget::Windows => "4 vCPU · 8 GB RAM · 50 GB SSD (Windows)",
+        PlatformTarget::MacOS => "4 vCPU · 8 GB RAM · 50 GB SSD (macOS)",
+        PlatformTarget::Linux => {
+            if avg_duration_secs >= 180.0 {
+                "4 vCPU · 8 GB RAM · 60 GB SSD (Linux/Docker)"
+            } else {
+                "2 vCPU · 4 GB RAM · 30 GB SSD (Linux/Docker)"
+            }
+        }
+        PlatformTarget::CrossPlatform => {
+            if avg_duration_secs >= 180.0 {
+                "4 vCPU · 8 GB RAM · 50 GB SSD"
+            } else {
+                "2 vCPU · 4 GB RAM · 25 GB SSD"
+            }
+        }
+    };
+
+    (
+        total_runs,
+        success_pct,
+        avg_duration_secs,
+        estimated_resources_label,
+    )
+}
+
 #[cfg(test)]
 mod duration_tests {
     use super::*;
@@ -1571,5 +1650,53 @@ mod duration_tests {
         assert!(!explicit_false.settings.onboarding_completed);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn compute_project_kpis_filters_repo_and_calculates_metrics() {
+        let mk_run = |repo: Option<&str>, status: RunStatus, secs: f64| Run {
+            id: new_id("run"),
+            workflow_id: "wf-1".into(),
+            workflow_name: "CI".into(),
+            status,
+            trigger_label: "push".into(),
+            title: "commit".into(),
+            number: 1,
+            commit: None,
+            started_at: "18/11/2026 10:00".into(),
+            started_ts: None,
+            finished_at: None,
+            steps: vec![],
+            approved: false,
+            cancel_requested: false,
+            secs,
+            actor: "maestro".into(),
+            repo_name: repo.map(str::to_string),
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: vec![],
+        };
+
+        let runs = vec![
+            mk_run(Some("matheuswidder/w-erp"), RunStatus::Success, 120.0),
+            mk_run(Some("MATHEUSWIDDER/w-erp"), RunStatus::Success, 240.0),
+            mk_run(Some("matheuswidder/w-erp"), RunStatus::Failed, 60.0),
+            mk_run(Some("matheuswidder/w-erp"), RunStatus::Running, 999.0),
+            mk_run(Some("matheuswidder/other"), RunStatus::Failed, 10.0),
+        ];
+
+        let (total, pct, avg, res) =
+            compute_project_kpis(&runs, "matheuswidder/w-erp", PlatformTarget::Linux);
+        assert_eq!(total, 4);
+        assert_eq!(pct, 67);
+        assert!((avg - 140.0).abs() < 0.01);
+        assert!(res.contains("Linux"));
+
+        let (empty_total, empty_pct, empty_avg, empty_res) =
+            compute_project_kpis(&runs, "matheuswidder/missing", PlatformTarget::Windows);
+        assert_eq!(empty_total, 0);
+        assert_eq!(empty_pct, 0);
+        assert_eq!(empty_avg, 0.0);
+        assert!(empty_res.contains("Windows"));
     }
 }

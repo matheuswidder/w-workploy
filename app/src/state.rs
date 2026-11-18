@@ -693,6 +693,8 @@ pub struct AppState {
     pub connections_seen_healthy: bool,
     pub nav: NavTarget,
     pub previous_list_nav: NavTarget,
+    pub selected_project_id: Option<String>,
+    pub selected_workflow_id: Option<String>,
     pub settings_tab: SettingsTab,
 
     pub open_select: Option<String>,
@@ -784,6 +786,8 @@ impl AppState {
             connections_seen_healthy: false,
             nav: NavTarget::Runs,
             previous_list_nav: NavTarget::Runs,
+            selected_project_id: None,
+            selected_workflow_id: None,
             settings_tab: SettingsTab::GitHub,
             open_select: None,
             search_runs: TextEdit::new(""),
@@ -965,6 +969,9 @@ impl AppState {
 
     pub fn navigate_to(&mut self, target: NavTarget) {
         self.open_select = None;
+        if let NavTarget::WorkflowRuns(ref id) = target {
+            self.selected_workflow_id = Some(id.clone());
+        }
         if !matches!(target, NavTarget::RunDetail { .. }) {
             self.previous_list_nav = target.clone();
         }
@@ -973,6 +980,30 @@ impl AppState {
                 self.connections_health() == ConnectionsHealth::Healthy;
         }
         self.nav = target;
+    }
+
+    pub fn project_workflows<'a>(&'a self, b: &RepoBinding) -> Vec<&'a Workflow> {
+        let base_ids = engine::matching_workflows_for_binding_with_bindings(
+            &self.snapshot.workflows,
+            b,
+            &self.snapshot.settings.repo_bindings,
+        );
+        let mut out: Vec<&'a Workflow> = Vec::new();
+        for wid in base_ids {
+            let mut cur_id = Some(wid.as_str());
+            while let Some(cid) = cur_id {
+                if out.iter().any(|w| w.id == cid) {
+                    break;
+                }
+                if let Some(wf) = self.snapshot.workflows.iter().find(|w| w.id == cid) {
+                    out.push(wf);
+                    cur_id = wf.on_success.as_deref();
+                } else {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     pub fn open_run_summary(&mut self, run_id: &str) {
@@ -2598,6 +2629,8 @@ impl AppState {
             platform: draft.platform,
         };
 
+        let sync_server_id = binding.target_server_id.clone();
+
         if self.demo_mode {
             if let Some(slot) = self
                 .snapshot
@@ -2611,19 +2644,25 @@ impl AppState {
                 self.snapshot.settings.repo_bindings.push(binding);
             }
         } else {
-            let mut guard = self.shared.lock().unwrap();
-            if let Some(slot) = guard
-                .settings
-                .repo_bindings
-                .iter_mut()
-                .find(|x| x.id == id)
             {
-                *slot = binding;
-            } else {
-                guard.settings.repo_bindings.push(binding);
+                let mut guard = self.shared.lock().unwrap();
+                if let Some(slot) = guard
+                    .settings
+                    .repo_bindings
+                    .iter_mut()
+                    .find(|x| x.id == id)
+                {
+                    *slot = binding;
+                } else {
+                    guard.settings.repo_bindings.push(binding);
+                }
+                model::save_settings(&guard);
             }
-            model::save_settings(&guard);
-            self.snapshot = guard.clone();
+            if let Some(sid) = sync_server_id {
+                github::sync_repo_bindings_to_vps(&self.shared, &sid);
+                tx.wake_after(std::time::Duration::from_millis(120));
+            }
+            self.snapshot = self.shared.lock().unwrap().clone();
         }
         self.modal = ModalState::None;
         self.push_toast(
@@ -2636,6 +2675,9 @@ impl AppState {
     }
 
     pub fn delete_binding(&mut self, binding_id: &str, tx: &mut Tx) {
+        if self.selected_project_id.as_deref() == Some(binding_id) {
+            self.selected_project_id = None;
+        }
         if self.demo_mode {
             self.snapshot
                 .settings
@@ -3008,14 +3050,29 @@ impl AppState {
                 self.snapshot.workflows.push(wf);
             }
         } else {
-            let mut guard = self.shared.lock().unwrap();
-            if let Some(existing) = guard.workflows.iter_mut().find(|w| w.id == wf_id) {
-                *existing = wf;
-            } else {
-                guard.workflows.push(wf);
+            let installed_servers: Vec<String> = {
+                let mut guard = self.shared.lock().unwrap();
+                if let Some(existing) = guard.workflows.iter_mut().find(|w| w.id == wf_id) {
+                    *existing = wf;
+                } else {
+                    guard.workflows.push(wf);
+                }
+                model::save_workflows(&guard);
+                guard
+                    .settings
+                    .servers
+                    .iter()
+                    .filter(|srv| srv.runner_installed)
+                    .map(|srv| srv.id.clone())
+                    .collect()
+            };
+            for sid in &installed_servers {
+                github::sync_repo_bindings_to_vps(&self.shared, sid);
             }
-            model::save_workflows(&guard);
-            self.snapshot = guard.clone();
+            self.snapshot = self.shared.lock().unwrap().clone();
+            if !installed_servers.is_empty() {
+                tx.wake_after(std::time::Duration::from_millis(120));
+            }
         }
         self.modal = ModalState::None;
         self.open_select = None;
@@ -3083,6 +3140,9 @@ impl AppState {
             guard.workflows.retain(|w| w.id != wf_id);
             model::save_workflows(&guard);
             self.snapshot = guard.clone();
+        }
+        if self.selected_workflow_id.as_deref() == Some(wf_id.as_str()) {
+            self.selected_workflow_id = None;
         }
         if matches!(&self.nav, NavTarget::WorkflowRuns(id) if id == &wf_id) {
             self.navigate_to(NavTarget::Runs);

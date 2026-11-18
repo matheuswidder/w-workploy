@@ -545,6 +545,7 @@ PURGE_LOCK = threading.Lock()
 RUNS = []
 PROCESSES = {}
 ACTIVE_WORKDIRS = {}
+SUBSTEP_MONO = {}
 
 
 def now_str():
@@ -587,6 +588,9 @@ def load_runs():
                     for st in r.get("steps", []):
                         if st.get("status") in ("Pending", "Running", "WaitingApproval"):
                             st["status"] = "Skipped"
+                        for sub in st.get("substeps", []):
+                            if sub.get("status") in ("Pending", "Running", "WaitingApproval"):
+                                sub["status"] = "Skipped"
             RUNS = data[:100]
             save_runs_locked()
     except json.JSONDecodeError:
@@ -828,14 +832,53 @@ def prepare_workspace(repo_full_name, branch, custom_workdir):
     return wd, "\n".join(logs) + ("\n" if logs else "")
 
 
+def _finalize_running_substep(run_id, step_idx, step_obj, final_status):
+    subs = step_obj.setdefault("substeps", [])
+    if subs and subs[-1].get("status") == "Running":
+        subs[-1]["status"] = final_status
+        key = (run_id, step_idx, len(subs) - 1)
+        t0 = SUBSTEP_MONO.pop(key, None)
+        if t0 is not None:
+            subs[-1]["secs"] = max(0.0, time.monotonic() - t0)
+        else:
+            st_ts = subs[-1].get("started_ts")
+            subs[-1]["secs"] = max(0.0, float(int(time.time()) - int(st_ts))) if st_ts else 0.0
+
+
 def append_step_log(run_id, step_idx, text):
     with STATE_LOCK:
         r = find_run_locked(run_id)
         if r and 0 <= step_idx < len(r["steps"]):
-            cur = r["steps"][step_idx].get("log", "") + text
-            if len(cur) > 120000:
-                cur = cur[-120000:]
-            r["steps"][step_idx]["log"] = cur
+            step_obj = r["steps"][step_idx]
+            subs = step_obj.setdefault("substeps", [])
+            for seg in text.splitlines(keepends=True) or [text]:
+                stripped = seg.strip()
+                if stripped.startswith("::workploy-substep::"):
+                    name = stripped[len("::workploy-substep::"):].strip() or "Sub-etapa"
+                    _finalize_running_substep(run_id, step_idx, step_obj, "Success")
+                    subs.append({
+                        "name": name,
+                        "status": "Running",
+                        "log": "",
+                        "secs": 0.0,
+                        "substeps": [],
+                        "started_ts": int(time.time()),
+                    })
+                    SUBSTEP_MONO[(run_id, step_idx, len(subs) - 1)] = time.monotonic()
+                    cur = step_obj.get("log", "") + f"=== {name} ===\n"
+                    if len(cur) > 120000:
+                        cur = cur[-120000:]
+                    step_obj["log"] = cur
+                else:
+                    cur = step_obj.get("log", "") + seg
+                    if len(cur) > 120000:
+                        cur = cur[-120000:]
+                    step_obj["log"] = cur
+                    if subs and subs[-1].get("status") == "Running":
+                        sub_cur = subs[-1].get("log", "") + seg
+                        if len(sub_cur) > 120000:
+                            sub_cur = sub_cur[-120000:]
+                        subs[-1]["log"] = sub_cur
             save_runs_locked()
 
 
@@ -952,6 +995,7 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                     return
                 r["steps"][idx]["secs"] = s_secs
                 if cancelled:
+                    _finalize_running_substep(run_id, idx, r["steps"][idx], "Skipped")
                     r["status"] = "Cancelled"
                     r["finished_at"] = now_str()
                     r["secs"] = time.monotonic() - t_start
@@ -960,7 +1004,9 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                             st["status"] = "Skipped"
                     save_runs_locked()
                     return
-                r["steps"][idx]["status"] = "Success" if ok else "Failed"
+                final_sub_status = "Success" if ok else "Failed"
+                _finalize_running_substep(run_id, idx, r["steps"][idx], final_sub_status)
+                r["steps"][idx]["status"] = final_sub_status
                 if not ok:
                     r["status"] = "Failed"
                     r["finished_at"] = now_str()
@@ -1004,6 +1050,17 @@ def queue_workflow(wf, trigger_label, repo_full_name="", branch="main", commit_i
         commit_sha, title = commit_info
     with STATE_LOCK:
         wf_id = wf.get("id", "")
+        clean_repo = (repo_full_name or "").strip()
+        clean_branch = (branch or "main").strip() or "main"
+        if clean_repo:
+            for existing in RUNS:
+                if (
+                    existing.get("status") in ("Queued", "Running", "AwaitingApproval")
+                    and existing.get("workflow_id") == wf_id
+                    and (existing.get("repo_name") or "").strip().lower() == clean_repo.lower()
+                    and (existing.get("branch") or "main").strip() == clean_branch
+                ):
+                    existing["cancel_requested"] = True
         number = sum(1 for r in RUNS if r.get("workflow_id") == wf_id) + 1
         run_id = f"run-vps-{now_ts:x}-{number}"
         run_obj = {
@@ -1989,6 +2046,8 @@ RUNNER_ACTIVE=1\r\n";
         assert!(script.contains("\"/purge\""));
         assert!(script.contains("def branch_matches("));
         assert!(script.contains("def resolve_workflow_for_binding("));
+        assert!(script.contains("::workploy-substep::"));
+        assert!(script.contains("def _finalize_running_substep("));
         assert!(script.contains("\"repo_name\": repo_full_name or None"));
         assert!(!script.contains("widder"));
         assert!(!script.contains("docker.io"));

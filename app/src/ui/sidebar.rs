@@ -12,32 +12,67 @@ const COLLAPSED_W: f32 = 68.0;
 const PILL_INSET: f32 = 10.0;
 const ROW_H: f32 = 34.0;
 const ROW_PITCH: f32 = 38.0;
+const SUB_ROW_H: f32 = 28.0;
+const SUB_ROW_PITCH: f32 = 30.0;
 const SECTION_H: f32 = 24.0;
+
+fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) -> String {
+    match target {
+        NavTarget::Onboarding => "nav-onboarding".into(),
+        NavTarget::Runs => {
+            if let Some(wf_id) = &s.selected_workflow_id {
+                if !collapsed
+                    && let Some(pid) = &s.selected_project_id
+                    && s.snapshot
+                        .settings
+                        .repo_bindings
+                        .iter()
+                        .find(|b| &b.id == pid)
+                        .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == wf_id))
+                {
+                    return format!("nav-proj-wf-{pid}-{wf_id}");
+                }
+                format!("wf-{wf_id}")
+            } else if let Some(pid) = &s.selected_project_id
+                && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+            {
+                format!("nav-proj-{pid}")
+            } else {
+                "nav-runs".into()
+            }
+        }
+        NavTarget::WorkflowRuns(id) => {
+            if !collapsed
+                && let Some(pid) = &s.selected_project_id
+                && s.snapshot
+                    .settings
+                    .repo_bindings
+                    .iter()
+                    .find(|b| &b.id == pid)
+                    .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == id))
+            {
+                format!("nav-proj-wf-{pid}-{id}")
+            } else {
+                format!("wf-{id}")
+            }
+        }
+        NavTarget::Approvals => "nav-approvals".into(),
+        NavTarget::Connections => "nav-connections".into(),
+        NavTarget::Settings => "nav-settings".into(),
+        NavTarget::RunDetail { .. } => resolve_nav_selected_id(s, &s.previous_list_nav, collapsed),
+    }
+}
 
 pub fn view(s: &AppState, t: UiTheme) -> El {
     let w = if s.sidebar_collapsed { COLLAPSED_W } else { EXPANDED_W };
     let pill_w = w - 2.0 * PILL_INSET;
     let collapsed = s.sidebar_collapsed;
 
-    let selected_id: String = match &s.nav {
-        NavTarget::Onboarding => "nav-onboarding".into(),
-        NavTarget::Runs => "nav-runs".into(),
-        NavTarget::WorkflowRuns(id) => format!("wf-{id}"),
-        NavTarget::Approvals => "nav-approvals".into(),
-        NavTarget::Connections => "nav-connections".into(),
-        NavTarget::Settings => "nav-settings".into(),
-        NavTarget::RunDetail { .. } => match &s.previous_list_nav {
-            NavTarget::Onboarding => "nav-onboarding".into(),
-            NavTarget::WorkflowRuns(id) => format!("wf-{id}"),
-            NavTarget::Approvals => "nav-approvals".into(),
-            NavTarget::Connections => "nav-connections".into(),
-            NavTarget::Settings => "nav-settings".into(),
-            _ => "nav-runs".into(),
-        },
-    };
+    let selected_id = resolve_nav_selected_id(s, &s.nav, collapsed);
 
     let mut y = 4.0f32;
     let mut sel_y = y;
+    let mut sel_h = ROW_H;
     let mut items: Vec<El> = Vec::new();
 
     // 1. Início / Onboarding (apenas na 1ª vez ou quando reaberto manualmente)
@@ -70,6 +105,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
     let is_runs = selected_id == "nav-runs";
     if is_runs {
         sel_y = y;
+        sel_h = ROW_H;
     }
     items.push(nav_row(
         t,
@@ -82,9 +118,158 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         PILL_INSET,
         y,
         pill_w,
-        |s: &mut AppState| s.navigate_to(NavTarget::Runs),
+        |s: &mut AppState| {
+            s.selected_project_id = None;
+            s.selected_workflow_id = None;
+            s.navigate_to(NavTarget::Runs);
+        },
     ));
-    y += ROW_PITCH + 10.0;
+    y += ROW_PITCH + 8.0;
+
+    // 2.5. Projetos
+    if !s.snapshot.settings.repo_bindings.is_empty() {
+        if !collapsed {
+            items.push(
+                row()
+                    .key("hdr-projs")
+                    .absolute(0.0, y)
+                    .size(w, SECTION_H)
+                    .px(18.0)
+                    .center_y()
+                    .justify_between()
+                    .help("Projetos vinculados ao GitHub. Clique em um projeto para ver seus KPIs, fluxos e histórico.")
+                    .child(
+                        text("PROJETOS")
+                            .font(ty::EYEBROW)
+                            .color(t.text_muted),
+                    ),
+            );
+            y += SECTION_H + 2.0;
+        }
+
+        let total_projects = s.snapshot.settings.repo_bindings.len();
+        for b in &s.snapshot.settings.repo_bindings {
+            let proj_key = format!("nav-proj-{}", b.id);
+            let is_proj_sel = selected_id == proj_key;
+            if is_proj_sel {
+                sel_y = y;
+                sel_h = ROW_H;
+            }
+            let bid = b.id.clone();
+            let repo_trim = b.full_name.trim();
+            let has_running = s.snapshot.runs.iter().any(|r| {
+                (r.repo_name
+                    .as_deref()
+                    .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
+                    || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim)))
+                    && matches!(
+                        r.status,
+                        workploy::model::RunStatus::Queued | workploy::model::RunStatus::Running
+                    )
+            });
+            let has_approval = !has_running
+                && s.snapshot.runs.iter().any(|r| {
+                    (r.repo_name
+                        .as_deref()
+                        .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
+                        || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim)))
+                        && r.status == workploy::model::RunStatus::AwaitingApproval
+                });
+            let dot_col = if has_running {
+                t.info
+            } else if has_approval {
+                t.warning
+            } else if b.enabled {
+                t.success
+            } else {
+                t.text_muted
+            };
+            let proj_badge = (!collapsed).then(|| el().size(6.0, 6.0).radius(3.0).fill(dot_col));
+
+            items.push(nav_row(
+                t,
+                proj_key,
+                b.full_name.clone(),
+                &icons::BRANCH,
+                proj_badge,
+                is_proj_sel,
+                collapsed,
+                PILL_INSET,
+                y,
+                pill_w,
+                move |s: &mut AppState| {
+                    s.selected_project_id = Some(bid.clone());
+                    s.selected_workflow_id = None;
+                    s.navigate_to(NavTarget::Runs);
+                },
+            ));
+            y += ROW_PITCH;
+
+            let show_sub_wfs = !collapsed
+                && (s.selected_project_id.as_deref() == Some(b.id.as_str())
+                    || total_projects <= 4);
+            if show_sub_wfs {
+                for wf in s.project_workflows(b) {
+                    let sub_key = format!("nav-proj-wf-{}-{}", b.id, wf.id);
+                    let is_sub_sel = selected_id == sub_key;
+                    if is_sub_sel {
+                        sel_y = y;
+                        sel_h = SUB_ROW_H;
+                    }
+                    let bid_sub = b.id.clone();
+                    let wfid_sub = wf.id.clone();
+                    let wf_name = wf.name.clone();
+                    let ic_col = if is_sub_sel { t.accent } else { t.text_muted };
+                    let fg_col = if is_sub_sel {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    };
+                    items.push(
+                        row()
+                            .key(sub_key)
+                            .role("tab")
+                            .label(format!("{} · {}", b.full_name, wf_name))
+                            .checked(is_sub_sel)
+                            .absolute(PILL_INSET, y)
+                            .size(pill_w, SUB_ROW_H)
+                            .pl(14.0)
+                            .pr(10.0)
+                            .gap(7.0)
+                            .center_y()
+                            .radius(6.0)
+                            .cursor(Cursor::Pointer)
+                            .focusable(true)
+                            .focus_ring(2.0, 2.0, t.accent)
+                            .hover(if is_sub_sel {
+                                Color::TRANSPARENT
+                            } else {
+                                t.hover
+                            })
+                            .press(t.press)
+                            .press_scale(0.98)
+                            .on_press(move |s: &mut AppState| {
+                                s.selected_project_id = Some(bid_sub.clone());
+                                s.selected_workflow_id = Some(wfid_sub.clone());
+                                s.navigate_to(NavTarget::Runs);
+                            })
+                            .child(icon(&icons::PLAY, 11.5).color(ic_col).a11y_hidden())
+                            .child(
+                                text(wf_name)
+                                    .font(if is_sub_sel { ty::SMALL_MED } else { ty::SMALL })
+                                    .color(fg_col)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .truncate()
+                                    .a11y_hidden(),
+                            ),
+                    );
+                    y += SUB_ROW_PITCH;
+                }
+            }
+        }
+        y += 8.0;
+    }
 
     // 3. Receitas de fluxo
     if !collapsed {
@@ -111,6 +296,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         let is_sel = selected_id == key;
         if is_sel {
             sel_y = y;
+            sel_h = ROW_H;
         }
         let wf_id = wf.id.clone();
         let count = s
@@ -135,7 +321,11 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             PILL_INSET,
             y,
             pill_w,
-            move |s: &mut AppState| s.navigate_to(NavTarget::WorkflowRuns(wf_id.clone())),
+            move |s: &mut AppState| {
+                s.selected_project_id = None;
+                s.selected_workflow_id = Some(wf_id.clone());
+                s.navigate_to(NavTarget::WorkflowRuns(wf_id.clone()));
+            },
         ));
         y += ROW_PITCH;
     }
@@ -292,7 +482,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         .child(
             el().key("sidebar-selection")
                 .absolute(PILL_INSET, sel_y)
-                .size(pill_w, ROW_H)
+                .size(pill_w, sel_h)
                 .radius(6.0)
                 .fill(t.surface_3)
                 .border(1.0, t.border_subtle)

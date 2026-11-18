@@ -46,10 +46,61 @@ fn win_store() -> Result<&'static std::sync::Arc<windows_native_keyring_store::S
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
+fn load_vault_file(path: &std::path::Path) -> HashMap<String, String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<HashMap<String, String>>(&raw).unwrap_or_default()
+}
+
+#[cfg(any(test, not(target_os = "windows")))]
+fn write_vault_file(path: &std::path::Path, map: &HashMap<String, String>) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Falha ao preparar diretório do cofre: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(map)
+        .map_err(|e| format!("Falha ao serializar cofre local: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("Falha ao gravar cofre local: {e}"))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("Falha ao escrever cofre local: {e}"))?;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, json.as_bytes())
+            .map_err(|e| format!("Falha ao gravar cofre local: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("Falha ao atualizar cofre local: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), not(target_os = "windows")))]
+fn fallback_vault_path() -> std::path::PathBuf {
+    crate::model::data_dir().join(".vault.json")
+}
+
 #[cfg(all(not(test), not(target_os = "windows")))]
 fn fallback_store() -> &'static Mutex<HashMap<String, String>> {
     static MEM: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    MEM.get_or_init(|| Mutex::new(HashMap::new()))
+    MEM.get_or_init(|| Mutex::new(load_vault_file(&fallback_vault_path())))
 }
 
 pub fn save_secret(key: &str, value: &str) -> Result<(), String> {
@@ -85,7 +136,7 @@ pub fn save_secret(key: &str, value: &str) -> Result<(), String> {
             .lock()
             .map_err(|_| "Falha ao acessar o cofre em memória.".to_string())?;
         guard.insert(key.to_string(), value.to_string());
-        Ok(())
+        write_vault_file(&fallback_vault_path(), &guard)
     }
 }
 
@@ -169,7 +220,7 @@ pub fn delete_secret(key: &str) -> Result<(), String> {
             .lock()
             .map_err(|_| "Falha ao acessar o cofre em memória.".to_string())?;
         guard.remove(key);
-        Ok(())
+        write_vault_file(&fallback_vault_path(), &guard)
     }
 }
 
@@ -212,5 +263,28 @@ mod tests {
         assert_eq!(vps_password_key("vps-1"), "vps:vps-1:password");
         assert_eq!(vps_webhook_secret_key("vps-1"), "vps:vps-1:webhook");
         assert_eq!(vps_runner_token_key("vps-1"), "vps:vps-1:runner-token");
+    }
+
+    #[test]
+    fn file_vault_persists_and_reloads_secrets() {
+        let tmp = std::env::temp_dir().join(format!("workploy-vault-test-{}", crate::model::new_id("dir")));
+        let path = tmp.join(".vault.json");
+        let mut map = HashMap::new();
+        map.insert(KEY_GITHUB_PAT.into(), "ghp_test_token_123".into());
+        map.insert(vps_password_key("vps-1"), "ssh_pass_456".into());
+
+        write_vault_file(&path, &map).unwrap();
+        let reloaded = load_vault_file(&path);
+        assert_eq!(reloaded.get(KEY_GITHUB_PAT).map(String::as_str), Some("ghp_test_token_123"));
+        assert_eq!(reloaded.get(&vps_password_key("vps-1")).map(String::as_str), Some("ssh_pass_456"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

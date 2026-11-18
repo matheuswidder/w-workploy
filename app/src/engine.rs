@@ -43,17 +43,72 @@ fn update_run(sh: &SharedHandle, id: &str, f: impl FnOnce(&mut Run)) {
     notify(sh);
 }
 
+fn push_capped_log(buf: &mut String, chunk: &str) {
+    buf.push_str(chunk);
+    const CAP: usize = 120_000;
+    if buf.len() > CAP {
+        let mut cut = buf.len() - CAP;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
+    }
+}
+
+pub(crate) fn apply_log_to_step(st: &mut StepRun, text: &str) {
+    let now = now_ts();
+    for seg in text.split_inclusive('\n') {
+        let trimmed = seg.trim();
+        let marker_cand = trimmed.trim_matches('"');
+        if let Some(raw_name) = marker_cand.strip_prefix("::workploy-substep::") {
+            let name = raw_name.trim();
+            let sub_name = if name.is_empty() {
+                "Sub-etapa".to_string()
+            } else {
+                name.to_string()
+            };
+            if let Some(prev) = st.substeps.last_mut()
+                && prev.status == StepStatus::Running
+            {
+                prev.status = StepStatus::Success;
+                prev.secs = prev.started_ts.map(|t| (now - t).max(0) as f64).unwrap_or(0.0);
+            }
+            st.substeps.push(StepRun {
+                name: sub_name.clone(),
+                status: StepStatus::Running,
+                log: String::new(),
+                secs: 0.0,
+                substeps: Vec::new(),
+                started_ts: Some(now),
+            });
+            push_capped_log(&mut st.log, &format!("=== {sub_name} ===\n"));
+        } else {
+            push_capped_log(&mut st.log, seg);
+            if let Some(active) = st.substeps.last_mut()
+                && active.status == StepStatus::Running
+            {
+                push_capped_log(&mut active.log, seg);
+            }
+        }
+    }
+}
+
+pub(crate) fn finalize_step_substeps(st: &mut StepRun, final_status: StepStatus) {
+    let now = now_ts();
+    if let Some(last) = st.substeps.last_mut()
+        && last.status == StepStatus::Running
+    {
+        last.status = final_status;
+        last.secs = last.started_ts.map(|t| (now - t).max(0) as f64).unwrap_or(0.0);
+    }
+}
+
 fn append_log(sh: &SharedHandle, run_id: &str, step_idx: usize, text: &str) {
     let mut s = sh.lock().unwrap();
     if let Some(r) = s.runs.iter_mut().find(|r| r.id == run_id)
         && let Some(st) = r.steps.get_mut(step_idx)
     {
-        st.log.push_str(text);
-        const CAP: usize = 120_000;
-        if st.log.len() > CAP {
-            let cut = st.log.len() - CAP;
-            st.log.drain(..cut);
-        }
+        apply_log_to_step(st, text);
     }
     drop(s);
     notify(sh);
@@ -178,6 +233,19 @@ pub fn start_run_with_target(
     let commit_sha_for_exec = run.commit.clone();
     {
         let mut s = sh.lock().unwrap();
+        if let Some(ref repo) = clean_repo {
+            for r in &mut s.runs {
+                if r.status.active()
+                    && r.workflow_id == wf.id
+                    && r.repo_name
+                        .as_deref()
+                        .is_some_and(|existing| existing.eq_ignore_ascii_case(repo))
+                    && r.branch == clean_branch
+                {
+                    r.cancel_requested = true;
+                }
+            }
+        }
         s.runs.insert(0, run);
         save_runs(&s);
     }
@@ -295,6 +363,7 @@ fn finish_cancelled(
                 st.status,
                 StepStatus::Pending | StepStatus::WaitingApproval | StepStatus::Running
             ) {
+                finalize_step_substeps(st, StepStatus::Skipped);
                 st.status = StepStatus::Skipped;
             }
         }
@@ -631,11 +700,13 @@ fn execute_run(
         update_run(&sh, &run_id, |r| {
             if let Some(st) = r.steps.get_mut(i) {
                 st.secs = secs;
-                st.status = if ok {
+                let final_status = if ok {
                     StepStatus::Success
                 } else {
                     StepStatus::Failed
                 };
+                finalize_step_substeps(st, final_status);
+                st.status = final_status;
             }
             if !ok {
                 r.status = RunStatus::Failed;
@@ -2007,5 +2078,121 @@ mod tests {
         let s = sh.lock().unwrap();
         let remaining_ids: Vec<&str> = s.runs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(remaining_ids, vec!["r-queued", "r-running", "r-wait"]);
+    }
+
+    #[test]
+    fn substep_telemetry_tracks_live_substeps_and_finalizes_status() {
+        let mut step = StepRun {
+            name: "Typecheck + Tests".into(),
+            status: StepStatus::Running,
+            log: String::new(),
+            secs: 0.0,
+            substeps: Vec::new(),
+            started_ts: Some(now_ts()),
+        };
+
+        apply_log_to_step(&mut step, "::workploy-substep::Install dependencies\n");
+        assert_eq!(step.substeps.len(), 1);
+        assert_eq!(step.substeps[0].name, "Install dependencies");
+        assert_eq!(step.substeps[0].status, StepStatus::Running);
+
+        apply_log_to_step(&mut step, "Packages: +811\nDone in 2s\n");
+        assert!(step.substeps[0].log.contains("Packages: +811"));
+        assert!(step.log.contains("Packages: +811"));
+
+        apply_log_to_step(&mut step, "::workploy-substep::Run tests\n");
+        assert_eq!(step.substeps.len(), 2);
+        assert_eq!(step.substeps[0].status, StepStatus::Success);
+        assert_eq!(step.substeps[1].name, "Run tests");
+        assert_eq!(step.substeps[1].status, StepStatus::Running);
+
+        apply_log_to_step(&mut step, "FAIL src/app.spec.ts\n");
+        assert!(step.substeps[1].log.contains("FAIL src/app.spec.ts"));
+        assert!(!step.substeps[0].log.contains("FAIL src/app.spec.ts"));
+
+        finalize_step_substeps(&mut step, StepStatus::Failed);
+        assert_eq!(step.substeps[0].status, StepStatus::Success);
+        assert_eq!(step.substeps[1].status, StepStatus::Failed);
+    }
+
+    #[test]
+    fn start_run_with_target_cancels_previous_active_run_on_same_repo_branch_and_workflow() {
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            let mut wf = echo_workflow("wf-ci", false, None);
+            wf.steps[0].run = if cfg!(windows) {
+                "ping -n 5 127.0.0.1 > nul"
+            } else {
+                "sleep 5"
+            }
+            .into();
+            s.workflows.push(wf.clone());
+            wf.id = "wf-other".into();
+            s.workflows.push(wf);
+        }
+
+        let first_main = start_run_with_target(
+            &sh,
+            "wf-ci",
+            "push 1",
+            None,
+            None,
+            Some("widder/erp".into()),
+            Some("main".into()),
+        )
+        .unwrap();
+        let dev_run = start_run_with_target(
+            &sh,
+            "wf-ci",
+            "push dev",
+            None,
+            None,
+            Some("widder/erp".into()),
+            Some("dev".into()),
+        )
+        .unwrap();
+        let other_wf_run = start_run_with_target(
+            &sh,
+            "wf-other",
+            "push other wf",
+            None,
+            None,
+            Some("widder/erp".into()),
+            Some("main".into()),
+        )
+        .unwrap();
+
+        assert!(wait_status(&sh, &first_main, RunStatus::Running, 5000));
+
+        // Nova execução na mesma (repo, branch, workflow_id) deve solicitar cancelamento da anterior
+        let second_main = start_run_with_target(
+            &sh,
+            "wf-ci",
+            "push 2",
+            None,
+            None,
+            Some("WIDDER/ERP".into()),
+            Some("main".into()),
+        )
+        .unwrap();
+
+        {
+            let s = sh.lock().unwrap();
+            let r1 = s.runs.iter().find(|r| r.id == first_main).unwrap();
+            let r_dev = s.runs.iter().find(|r| r.id == dev_run).unwrap();
+            let r_other = s.runs.iter().find(|r| r.id == other_wf_run).unwrap();
+            let r2 = s.runs.iter().find(|r| r.id == second_main).unwrap();
+
+            assert!(r1.cancel_requested);
+            assert!(!r_dev.cancel_requested);
+            assert!(!r_other.cancel_requested);
+            assert!(!r2.cancel_requested);
+        }
+
+        assert!(wait_status(&sh, &first_main, RunStatus::Cancelled, 10_000));
+        cancel(&sh, &dev_run);
+        cancel(&sh, &other_wf_run);
+        cancel(&sh, &second_main);
     }
 }

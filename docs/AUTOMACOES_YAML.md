@@ -1,20 +1,20 @@
 # Guia de Automações `.yml` no Workploy
 
-Este guia ensina como criar, estruturar, importar e testar automações `.yml` no Workploy.
+Este guia explica como criar, estruturar, importar e diagnosticar automações `.yml` no Workploy v0.1.10.
 
 ## 1. Conceito central: Receita vs. Vínculo
 
 O Workploy separa o fluxo em duas partes independentes para que você reaproveite a mesma receita em projetos e servidores diferentes.
 
-| Conceito | O que define | Onde você configura |
+| Conceito | O que define | Onde configurar |
 |---|---|---|
-| **Receita** (`Workflow`) | **O que** executar: nome, gatilho base, pasta de trabalho, lista sequencial de passos, portões de aprovação e fluxo seguinte (`on_success`). | Barra lateral (`Novo fluxo`) ou modal **Importar YAML** / **Arquivo YAML**. |
-| **Vínculo** (`RepoBinding`) | **Onde** e **quando** rodar: repositório GitHub (`dono/nome`), branches monitoradas, destino (`Local` ou uma `VPS`) e modo de disparo. | **Configurações → GitHub** (botão **Vincular** ou **Novo vínculo**). |
+| **Receita** (`Workflow`) | **O que** executar: nome, gatilho base, pasta de trabalho, jobs e passos, portões de aprovação e fluxo seguinte (`on_success`). | Barra lateral agrupada por projeto (`Novo fluxo`) ou modal **Importar YAML** / **Arquivo YAML**. |
+| **Vínculo** (`RepoBinding`) | **Onde** e **quando** rodar: repositório GitHub (`dono/nome`), branches monitoradas, destino (`Local` ou uma `VPS`) e modo de disparo. | **Configurações → GitHub** (botão **Vincular** ou **+ Novo vínculo**). |
 
 ### Onde a automação roda
 
-- **Local (Esta máquina):** o aplicativo desktop executa os comandos direto no seu computador. No Windows, cada passo roda via `cmd /C` (`app/src/engine.rs`); no Linux, via `sh -c`. Ideal para builds nativos Windows, testes locais e pasta vigiada.
-- **VPS Linux (`workploy-runner`):** o serviço `systemd` provisionado na VPS clona ou atualiza o repositório em `/var/lib/workploy/workspaces/<slug>` (ou usa o `workdir` informado) e executa cada passo via `/bin/bash -lc` (ou `/bin/sh -lc`). Seus pipelines continuam rodando mesmo com o computador desligado.
+- **Local (Esta máquina):** o aplicativo desktop executa os comandos no seu computador. No Windows, cada passo roda via `cmd /C` (`app/src/engine.rs`); no Linux, via `sh -c`. Indique este modo para builds nativos Windows, testes locais e pasta vigiada.
+- **VPS Linux (`workploy-runner`):** o serviço `systemd` provisionado na VPS clona ou atualiza o repositório em `/var/lib/workploy/workspaces/<slug>` (ou usa o `workdir` informado) e executa cada passo via `/bin/bash -lc` (ou `/bin/sh -lc`). Seus pipelines seguem ativos com o computador desligado.
 
 ### Quando o vínculo dispara
 
@@ -56,43 +56,131 @@ steps:
 
 | Campo | Obrigatório | Valores / Tipo | Função |
 |---|---|---|---|
-| `name` | Sim | Texto | Nome exibido na barra lateral, no histórico de **Execuções** e nos vínculos. |
-| `trigger` | Não (padrão `manual`) | `manual`, `push`, `watch` | `manual` roda ao clicar em **Executar** ou por encadeamento; `push` responde a atualizações do GitHub; `watch` dispara ao detectar mudanças na pasta local configurada em **Configurações → GitHub**. |
+| `name` | Sim | Texto | Nome exibido na barra lateral, no **Dashboard do Projeto**, no histórico de **Execuções** e nos vínculos. |
+| `trigger` | Não (padrão `manual`) | `manual`, `push`, `watch` | `manual` roda ao clicar em **Executar agora** ou por encadeamento; `push` responde a atualizações do GitHub; `watch` dispara ao detectar mudanças na pasta local configurada em **Configurações → GitHub**. |
 | `workdir` | Não | Caminho absoluto ou relativo | Diretório onde os comandos rodam (ex: `/srv/app` na VPS ou `C:\Projects\app` no Windows). Quando vazio na VPS, o `workploy-runner` usa `/var/lib/workploy/workspaces/<repo>`. |
-| `on_success` | Não | ID de outro fluxo | Inicia automaticamente a receita indicada quando todos os passos atuais terminam com sucesso. |
+| `on_success` | Não | ID de outro fluxo | Inicia a receita indicada quando todos os passos atuais terminam com sucesso. |
 | `steps` | Sim | Lista (mínimo 1 item) | Etapas executadas em ordem. Se um passo retorna código diferente de zero, os seguintes são ignorados (`Ignorado`). |
 | `steps[].name` | Não | Texto | Título curto exibido na linha do tempo e nos logs. Se omitido, vira `Passo N`. |
 | `steps[].run` | Sim | String ou bloco multilinha (`\|`) | Comando shell da etapa. Use `\|` para scripts com várias linhas. |
 | `steps[].approval` | Não (padrão `false`) | `true` ou `false` | Pausa a execução antes deste passo com o status **Aguardando aprovação** e exibe o cartão na aba **Aprovações**. |
 
-> **Nota sobre o importador atual (`app/src/yaml.rs`):** o parser integrado do modal **Importar YAML** / **Arquivo YAML** lê e exporta um formato compatível com GitHub Actions simplificado:
+> **Nota sobre o parser YAML (`app/src/yaml.rs`):** o modal **Importar YAML** / **Arquivo YAML** lê e exporta o formato compatível com GitHub Actions simplificado:
 > - `on: [push]` ou `on: [workflow_dispatch]` no lugar de `trigger`
-> - `jobs.build.runs-on: local` ou `self-hosted` para definir o runner padrão
+> - `jobs.<id>.runs-on: local` ou `self-hosted` para definir o runner padrão
 > - `x-approval: true` dentro do passo no lugar de `approval: true`
 > - `x-chain: <id-do-fluxo>` na raiz no lugar de `on_success`
 > - `x-server: <id-da-vps>` e `x-repo: <id-do-vinculo>` para fixar servidor e vínculo na exportação
 >
-> Campos como `workdir` e o gatilho `Mudança na pasta` (`watch`) ficam disponíveis direto no formulário **Editar fluxo** após importar. Se você colar um YAML direto no modal atual, use a sintaxe equivalente abaixo:
->
-> ```yaml
-> name: Exemplo compatível com importador atual
-> on: [push]
->
-> jobs:
->   build:
->     runs-on: self-hosted
->     steps:
->       - name: Validar código
->         run: npm test
->       - name: Publicar em produção
->         run: docker compose up -d --build
->         x-approval: true
-> x-chain: wf-deploy-id
-> ```
+> Campos como `workdir` e o gatilho `Mudança na pasta` (`watch`) ficam disponíveis no formulário **Editar fluxo** após importar.
 
 ---
 
-## 3. Exemplos prontos para copiar
+## 3. Importação de `.github/workflows/*.yml` e Jobs com Sub-etapas
+
+Na versão `0.1.10`, o Workploy importa workflows existentes de `.github/workflows/*.yml` (e `.yaml`) direto pelo botão **Buscar fluxos no repo** ou pelo modal **Importar YAML**.
+
+### Como o Workploy mapeia workflows do GitHub Actions
+
+1. **Descoberta automática:** ao escanear o repositório (`app/src/github.rs`), o Workploy lista todos os arquivos `.yml` e `.yaml` em `.github/workflows/` além de manifestos na raiz (`package.json`, `Cargo.toml`, `docker-compose.yml`, `Dockerfile`).
+2. **Mapeamento de jobs e concorrência:**
+   - `on: [push]` vira gatilho automático por push; `on: [workflow_dispatch]` vira disparo manual.
+   - `concurrency.cancel-in-progress: true` instrui o `workploy-runner` a cancelar runs anteriores ainda em andamento na mesma branch quando um novo commit chega.
+   - `jobs.<id>.runs-on` define o destino (`local` para a máquina desktop, `self-hosted` para a VPS Linux).
+   - Cada job é exibido na tela de execução agrupado por tipo, como no GitHub Actions: `Typecheck + Tests + Smoke`, `Secret scan`, `Contracts Zod` e `Deploy VPS`.
+3. **Live Logs (`stick_bottom`):** durante a execução, o painel de detalhes rola automaticamente (`stick_bottom`) para a última linha emitida e mantém a sub-etapa ativa visível.
+
+### Como estruturar Jobs com Sub-etapas (`::workploy-substep::<Nome>`)
+
+Dentro de um job ou passo `run`, emita marcadores `::workploy-substep::<Nome>` na saída padrão (`stdout`) para dividir um script longo em sub-etapas expansíveis e cronometradas na tela de execução:
+
+```text
+::workploy-substep::Instalar dependências
+```
+
+Quando o `workploy-runner` ou o executor local lê uma linha com esse prefixo:
+
+- Fecha a sub-etapa anterior com o tempo decorrido e status (`Concluído` ou `Falhou`).
+- Abre uma nova sub-etapa expansível com `<Nome>` na árvore do job pai.
+- Direciona as linhas seguintes de log para essa sub-etapa mantendo o acompanhamento ao vivo (`stick_bottom`).
+
+### Exemplo completo em `.github/workflows/ci-deploy.yml`
+
+Este exemplo agrupa os quatro tipos de job na tela de execução (`Typecheck + Tests + Smoke`, `Secret scan`, `Contracts Zod` e `Deploy VPS`) e usa `::workploy-substep::<Nome>` dentro de cada job:
+
+```yaml
+name: CI e Deploy VPS
+on: [push]
+
+concurrency:
+  group: workploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck-tests-smoke:
+    name: Typecheck + Tests + Smoke
+    runs-on: self-hosted
+    steps:
+      - name: Typecheck + Tests + Smoke
+        run: |
+          echo "::workploy-substep::Instalar dependências"
+          pnpm install --frozen-lockfile
+
+          echo "::workploy-substep::Typecheck em todos os pacotes"
+          pnpm -r typecheck
+
+          echo "::workploy-substep::Testes unitários e integração"
+          pnpm test:ci
+
+          echo "::workploy-substep::Readiness smoke"
+          node scripts/readiness-smoke.mjs
+
+  secret-scan:
+    name: Secret scan
+    runs-on: self-hosted
+    steps:
+      - name: Secret scan
+        run: |
+          echo "::workploy-substep::Gitleaks no repositório"
+          gitleaks detect --source . --no-banner
+
+          echo "::workploy-substep::Auditoria de dependências (high+)"
+          pnpm audit --audit-level high
+
+  contracts-zod:
+    name: Contracts Zod
+    runs-on: self-hosted
+    steps:
+      - name: Contracts Zod
+        run: |
+          echo "::workploy-substep::Validar schemas Zod"
+          pnpm --filter contracts typecheck
+
+          echo "::workploy-substep::Testar compatibilidade de payloads"
+          pnpm --filter contracts test
+
+  deploy-vps:
+    name: Deploy VPS
+    needs: [typecheck-tests-smoke, secret-scan, contracts-zod]
+    runs-on: self-hosted
+    steps:
+      - name: Deploy VPS
+        x-approval: true
+        run: |
+          echo "::workploy-substep::Atualizar código e construir imagens"
+          git fetch origin && git pull --ff-only
+          docker compose -f infra/api/docker-compose.yml build
+
+          echo "::workploy-substep::Subir containers e validar healthcheck"
+          docker compose -f infra/api/docker-compose.yml up -d --remove-orphans
+          curl -fsS http://127.0.0.1:3001/healthz
+```
+
+> **Dica:** use nomes curtos e claros depois de `::workploy-substep::` (como `Instalar dependências`, `Typecheck`, `Build Docker` e `Healthcheck`) para facilitar a leitura na lista recolhível e no filtro de busca dos logs.
+
+---
+
+## 4. Exemplos prontos para copiar
 
 ### Exemplo 1: Node / Next.js + Docker Compose Redeploy na VPS
 
@@ -122,13 +210,13 @@ steps:
     run: curl -fsS http://127.0.0.1:3000/api/health
 ```
 
-**Dica de vínculo:** em **Configurações → GitHub**, aponte este projeto para a sua VPS Linux e selecione **Webhook 24/7 na VPS** ou **Sondagem 24/7 na VPS**. Se `workdir` ficar vazio, o `workploy-runner` faz o `git clone` e `git pull` automático em `/var/lib/workploy/workspaces/<repo>` antes do primeiro passo.
+**Dica de vínculo:** em **Configurações → GitHub**, aponte este projeto para a sua VPS Linux e selecione **Webhook 24/7 na VPS** ou **Sondagem 24/7 na VPS**. Se `workdir` ficar vazio, o `workploy-runner` faz o `git clone` e `git pull` em `/var/lib/workploy/workspaces/<repo>` antes do primeiro passo.
 
 ---
 
 ### Exemplo 2: Rust (`cargo check` + `clippy` + `test`)
 
-Receita direta de verificação contínua para crates e workspaces em Rust.
+Receita de verificação contínua para crates e workspaces em Rust.
 
 ```yaml
 name: Rust Cargo CI
@@ -149,7 +237,7 @@ steps:
 
 ---
 
-### Exemplo 3: Pipeline encadeado (CI → Portão de Aprovação → Deploy VPS)
+### Exemplo 3: Pipeline encadeado (CI -> Portão de Aprovação -> Deploy VPS)
 
 Separe validação e publicação em duas receitas encadeadas. A primeira roda a cada push e dispara a segunda apenas se todos os testes passarem; a segunda pausa no portão de aprovação antes de reiniciar produção.
 
@@ -191,9 +279,9 @@ steps:
 ```
 
 **Como ligar o encadeamento na prática:**
-1. Crie ou importe primeiro a receita **Deploy VPS** para que ela receba um ID interno (ou configure pelo formulário).
+1. Crie ou importe primeiro a receita **Deploy VPS** para que ela receba um ID interno.
 2. Abra **CI Principal → Editar fluxo** e, em **Encadear ao concluir com sucesso**, selecione **Deploy VPS** (o aplicativo grava o ID real em `on_success` / `x-chain`).
-3. Quando o CI terminar sem falhas, o Workploy abre automaticamente a execução de **Deploy VPS**, para no passo `Subir nova versão em produção` e envia um alerta para a aba **Aprovações**.
+3. Quando o CI terminar sem falhas, o Workploy abre a execução de **Deploy VPS**, para no passo `Subir nova versão em produção` e envia um alerta para a aba **Aprovações**.
 4. Clique em **Aprovar e continuar** (ou **Rejeitar** para abortar sem reiniciar os containers).
 
 ---
@@ -227,37 +315,74 @@ steps:
     run: dir dist
 ```
 
-Se quiser rodar o mesmo projeto automaticamente quando editar arquivos na máquina Windows:
+Para rodar o mesmo projeto ao editar arquivos na máquina Windows:
 1. Em **Configurações → GitHub**, role até **Vigia de pasta local & Sondagem**, ative **Ativar vigia local** e informe a pasta (ex: `C:\Projects\meu-app-desktop`).
 2. Na receita, defina o gatilho como **Mudança na pasta** (`watch`).
 3. Deixe o vínculo apontado para **Local (Esta máquina)**.
 
 ---
 
-## 4. Como importar e testar passo a passo na UI
+## 5. Requisitos estimados por tipo de projeto e diagnóstico de subpastas
+
+O **Dashboard do Projeto** e a tela **Conexões & Diagnóstico** classificam suas VPSs pelas faixas definidas em `CapacityTier` (`app/src/model.rs`). Use a tabela abaixo para dimensionar cada projeto antes de vincular o deploy 24/7.
+
+### Requisitos estimados por tipo de projeto
+
+| Tipo de projeto | Perfil Workploy | vCPU | RAM | Disco livre | Observações operacionais |
+|---|---|---|---|---|---|
+| **Node / Next.js monorepo** | **Padrão** (ou **Pesada** acima de 15 pacotes) | 2–4 vCPU | 4–8 GB (swap 2 GB recomendado) | 50+ GB SSD | `pnpm -r typecheck` e `next build` consomem picos de RAM; mantenha `NODE_OPTIONS="--max-old-space-size=3072"` se a VPS tiver 4 GB. |
+| **Rust / Cargo** | **Padrão** a **Pesada** | 4–8 vCPU | 8–16 GB | 80+ GB NVMe | O diretório `target/` cresce rápido entre builds; ative a **Regra de limpeza (Purge)** por teto em GB na VPS. |
+| **Docker Compose** | **Leve** a **Padrão** | 1–4 vCPU | 2–8 GB | 25–50+ GB SSD | Builds multi-stage e imagens antigas acumulam camadas; combine `docker compose up -d --build` com **Purge** de imagens não usadas. |
+
+### Diagnóstico de deploy em subpastas (`infra/api`, `infra/web`)
+
+Monorepos costumam guardar arquivos Compose e Dockerfiles em subpastas como `infra/api/docker-compose.yml` ou `infra/web/docker-compose.yml`. Se o deploy falhar logo nos primeiros segundos, verifique estes quatro pontos:
+
+1. **`workdir` vs. `-f <subpasta>`:** mantenha `workdir` na raiz do repositório (ou vazio para usar `/var/lib/workploy/workspaces/<repo>`) e passe `-f infra/api/docker-compose.yml` explícito. Se você trocar `workdir` para `infra/api`, comandos anteriores como `pnpm -r typecheck` ou `gitleaks detect --source .` perdem o acesso à raiz do monorepo.
+2. **Contexto de build no `docker-compose.yml`:** quando o `Dockerfile` dentro de `infra/api/` copia `package.json`, `pnpm-lock.yaml` ou `packages/` da raiz, o `build.context` precisa apontar para `../..` (raiz do repo) e `dockerfile` para `infra/api/Dockerfile`:
+   ```yaml
+   services:
+     api:
+       build:
+         context: ../..
+         dockerfile: infra/api/Dockerfile
+   ```
+   Se `context` estiver como `.` dentro de `infra/api`, o Docker falha com `COPY failed: file not found in build context`.
+3. **Arquivo `.env` e `--project-directory`:** o `docker compose` lê por padrão o `.env` da pasta onde está o arquivo YAML (`infra/api/.env`), ignorando o `.env` da raiz. Para usar o `.env` da raiz ou um caminho fixo na VPS, passe `--env-file`:
+   ```bash
+   docker compose --env-file /srv/meu-app/.env -f infra/api/docker-compose.yml up -d --build
+   ```
+4. **Caminhos independentes para API e Web:** ao separar **Deploy API** (`infra/api`) e **Deploy Web** (`infra/web`), dê nomes distintos com `-p` (`--project-name`) para que `--remove-orphans` de um stack não derrube containers do outro:
+   ```bash
+   docker compose -p erp-api -f infra/api/docker-compose.yml up -d --build --remove-orphans
+   docker compose -p erp-web -f infra/web/docker-compose.yml up -d --build --remove-orphans
+   ```
+
+---
+
+## 6. Como importar e testar passo a passo na UI
 
 ### Passo 1: Criar ou importar a receita
 
-1. **Pelo editor visual:** clique em **+ Novo fluxo** na barra lateral (ou **Novo fluxo** no topo de **Execuções**). Escolha um dos presets rápidos (**Node / pnpm CI**, **Rust Cargo CI**, **Docker Compose Redeploy**, **Auditoria & Smoke**) ou monte os passos manualmente, preencha a **Pasta de trabalho** se precisar e clique em **Salvar fluxo**.
-2. **Pelo YAML:** na tela **Execuções**, clique em **Importar YAML** para criar um fluxo novo, ou abra uma receita existente na barra lateral e clique em **Arquivo YAML** para visualizar, copiar e editar a definição. Cole o conteúdo e clique em **Aplicar YAML**.
+1. **Geração automática pelo repo:** com o repositório vinculado, clique em **Gerar receita** no card do projeto em **Execuções**. O Workploy analisa `package.json`, `Cargo.toml` e `docker-compose.yml` para criar uma receita pronta de CI e deploy.
+2. **Importar `.github/workflows/*.yml` ou colar YAML:** clique em **Buscar fluxos no repo** no modal de vínculo para importar workflows existentes de `.github/workflows/`, ou clique em **Importar YAML** em **Execuções** para colar seu YAML.
+3. **Pelo editor visual:** clique em **+ Novo fluxo** na barra lateral (agrupada por projeto), escolha um preset (**Node / pnpm CI**, **Rust Cargo CI**, **Docker Compose Redeploy**, **Auditoria & Smoke**) ou monte os passos manualmente e clique em **Salvar fluxo**.
 
 ### Passo 2: Vincular o repositório e escolher o servidor
 
-1. Acesse **Configurações → GitHub** e valide seu Token PAT em **Testar conexão** (no Windows, o token fica protegido no Gerenciador de Credenciais; nunca em arquivos JSON).
-2. Localize o repositório na lista e clique em **Vincular** (ou clique em **Novo vínculo**).
+1. Acesse **Configurações → GitHub** e valide seu Token PAT em **Testar conexão** (no Windows, o token fica no Gerenciador de Credenciais; no Linux, no cofre local `0600`).
+2. Localize o repositório na lista e clique em **Vincular** (ou **+ Novo vínculo**).
 3. No modal de vínculo:
-   - Informe ou selecione a **Branch monitorada** (clique em **Buscar branches** para marcar múltiplas branches como `main,dev`, ou clique em **Todas (*)**).
-   - Escolha o **Servidor de destino**: **Local (Esta máquina)** ou uma das **VPSs Linux** cadastradas em **Configurações → VPS & Motor**.
+   - Informe ou selecione a **Branch monitorada** (`main`, `main,dev` ou **Todas (*)**).
+   - Escolha o **Servidor de destino**: **Local (Esta máquina)** ou uma das **VPSs Linux** cadastradas em **Configurações → VPS**.
    - Selecione o **Modo de disparo** (**Webhook 24/7 na VPS**, **Sondagem 24/7 na VPS** ou **Sondagem no Desktop**).
    - Escolha a receita em **Fluxo disparado** (ou deixe **Automático (por gatilho)** para disparar os fluxos marcados com `push`).
-4. Clique em **Salvar vínculo**. Se o destino for uma VPS, clique em **Sincronizar na VPS** na linha do vínculo para enviar o `config.json` ao `workploy-runner`.
-   - Caso tenha escolhido **Webhook 24/7 na VPS**, use os botões **Copiar URL Webhook** e **Copiar Segredo** na mesma linha e cole em **Settings → Webhooks** do seu repositório no GitHub.
+4. Clique em **Salvar vínculo**. O Workploy sincroniza a configuração na VPS alvo (ou clique em **Sincronizar na VPS** na linha do vínculo para forçar o envio imediato de `/etc/workploy/config.json`).
+   - Para **Webhook 24/7 na VPS**, use **Copiar URL Webhook** e **Copiar Segredo** na linha do vínculo e cadastre em **Settings → Webhooks** no GitHub.
 
 ### Passo 3: Testar e acompanhar execuções
 
-1. **Disparar na hora:** na tela **Execuções**, encontre o card do seu projeto em **Projetos & Repositórios configurados** e clique em **Executar agora** (ou abra uma receita na barra lateral e clique em **Executar fluxo**).
-2. **Acompanhar logs e resumo:** clique na linha da execução para abrir a visão detalhada com duração por etapa, anotações e logs em tempo real. Use o botão **Arquivo YAML** na lateral direita do detalhe se quiser inspecionar ou ajustar a receita.
-3. **Conferir commits e filtrar por branch:**
-   - Na barra de filtros de **Execuções**, use o seletor de **Branch** para isolar execuções da branch desejada (ex: `main`, `dev`, `staging`).
-   - Quando a consulta de commits por branch (**Ver commits**) estiver disponível para o vínculo ou branch selecionada, o Workploy consulta os commits recentes via API do GitHub (`github::fetch_repo_commits`) com SHA abreviado, mensagem, autor e data para confirmar qual revisão será testada.
-4. **Liberar portões de aprovação:** se o fluxo tiver algum passo com `approval: true` (ou `x-approval: true`), o card fica destacado em âmbar na aba **Aprovações**. Revise o resumo ou os logs e clique em **Aprovar e continuar** ou **Rejeitar**.
+1. **Disparar e abrir o Dashboard do Projeto:** selecione o projeto na barra lateral para ver os KPIs (onde roda, recursos recomendados, duração média, taxa de sucesso e commits) e clique em **Executar agora**.
+2. **Acompanhar Jobs, Sub-etapas e Live Logs:** abra a execução em andamento para expandir cada job e suas sub-etapas (`::workploy-substep::`). Os logs rolam automaticamente (`stick_bottom`) acompanhando a linha mais recente e a sub-etapa ativa.
+3. **Conferir commits e filtrar por branch:** use o seletor de **Branch** em **Execuções** e o botão **Ver commits** para consultar os commits recentes via API do GitHub (SHA abreviado, mensagem, autor e data).
+4. **Liberar portões de aprovação:** passos com `approval: true` ou `x-approval: true` geram um cartão destacado em âmbar na aba **Aprovações**. Revise o resumo ou os logs e clique em **Aprovar e continuar** ou **Rejeitar**.

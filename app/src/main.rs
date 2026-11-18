@@ -1648,12 +1648,12 @@ mod tests {
             for key in [
                 "project-card-rb-erp",
                 "project-card-rb-landing",
+                "open-proj-rb-erp",
+                "open-proj-rb-landing",
                 "run-binding-rb-erp",
                 "run-binding-rb-landing",
                 "commits-binding-rb-erp",
                 "commits-binding-rb-landing",
-                "cfg-binding-rb-erp",
-                "cfg-binding-rb-landing",
             ] {
                 let el = els
                     .iter()
@@ -1667,7 +1667,7 @@ mod tests {
             }
         }
 
-        // 2. Live status + run_binding_now + Configurar button
+        // 2. Live status + run_binding_now + Abrir projeto -> Configurar button
         let mut rt = Runtime::new(
             AppState::init_demo(),
             ui::view,
@@ -1702,7 +1702,15 @@ mod tests {
                 .any(|t| t.options.title == "Execução iniciada")
         );
 
-        // Click "Configurar" on rb-erp -> opens BindingEditor
+        // Click "Abrir projeto" on rb-erp -> opens Project Dashboard, then click "Configurar" -> opens BindingEditor
+        let (ox, oy) = rt
+            .find("open-proj-rb-erp")
+            .expect("open-proj-rb-erp exists");
+        rt.pointer_down(ox, oy);
+        rt.pointer_up(ox, oy);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-erp"));
+
         let (cx, cy) = rt
             .find("cfg-binding-rb-erp")
             .expect("cfg-binding-rb-erp exists");
@@ -2098,6 +2106,7 @@ mod tests {
     fn runs_generate_workflow_and_clear_history_work() {
         for vw in [360.0_f32, 768.0, 1440.0] {
             let mut state = AppState::init_demo();
+            state.selected_project_id = Some("rb-erp".into());
             if vw < 500.0 {
                 state.sidebar_collapsed = true;
             }
@@ -2107,8 +2116,9 @@ mod tests {
 
             let els = rt.elements();
             for key in [
+                "proj-back-all",
                 "gen-wf-binding-rb-erp",
-                "gen-wf-binding-rb-landing",
+                "cfg-binding-rb-erp",
                 "btn-clear-runs",
             ] {
                 let el = els
@@ -2135,9 +2145,11 @@ mod tests {
         rt_new.frame(0.0);
         assert!(rt_new.find("bind-gen-wf").is_none());
 
-        // Demo actions in Runs view
+        // Demo actions in Runs Project Dashboard view
+        let mut demo_state = AppState::init_demo();
+        demo_state.selected_project_id = Some("rb-erp".into());
         let mut rt = Runtime::new(
-            AppState::init_demo(),
+            demo_state,
             ui::view,
             (1280.0, 820.0),
             Env::new(true, 1.0),
@@ -2297,5 +2309,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sidebar_projects_dashboard_kpis_resync_and_live_substeps_work() {
+        use workploy::model::{StepRun, StepStatus};
+
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            state.selected_project_id = Some("rb-erp".into());
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+            let els = rt.elements();
+            for key in [
+                "project-dashboard-hdr",
+                "proj-kpi-grid",
+                "proj-kpi-where",
+                "proj-kpi-resources",
+                "proj-kpi-avg-dur",
+                "proj-kpi-success",
+                "proj-workflows-section",
+            ] {
+                let el = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("expected {key} at {vw}px"));
+                assert!(
+                    el.rect[0] + el.rect[2] <= vw + 0.5,
+                    "{key} overflowed {vw}px: {:?}",
+                    el.rect
+                );
+            }
+        }
+
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // 1. Sidebar PROJETOS section and sub-workflows exist (<= 4 projects expands all)
+        assert!(rt.find("hdr-projs").is_some());
+        assert!(rt.find("nav-proj-rb-erp").is_some());
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_some());
+        assert!(rt.find("nav-proj-rb-landing").is_some());
+        assert!(rt.find("nav-proj-wf-rb-landing-wf-ci-principal").is_some());
+        assert!(rt.find("nav-proj-wf-rb-landing-wf-deploy-vps").is_some());
+
+        // Click project rb-erp in sidebar -> opens Project Dashboard
+        let (px, py) = rt.find("nav-proj-rb-erp").expect("nav-proj-rb-erp exists");
+        rt.pointer_down(px, py);
+        rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-erp"));
+        assert_eq!(rt.state.selected_workflow_id, None);
+        assert_eq!(rt.state.nav, NavTarget::Runs);
+
+        // Verify Project Dashboard header, 4 KPIs, project workflows, and filtered runs
+        for key in [
+            "project-dashboard-hdr",
+            "proj-back-all",
+            "proj-kpi-grid",
+            "proj-kpi-where",
+            "proj-kpi-resources",
+            "proj-kpi-avg-dur",
+            "proj-kpi-success",
+            "proj-workflows-section",
+            "proj-wf-card-wf-deploy-vps",
+            "run-row-run-demo-approval-1",
+            "run-row-run-demo-deploy-37",
+        ] {
+            assert!(rt.find(key).is_some(), "expected {key} in project dashboard");
+        }
+        // Runs belonging to other repos must be filtered out
+        assert!(rt.find("run-row-run-demo-featured").is_none());
+
+        // Click sub-workflow under rb-landing in sidebar -> opens workflow view
+        let (wx, wy) = rt
+            .find("nav-proj-wf-rb-landing-wf-ci-principal")
+            .expect("nav-proj-wf-rb-landing-wf-ci-principal exists");
+        rt.pointer_down(wx, wy);
+        rt.pointer_up(wx, wy);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-landing"));
+        assert_eq!(
+            rt.state.selected_workflow_id.as_deref(),
+            Some("wf-ci-principal")
+        );
+        assert!(rt.find("wf-pipeline-summary").is_some());
+
+        // Click project rb-landing in sidebar -> returns to rb-landing Project Dashboard
+        let (lx, ly) = rt
+            .find("nav-proj-rb-landing")
+            .expect("nav-proj-rb-landing exists");
+        rt.pointer_down(lx, ly);
+        rt.pointer_up(lx, ly);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-landing"));
+        assert_eq!(rt.state.selected_workflow_id, None);
+        assert!(rt.find("proj-kpi-grid").is_some());
+
+        // Click "← Todos os projetos" -> returns to overview
+        let (bx, by) = rt.find("proj-back-all").expect("proj-back-all exists");
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected_project_id, None);
+        assert!(rt.find("projects-section").is_some());
+
+        // 2. Settings GitHub tab shows "Re-sincronizar" with auto-sync tooltip
+        rt.update(|s, _| s.open_settings(SettingsTab::GitHub));
+        rt.frame(1.0 / 60.0);
+        let els_set = rt.elements();
+        let sync_btn = els_set
+            .iter()
+            .find(|e| e.key.as_deref() == Some("btn-sync-bind-rb-erp"))
+            .expect("btn-sync-bind-rb-erp exists");
+        assert_eq!(sync_btn.label.as_deref(), Some("Re-sincronizar"));
+        assert!(
+            sync_btn
+                .help
+                .as_deref()
+                .is_some_and(|h| h.contains("sincroniza automaticamente")),
+            "expected auto-sync tooltip on btn-sync-bind-rb-erp"
+        );
+
+        // 3. Detail logs view with active run keeps Running substep expanded and formats ::workploy-substep::
+        let mut live_state = AppState::init_demo();
+        if let Some(run) = live_state
+            .snapshot
+            .runs
+            .iter_mut()
+            .find(|r| r.id == "run-demo-running")
+        {
+            run.steps[1].substeps = vec![
+                StepRun {
+                    name: "Preparar checkout".into(),
+                    status: StepStatus::Success,
+                    log: "git checkout feat/pix-recibo".into(),
+                    secs: 3.0,
+                    substeps: Vec::new(),
+                    started_ts: None,
+                },
+                StepRun {
+                    name: "Executar gitleaks".into(),
+                    status: StepStatus::Running,
+                    log: "::workploy-substep::Varredura profunda\nAnalisando 418 commits...".into(),
+                    secs: 11.0,
+                    substeps: Vec::new(),
+                    started_ts: None,
+                },
+            ];
+        }
+        live_state.open_run_logs("run-demo-running", 1);
+        live_state.collapsed_steps.insert("sub-1-1".into());
+        let mut rt_logs = Runtime::new(live_state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt_logs.frame(0.0);
+        rt_logs.frame(1.0 / 60.0);
+
+        let els_logs = rt_logs.elements();
+        assert!(
+            els_logs
+                .iter()
+                .any(|e| e.text.as_deref() == Some("▸ Varredura profunda")),
+            "expected ::workploy-substep:: line rendered as '▸ Varredura profunda' while active substep stays open"
+        );
     }
 }

@@ -10,7 +10,7 @@ use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{AppState, ModalState, SettingsTab, StatusFilter, platform_compat_warning};
 use crate::ui::components::{
     btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card, pill_badge,
-    primary_button, run_status_icon, status_pill,
+    primary_button, run_status_icon, status_pill, surface_card,
 };
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -23,7 +23,19 @@ pub fn view(
     main_w: f32,
     layer: &mut Vec<El>,
 ) -> El {
+    let wf_filter = wf_filter.or(s.selected_workflow_id.as_deref());
     let wf = wf_filter.and_then(|id| s.snapshot.workflows.iter().find(|w| w.id == id));
+    let selected_project = if wf.is_none() {
+        s.selected_project_id.as_deref().and_then(|pid| {
+            s.snapshot
+                .settings
+                .repo_bindings
+                .iter()
+                .find(|b| b.id == pid)
+        })
+    } else {
+        None
+    };
 
     let wf_word = if s.snapshot.workflows.len() == 1 {
         "receita configurada"
@@ -182,7 +194,14 @@ pub fn view(
     let mut branches_set = BTreeSet::new();
     let mut actors_set = BTreeSet::new();
     for r in &s.snapshot.runs {
-        if wf_filter.is_none_or(|id| r.workflow_id == id) {
+        let proj_ok = selected_project.is_none_or(|b| {
+            let repo_trim = b.full_name.trim();
+            r.repo_name
+                .as_deref()
+                .is_some_and(|rn| rn == b.full_name.as_str() || rn.eq_ignore_ascii_case(repo_trim))
+                || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+        });
+        if wf_filter.is_none_or(|id| r.workflow_id == id) && proj_ok {
             if !r.trigger_label.is_empty() {
                 events_set.insert(r.trigger_label.clone());
             }
@@ -392,6 +411,14 @@ pub fn view(
         .runs
         .iter()
         .filter(|r| wf_filter.is_none_or(|id| r.workflow_id == id))
+        .filter(|r| {
+            selected_project.is_none_or(|b| {
+                let repo_trim = b.full_name.trim();
+                r.repo_name.as_deref().is_some_and(|rn| {
+                    rn == b.full_name.as_str() || rn.eq_ignore_ascii_case(repo_trim)
+                }) || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+            })
+        })
         .filter(|r| s.filter_status.matches(r.status))
         .filter(|r| {
             s.filter_event
@@ -475,6 +502,12 @@ pub fn view(
         stack
     };
 
+    let top_hdr = if let Some(b) = selected_project {
+        project_dashboard_header(s, t, b)
+    } else {
+        hdr_card
+    };
+
     let mut page = col()
         .key("runs-page")
         .w_full()
@@ -485,7 +518,7 @@ pub fn view(
         .pb(16.0)
         .gap(14.0)
         .transition(Transition::opacity())
-        .child(hdr_card);
+        .child(top_hdr);
 
     if let Some(w) = wf {
         page = page.child(workflow_pipeline_summary(s, t, w));
@@ -499,6 +532,36 @@ pub fn view(
                 .scroll_edge_fade(16.0)
                 .pb(16.0)
                 .child(list_body),
+        );
+    }
+
+    if let Some(b) = selected_project {
+        return page.child(
+            col()
+                .key("runs-scroll")
+                .grow(1.0)
+                .min_h(0.0)
+                .w_full()
+                .scroll(ScrollSpec { stick_bottom: false })
+                .scroll_edge_fade(16.0)
+                .gap(16.0)
+                .pb(16.0)
+                .child(project_kpi_strip(s, t, b, main_w))
+                .child(project_workflows_section(s, t, b))
+                .child(
+                    col()
+                        .key("runs-history-section")
+                        .w_full()
+                        .min_w(0.0)
+                        .gap(10.0)
+                        .child(
+                            text("Histórico de execuções")
+                                .font(ty::SMALL_MED)
+                                .color(t.text_secondary),
+                        )
+                        .child(filter_bar)
+                        .child(list_body),
+                ),
         );
     }
 
@@ -834,10 +897,9 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
         text(hint).font(ty::CAPTION).color(t.text_muted).truncate()
     };
 
+    let bid_open = b.id.clone();
     let bid_run = b.id.clone();
-    let bid_cfg = b.id.clone();
     let bid_commits = b.id.clone();
-    let bid_gen = b.id.clone();
 
     let mut badges_row = row()
         .w_full()
@@ -954,15 +1016,18 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
         .center_y()
         .flex_wrap()
         .child(
-            btn_ghost(
+            btn_neutral(
                 t,
-                format!("cfg-binding-{}", b.id),
-                "Configurar",
-                Some(&icons::SLIDERS),
+                format!("open-proj-{}", b.id),
+                "Abrir projeto",
+                Some(&icons::CHEVRON_RIGHT),
                 28.0,
-                move |s: &mut AppState, _| s.open_edit_binding_modal(&bid_cfg),
+                move |s: &mut AppState, _| {
+                    s.selected_project_id = Some(bid_open.clone());
+                    s.selected_workflow_id = None;
+                },
             )
-            .help("Abre as configurações deste vínculo (branch, destino, modo e receita)."),
+            .help("Abre o dashboard deste projeto com KPIs, fluxos vinculados e histórico filtrado."),
         )
         .child(
             btn_neutral(
@@ -976,19 +1041,6 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
                 },
             )
             .help("Lista os últimos commits da branch e permite disparar o fluxo para um commit específico."),
-        )
-        .child(
-            btn_neutral(
-                t,
-                format!("gen-wf-binding-{}", b.id),
-                "Gerar receita",
-                Some(&icons::BOLT),
-                28.0,
-                move |s: &mut AppState, tx: &mut Tx| {
-                    s.generate_workflow_for_binding(&bid_gen, tx);
-                },
-            )
-            .help("Lê package.json, Cargo.toml e docker-compose.yml no GitHub para criar passos reais de testes e redeploy automático."),
         )
         .child(
             primary_button(
@@ -1025,6 +1077,567 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
             )
             .child(actions_row),
     )
+}
+
+fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
+    let repo_trim = b.full_name.trim();
+    let repo_matches = |r: &Run| -> bool {
+        r.repo_name
+            .as_deref()
+            .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
+            || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+    };
+    let running_run = s
+        .snapshot
+        .runs
+        .iter()
+        .find(|r| repo_matches(r) && matches!(r.status, RunStatus::Queued | RunStatus::Running));
+    let approval_run = if running_run.is_none() {
+        s.snapshot
+            .runs
+            .iter()
+            .find(|r| repo_matches(r) && r.status == RunStatus::AwaitingApproval)
+    } else {
+        None
+    };
+
+    let status_badge = if running_run.is_some() {
+        let pulse_dot = el()
+            .size(8.0, 8.0)
+            .center()
+            .child(
+                effect(MARK_PULSE_RADAR)
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .radius(4.0)
+                    .effect_bleed(7.0)
+                    .effect_data([4.0, 7.0, 1.8, 0.7]),
+            )
+            .child(el().size(7.0, 7.0).radius(3.5).fill(t.info));
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(6.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.info_bg)
+            .border(1.0, t.info.alpha(0.32))
+            .child(pulse_dot)
+            .child(text("Rodando").font(ty::CAPTION).color(t.info))
+    } else if approval_run.is_some() {
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(5.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.warning_bg)
+            .border(1.0, t.warning.alpha(0.38))
+            .child(icon(&icons::BOLT, 11.5).color(t.warning))
+            .child(
+                text("Aguardando aprovação")
+                    .font(ty::CAPTION)
+                    .color(t.warning),
+            )
+    } else {
+        row()
+            .key(format!("project-status-{}", b.id))
+            .h(22.0)
+            .px(8.0)
+            .gap(6.0)
+            .center_y()
+            .radius(11.0)
+            .fill(t.success_bg)
+            .border(1.0, t.success.alpha(0.28))
+            .child(el().size(6.0, 6.0).radius(3.0).fill(t.success))
+            .child(
+                text("Em standby · aguardando push")
+                    .font(ty::CAPTION)
+                    .color(t.success),
+            )
+    };
+
+    let branch_label = if b.branch.trim().is_empty() {
+        "main"
+    } else {
+        b.branch.trim()
+    };
+
+    let bid_commits = b.id.clone();
+    let bid_gen = b.id.clone();
+    let bid_cfg = b.id.clone();
+    let bid_run = b.id.clone();
+
+    let header_actions = row()
+        .min_w(0.0)
+        .shrink()
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .child(
+            btn_neutral(
+                t,
+                "proj-back-all",
+                "← Todos os projetos",
+                Some(&icons::ARROW_LEFT),
+                32.0,
+                |s: &mut AppState, _| {
+                    s.selected_project_id = None;
+                    s.selected_workflow_id = None;
+                },
+            )
+            .help("Volta para a visão geral com todos os projetos e execuções."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("commits-binding-{}", b.id),
+                "Ver commits",
+                Some(&icons::COMMIT),
+                32.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.open_repo_commits_modal(&bid_commits, tx);
+                },
+            )
+            .help("Lista os últimos commits da branch e permite disparar o fluxo para um commit específico."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("gen-wf-binding-{}", b.id),
+                "Gerar receita",
+                Some(&icons::BOLT),
+                32.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.generate_workflow_for_binding(&bid_gen, tx);
+                },
+            )
+            .help("Lê package.json, Cargo.toml e docker-compose.yml no GitHub para criar passos reais de testes e redeploy automático."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("cfg-binding-{}", b.id),
+                "Configurar",
+                Some(&icons::SLIDERS),
+                32.0,
+                move |s: &mut AppState, _| s.open_edit_binding_modal(&bid_cfg),
+            )
+            .help("Abre as configurações deste vínculo (branch, destino, modo e receita)."),
+        )
+        .child(
+            primary_button(
+                t,
+                format!("run-binding-{}", b.id),
+                "Executar agora",
+                Some(&icons::PLAY),
+                32.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.run_binding_now(&bid_run, tx);
+                },
+            )
+            .help("Dispara imediatamente uma execução para este projeto usando a receita e o destino configurados."),
+        );
+
+    let title_row = row()
+        .w_full()
+        .min_w(0.0)
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .child(icon(&icons::BRANCH, 16.0).color(t.accent).a11y_hidden())
+        .child(
+            text(b.full_name.clone())
+                .font(ty::H1)
+                .color(t.text_primary)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(
+            row()
+                .h(22.0)
+                .px(8.0)
+                .center_y()
+                .radius(5.0)
+                .fill(t.surface_2)
+                .child(
+                    text(branch_label.to_string())
+                        .font(ty::MONO_SM)
+                        .color(t.text_secondary),
+                ),
+        )
+        .child(
+            pill_badge(t, b.platform.label(), t.text_secondary, t.surface_2)
+                .key(format!("project-platform-{}", b.id)),
+        )
+        .child(status_badge);
+
+    let mut inner = col()
+        .px(20.0)
+        .py(16.0)
+        .gap(12.0)
+        .child(
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(16.0)
+                .center_y()
+                .justify_between()
+                .flex_wrap()
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(170.0)
+                        .gap(4.0)
+                        .child(title_row),
+                )
+                .child(header_actions),
+        );
+
+    if let Some(warn_msg) = platform_compat_warning(b.platform, b.target_server_id.as_deref()) {
+        inner = inner.child(
+            row()
+                .key(format!("project-platform-warn-{}", b.id))
+                .w_full()
+                .min_w(0.0)
+                .px(10.0)
+                .py(7.0)
+                .gap(7.0)
+                .center_y()
+                .radius(7.0)
+                .fill(t.warning_bg)
+                .border(1.0, t.warning.alpha(0.38))
+                .child(icon(&icons::BOLT, 13.0).color(t.warning).a11y_hidden())
+                .child(
+                    text(warn_msg)
+                        .font(ty::CAPTION)
+                        .color(t.warning)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .wrap(),
+                ),
+        );
+    }
+
+    header_card(t, "project-dashboard-hdr", 10.0, inner)
+}
+
+fn project_kpi_card(
+    t: UiTheme,
+    key: &str,
+    label: &str,
+    value: String,
+    subtext: String,
+    accent_color: rune::color::Color,
+) -> El {
+    surface_card(
+        t,
+        key,
+        10.0,
+        col()
+            .px(14.0)
+            .py(12.0)
+            .gap(6.0)
+            .justify_between()
+            .child(
+                text(label.to_string())
+                    .font(ty::EYEBROW)
+                    .color(t.text_muted)
+                    .truncate(),
+            )
+            .child(
+                text(value)
+                    .font(ty::H3)
+                    .color(accent_color)
+                    .wrap(),
+            )
+            .child(
+                text(subtext)
+                    .font(ty::CAPTION)
+                    .color(t.text_muted)
+                    .wrap(),
+            ),
+    )
+}
+
+fn project_kpi_strip(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
+    let (total_runs, success_pct, avg_secs, estimated_resources_label) =
+        model::compute_project_kpis(&s.snapshot.runs, &b.full_name, b.platform);
+
+    let where_val = s.server_label(b.target_server_id.as_deref());
+    let mode_label = match b.trigger_mode {
+        TriggerMode::WebhookOnVps => "Webhook 24/7",
+        TriggerMode::PollOnVps => "Sondagem 24/7",
+        TriggerMode::PollOnDesktop => "Desktop",
+    };
+    let where_sub = b
+        .target_server_id
+        .as_deref()
+        .and_then(|sid| s.snapshot.settings.servers.iter().find(|srv| srv.id == sid))
+        .and_then(|srv| srv.last_probe.as_ref())
+        .filter(|p| p.vcpus > 0 && p.ram_total_mb > 0)
+        .map(|p| {
+            let ram_gb = (p.ram_total_mb as f64 / 1024.0).round() as u64;
+            format!("{mode_label} · {} vCPU · {ram_gb} GB RAM", p.vcpus)
+        })
+        .unwrap_or_else(|| mode_label.to_string());
+
+    let avg_val = if total_runs > 0 {
+        model::fmt_dur(avg_secs)
+    } else {
+        "—".to_string()
+    };
+
+    let success_val = format!("{success_pct}%");
+    let success_sub = format!("{total_runs} execuções deste projeto");
+    let success_col = if total_runs == 0 {
+        t.text_primary
+    } else if success_pct >= 80 {
+        t.success
+    } else if success_pct >= 50 {
+        t.warning
+    } else {
+        t.danger
+    };
+
+    let cards = vec![
+        project_kpi_card(
+            t,
+            "proj-kpi-where",
+            "ONDE RODA",
+            where_val,
+            where_sub,
+            t.text_primary,
+        ),
+        project_kpi_card(
+            t,
+            "proj-kpi-resources",
+            "REQUISITOS ESTIMADOS",
+            estimated_resources_label.to_string(),
+            b.platform.label().to_string(),
+            t.text_primary,
+        ),
+        project_kpi_card(
+            t,
+            "proj-kpi-avg-dur",
+            "TEMPO MÉDIO",
+            avg_val,
+            "Média das execuções concluídas".to_string(),
+            t.text_primary,
+        ),
+        project_kpi_card(
+            t,
+            "proj-kpi-success",
+            "TAXA DE SUCESSO",
+            success_val,
+            success_sub,
+            success_col,
+        ),
+    ];
+
+    if main_w >= 860.0 {
+        let mut r = row().key("proj-kpi-grid").w_full().min_w(0.0).gap(10.0).items_stretch();
+        for c in cards {
+            r = r.child(c.grow(1.0).shrink().min_w(0.0));
+        }
+        r
+    } else if main_w >= 520.0 {
+        let mut grid = col().key("proj-kpi-grid").w_full().min_w(0.0).gap(10.0);
+        for chunk in cards.chunks(2) {
+            let mut r = row().w_full().min_w(0.0).gap(10.0).items_stretch();
+            for c in chunk {
+                r = r.child(c.clone().grow(1.0).shrink().min_w(0.0));
+            }
+            grid = grid.child(r);
+        }
+        grid
+    } else {
+        let mut stack = col().key("proj-kpi-grid").w_full().min_w(0.0).gap(10.0);
+        for c in cards {
+            stack = stack.child(c.w_full().min_w(0.0));
+        }
+        stack
+    }
+}
+
+fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
+    let workflows = s.project_workflows(b);
+    let mut list = col().w_full().min_w(0.0).gap(8.0);
+
+    if workflows.is_empty() {
+        let bid_gen = b.id.clone();
+        list = list.child(
+            row()
+                .key("proj-workflows-empty")
+                .w_full()
+                .min_w(0.0)
+                .px(14.0)
+                .py(12.0)
+                .gap(10.0)
+                .center_y()
+                .justify_between()
+                .flex_wrap()
+                .radius(10.0)
+                .fill(t.surface_1)
+                .border(1.0, t.border_subtle)
+                .child(
+                    text("Nenhum fluxo vinculado a este projeto.")
+                        .font(ty::SMALL)
+                        .color(t.text_muted),
+                )
+                .child(
+                    btn_neutral(
+                        t,
+                        format!("proj-empty-gen-wf-{}", b.id),
+                        "Gerar receita",
+                        Some(&icons::BOLT),
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.generate_workflow_for_binding(&bid_gen, tx);
+                        },
+                    )
+                    .help("Gera automaticamente uma receita a partir dos arquivos do repositório."),
+                ),
+        );
+    } else {
+        for wf in workflows {
+            let step_count = wf.steps.len();
+            let step_word = if step_count == 1 { "passo" } else { "passos" };
+            let wid_open = wf.id.clone();
+            let wid_edit = wf.id.clone();
+            let wid_run = wf.id.clone();
+            let bid_open = b.id.clone();
+
+            let mut badges = row()
+                .min_w(0.0)
+                .shrink()
+                .gap(6.0)
+                .center_y()
+                .flex_wrap()
+                .child(pill_badge(
+                    t,
+                    &format!("{step_count} {step_word}"),
+                    t.accent,
+                    t.accent_soft,
+                ))
+                .child(pill_badge(
+                    t,
+                    &format!("Gatilho: {}", wf.trigger.label()),
+                    t.text_secondary,
+                    t.surface_2,
+                ));
+            if let Some(next_id) = &wf.on_success {
+                let next_name = s
+                    .snapshot
+                    .workflows
+                    .iter()
+                    .find(|nw| &nw.id == next_id)
+                    .map(|nw| nw.name.as_str())
+                    .unwrap_or(next_id.as_str());
+                badges = badges.child(pill_badge(
+                    t,
+                    &format!("Encadeado → {next_name}"),
+                    t.accent,
+                    t.accent_soft,
+                ));
+            }
+
+            let actions = row()
+                .min_w(0.0)
+                .shrink()
+                .gap(6.0)
+                .center_y()
+                .flex_wrap()
+                .child(
+                    btn_ghost(
+                        t,
+                        format!("proj-wf-open-{}", wf.id),
+                        "Ver fluxo",
+                        Some(&icons::CHEVRON_RIGHT),
+                        28.0,
+                        move |s: &mut AppState, _| {
+                            s.selected_project_id = Some(bid_open.clone());
+                            s.selected_workflow_id = Some(wid_open.clone());
+                        },
+                    )
+                    .help("Abre a visão detalhada e o pipeline desta receita de fluxo."),
+                )
+                .child(
+                    btn_neutral(
+                        t,
+                        format!("proj-wf-edit-{}", wf.id),
+                        "Editar fluxo",
+                        Some(&icons::EDIT),
+                        28.0,
+                        move |s: &mut AppState, _| s.open_edit_workflow_modal(&wid_edit),
+                    )
+                    .help("Edita os passos, gatilho e encadeamento deste fluxo."),
+                )
+                .child(
+                    primary_button(
+                        t,
+                        format!("proj-wf-run-{}", wf.id),
+                        "Executar",
+                        Some(&icons::PLAY),
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| s.start_workflow(&wid_run, "manual", tx),
+                    )
+                    .help("Dispara imediatamente uma execução manual deste fluxo."),
+                );
+
+            list = list.child(
+                row()
+                    .key(format!("proj-wf-card-{}", wf.id))
+                    .w_full()
+                    .min_w(0.0)
+                    .px(14.0)
+                    .py(10.0)
+                    .gap(10.0)
+                    .center_y()
+                    .justify_between()
+                    .flex_wrap()
+                    .radius(10.0)
+                    .fill(t.surface_1)
+                    .border(1.0, t.border_subtle)
+                    .child(
+                        row()
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(160.0)
+                            .gap(10.0)
+                            .center_y()
+                            .flex_wrap()
+                            .child(icon(&icons::PLAY, 13.0).color(t.accent).a11y_hidden())
+                            .child(
+                                text(wf.name.clone())
+                                    .font(ty::BODY_MED)
+                                    .color(t.text_primary)
+                                    .shrink()
+                                    .min_w(0.0)
+                                    .truncate(),
+                            )
+                            .child(badges),
+                    )
+                    .child(actions),
+            );
+        }
+    }
+
+    col()
+        .key("proj-workflows-section")
+        .w_full()
+        .min_w(0.0)
+        .gap(8.0)
+        .child(
+            text("Fluxos deste projeto")
+                .font(ty::SMALL_MED)
+                .color(t.text_secondary),
+        )
+        .child(list)
 }
 
 fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> El {
@@ -1123,11 +1736,7 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         .settings
         .repo_bindings
         .iter()
-        .filter(|b| {
-            workploy::engine::matching_workflows_for_binding(&s.snapshot.workflows, b)
-                .iter()
-                .any(|wid| wid == &w.id)
-        })
+        .filter(|b| s.project_workflows(b).iter().any(|wf| wf.id == w.id))
         .collect();
 
     let mut triggers_row = row().w_full().min_w(0.0).gap(6.0).center_y().flex_wrap().child(

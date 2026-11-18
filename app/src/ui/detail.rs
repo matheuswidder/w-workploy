@@ -1099,6 +1099,8 @@ fn logs_view(s: &AppState, t: UiTheme, k: &Kit, run: &Run, job_idx: usize) -> El
     let query = s.log_search.text.trim().to_lowercase();
     let mut steps_col = col().w_full().gap(10.0).pb(16.0);
 
+    let run_active = run.status.active();
+
     if job.substeps.is_empty() {
         let key = format!("step-{idx}");
         steps_col = steps_col.child(collapsible_step_log(
@@ -1107,11 +1109,19 @@ fn logs_view(s: &AppState, t: UiTheme, k: &Kit, run: &Run, job_idx: usize) -> El
             &key,
             job,
             &query,
+            run_active,
         ));
     } else {
         for (si, sub) in job.substeps.iter().enumerate() {
             let key = format!("sub-{idx}-{si}");
-            steps_col = steps_col.child(collapsible_step_log(s, t, &key, sub, &query));
+            steps_col = steps_col.child(collapsible_step_log(
+                s,
+                t,
+                &key,
+                sub,
+                &query,
+                run_active,
+            ));
         }
     }
 
@@ -1160,7 +1170,9 @@ fn logs_view(s: &AppState, t: UiTheme, k: &Kit, run: &Run, job_idx: usize) -> El
                 .grow(1.0)
                 .min_h(0.0)
                 .w_full()
-                .scroll(ScrollSpec { stick_bottom: false })
+                .scroll(ScrollSpec {
+                    stick_bottom: run_active,
+                })
                 .scroll_edge_fade(16.0)
                 .child(steps_col),
         )
@@ -1172,8 +1184,10 @@ fn collapsible_step_log(
     step_key: &str,
     step: &StepRun,
     query: &str,
+    run_active: bool,
 ) -> El {
-    let collapsed = s.collapsed_steps.contains(step_key);
+    let force_open = run_active && step.status == StepStatus::Running;
+    let collapsed = !force_open && s.collapsed_steps.contains(step_key);
     let key_toggle = step_key.to_string();
 
     let header = row()
@@ -1248,7 +1262,27 @@ fn collapsible_step_log(
         };
         let mut shown = 0usize;
         for (ln, line) in raw.lines().enumerate() {
-            if !query.is_empty() && !line.to_lowercase().contains(query) {
+            let trimmed_marker = line.trim().trim_matches('"');
+            let substep_name = trimmed_marker
+                .strip_prefix("::workploy-substep::")
+                .map(str::trim);
+            let display_line = if let Some(sub_name) = substep_name {
+                format!(
+                    "▸ {}",
+                    if sub_name.is_empty() {
+                        "Sub-etapa"
+                    } else {
+                        sub_name
+                    }
+                )
+            } else {
+                line.to_string()
+            };
+
+            if !query.is_empty()
+                && !line.to_lowercase().contains(query)
+                && !display_line.to_lowercase().contains(query)
+            {
                 continue;
             }
             shown += 1;
@@ -1260,7 +1294,9 @@ fn collapsible_step_log(
                 || line.contains("PASS")
                 || line.contains("200 OK")
                 || line.contains("aprovado");
-            let line_col = if is_err {
+            let line_col = if substep_name.is_some() {
+                t.accent
+            } else if is_err {
                 rune::color::hex("#fca5a5").unwrap_or(t.danger)
             } else if is_ok {
                 rune::color::hex("#6ee7b7").unwrap_or(t.success)
@@ -1277,7 +1313,11 @@ fn collapsible_step_log(
                         .align(rune::Align::End),
                 );
             }
-            let mut txt = text(line.to_string()).font(ty::MONO).color(line_col).grow(1.0).shrink();
+            let mut txt = text(display_line)
+                .font(ty::MONO)
+                .color(line_col)
+                .grow(1.0)
+                .shrink();
             if s.log_wrap_lines {
                 txt = txt.wrap();
             } else {
