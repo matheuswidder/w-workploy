@@ -1,0 +1,41 @@
+# Rust / Cargo build outputs
+target/
+app/target/
+installer/target/
+**/target/
+
+# Distribuição (instaladores e ZIPs vão apenas nos GitHub Releases)
+dist/
+
+# Dados locais, logs, diagnósticos e capturas
+data/
+*.log
+checks/
+capture/
+inbox/
+pinned/
+investigation.cany/
+usage.json
+feed.json
+craft.json
+Usersteco_*
+app/build.err
+app/build.out
+app/shots/
+app/*=shots/
+
+# Chaves, segredos e variáveis de ambiente
+*.ed25519
+*.pem
+*.key
+.env
+.env.*
+
+# Arquivos temporários de sistema e IDE
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.tmp
