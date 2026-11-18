@@ -1608,11 +1608,10 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
                         .gap(12.0)
                         .center_y()
                         .child(
-                            el().size(40.0, 40.0)
-                                .radius(10.0)
-                                .fill(t.primary_bg)
-                                .center()
-                                .child(icon(&icons::BOLT, 20.0).color(t.primary_fg)),
+                            el().pixels(icons::brand_icon_for_theme(s.dark))
+                                .w(42.0)
+                                .h(42.0)
+                                .radius(10.0),
                         )
                         .child(
                             col()
@@ -1668,11 +1667,17 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
                                 Some(&icons::REFRESH),
                                 32.0,
                                 |s: &mut AppState, tx: &mut Tx| {
-                                    if !s.snapshot.update_checking {
+                                    if !s.snapshot.update_checking && !s.snapshot.update_downloading {
                                         s.check_for_updates(tx);
                                     }
                                 },
                             )
+                            .disabled(s.snapshot.update_checking || s.snapshot.update_downloading)
+                            .opacity(if s.snapshot.update_checking || s.snapshot.update_downloading {
+                                0.65
+                            } else {
+                                1.0
+                            })
                             .help("Consulta as releases oficiais no GitHub para verificar se há versão mais nova."),
                         ),
                 ),
@@ -1782,14 +1787,78 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
         } else {
             rel.html_url.clone()
         };
+        let github_url = if !rel.html_url.trim().is_empty() {
+            rel.html_url.clone()
+        } else {
+            open_url.clone()
+        };
         let pub_br = format_release_date_br(&rel.published_at);
+
+        let action_area = if rel.has_update {
+            let mut acts = row().gap(8.0).center_y().flex_wrap();
+            if s.snapshot.update_downloading {
+                acts = acts.child(
+                    primary_button(
+                        t,
+                        "btn-update-install",
+                        "Baixando atualização...",
+                        Some(&icons::REFRESH),
+                        30.0,
+                        |_: &mut AppState, _| {},
+                    )
+                    .disabled(true)
+                    .opacity(0.6)
+                    .cursor(Cursor::Default)
+                    .help("Download em andamento. O Workploy será atualizado e reiniciado ao concluir."),
+                );
+            } else {
+                acts = acts.child(
+                    primary_button(
+                        t,
+                        "btn-update-install",
+                        format!("Baixar e instalar v{} agora", rel.version),
+                        Some(&icons::BOLT),
+                        30.0,
+                        |s: &mut AppState, tx: &mut Tx| s.install_latest_update(tx),
+                    )
+                    .help("Baixa o instalador oficial, aplica a atualização silenciosamente e reinicia o Workploy."),
+                );
+            }
+            if !github_url.is_empty() {
+                let url_for_btn = github_url.clone();
+                acts = acts.child(
+                    btn_ghost(
+                        t,
+                        "btn-update-open",
+                        "Ver no GitHub",
+                        Some(&icons::EXTERNAL_LINK),
+                        30.0,
+                        move |_: &mut AppState, _| AppState::open_external_url(&url_for_btn),
+                    )
+                    .help("Abre a página desta release no GitHub no navegador."),
+                );
+            }
+            acts
+        } else if !open_url.is_empty() {
+            btn_neutral(
+                t,
+                "btn-open-release",
+                "Abrir release no GitHub",
+                Some(&icons::EXTERNAL_LINK),
+                30.0,
+                move |_: &mut AppState, _| AppState::open_external_url(&open_url),
+            )
+            .help("Abre a página da release no navegador padrão.")
+        } else {
+            el()
+        };
 
         let mut rel_col = col()
             .key("about-latest-release")
             .w_full()
             .px(14.0)
             .py(12.0)
-            .gap(8.0)
+            .gap(10.0)
             .radius(10.0)
             .fill(t.surface_2)
             .border(
@@ -1811,6 +1880,7 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
                         row()
                             .gap(8.0)
                             .center_y()
+                            .flex_wrap()
                             .child(
                                 text(format!("Última release: {}", rel.tag_name))
                                     .font(ty::BODY_MED)
@@ -1824,24 +1894,48 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
                                 el()
                             }),
                     )
-                    .child(if !open_url.is_empty() {
-                        btn_neutral(
-                            t,
-                            "btn-open-release",
-                            if rel.has_update {
-                                "Baixar instalador / Abrir release"
-                            } else {
-                                "Abrir release no GitHub"
-                            },
-                            Some(&icons::EXTERNAL_LINK),
-                            30.0,
-                            move |_: &mut AppState, _| AppState::open_external_url(&open_url),
-                        )
-                        .help("Abre o instalador ou a página da release no navegador padrão.")
-                    } else {
-                        el()
-                    }),
+                    .child(action_area),
             );
+
+        if rel.has_update && s.snapshot.update_downloading {
+            let frac = s.snapshot.update_progress.clamp(0.0, 1.0);
+            let pct = frac * 100.0;
+            let status_msg = if s.snapshot.update_status.trim().is_empty() {
+                format!("Baixando Workploy v{}...", rel.version)
+            } else {
+                s.snapshot.update_status.clone()
+            };
+            rel_col = rel_col.child(
+                col()
+                    .key("about-update-progress")
+                    .w_full()
+                    .gap(6.0)
+                    .child(
+                        row()
+                            .role("progressbar")
+                            .label("Progresso do download da atualização")
+                            .w_full()
+                            .h(8.0)
+                            .radius(999.0)
+                            .fill(t.surface_1)
+                            .border(1.0, t.border_subtle)
+                            .clip_soft(0.0)
+                            .child(
+                                el().key("about-update-progress-fill")
+                                    .h_full()
+                                    .radius(999.0)
+                                    .fill(if frac >= 1.0 { t.success } else { t.accent })
+                                    .w_frac(frac.max(0.02)),
+                            ),
+                    )
+                    .child(
+                        text(format!("{pct:.0}% · {status_msg}"))
+                            .font(ty::CAPTION)
+                            .color(t.text_secondary)
+                            .wrap(),
+                    ),
+            );
+        }
 
         if !rel.notes.trim().is_empty() {
             rel_col = rel_col.child(

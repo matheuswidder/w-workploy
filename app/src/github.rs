@@ -4,6 +4,9 @@ use crate::vault;
 use crate::vps;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
 
 #[derive(Serialize)]
 struct RunnerConfigPayload {
@@ -945,6 +948,283 @@ pub fn check_for_updates(sh: &SharedHandle) {
     });
 }
 
+const MIN_INSTALLER_BYTES: u64 = 500 * 1024;
+const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const PROGRESS_NOTIFY_BYTES: u64 = 256 * 1024;
+
+pub fn sanitize_installer_version(version: &str) -> String {
+    let cleaned: String = version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if cleaned.is_empty() {
+        "latest".to_string()
+    } else {
+        cleaned
+    }
+}
+
+pub fn is_dev_target_dir(exe_dir: &Path) -> bool {
+    exe_dir.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("target"))
+    })
+}
+
+pub fn build_installer_args(current_exe: Option<&Path>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    if let Some(exe) = current_exe
+        && let Some(parent) = exe.parent()
+        && !parent.as_os_str().is_empty()
+        && !is_dev_target_dir(parent)
+    {
+        args.push("--dir".into());
+        args.push(parent.as_os_str().to_os_string());
+    }
+    args.push("--silent".into());
+    args.push("--launch".into());
+    args
+}
+
+pub fn validate_downloaded_installer(path: &Path) -> Result<u64, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("Não foi possível ler o instalador baixado: {e}"))?;
+    let len = meta.len();
+    if len <= MIN_INSTALLER_BYTES {
+        return Err(format!(
+            "Arquivo de atualização inválido ou incompleto ({} KB).",
+            len / 1024
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("Falha ao abrir instalador baixado: {e}"))?;
+        let mut magic = [0u8; 2];
+        file.read_exact(&mut magic)
+            .map_err(|e| format!("Falha ao validar cabeçalho do instalador: {e}"))?;
+        if &magic != b"MZ" {
+            return Err(
+                "O arquivo baixado não é um executável Windows válido (assinatura MZ ausente)."
+                    .into(),
+            );
+        }
+    }
+    Ok(len)
+}
+
+fn format_download_progress(version: &str, downloaded: u64, total_bytes: Option<u64>) -> (f32, String) {
+    let dl_mb = downloaded as f64 / (1024.0 * 1024.0);
+    if let Some(total) = total_bytes
+        && total > 0
+    {
+        let frac = (downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32;
+        let pct = (frac * 100.0).round() as u32;
+        let tot_mb = total as f64 / (1024.0 * 1024.0);
+        (
+            frac,
+            format!("Baixando Workploy v{version}... {pct}% ({dl_mb:.1} / {tot_mb:.1} MB)"),
+        )
+    } else {
+        (
+            0.0,
+            format!("Baixando Workploy v{version}... ({dl_mb:.1} MB)"),
+        )
+    }
+}
+
+fn finish_update_download_error(sh: &SharedHandle, msg: String) {
+    {
+        let mut s = sh.lock().unwrap();
+        s.update_downloading = false;
+        s.update_progress = 0.0;
+        s.update_status = msg.clone();
+        record_update_event(&mut s, false, msg);
+    }
+    engine::notify(sh);
+}
+
+pub fn download_installer_stream(
+    sh: &SharedHandle,
+    installer_url: &str,
+    version: &str,
+    dest_path: &Path,
+    token: Option<&str>,
+) -> Result<u64, String> {
+    let url = installer_url.trim();
+    if url.is_empty() {
+        return Err("URL do instalador não informada.".into());
+    }
+
+    let mut req = ureq::get(url).set("User-Agent", "workploy");
+    if let Some(tok) = token {
+        let trimmed = tok.trim();
+        if !trimmed.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {trimmed}"));
+        }
+    }
+
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::Status(code, _) => {
+            format!("Falha ao baixar atualização (HTTP {code}).")
+        }
+        ureq::Error::Transport(t) => {
+            format!("Falha de rede ao baixar atualização: {t}")
+        }
+    })?;
+
+    let total_bytes = resp
+        .header("Content-Length")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0);
+
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Falha ao criar pasta temporária: {e}"))?;
+    }
+
+    let part_path = dest_path.with_extension("exe.part");
+    let file = std::fs::File::create(&part_path)
+        .map_err(|e| format!("Falha ao criar arquivo temporário da atualização: {e}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK_BYTES];
+    let mut downloaded: u64 = 0;
+    let mut last_notified: u64 = 0;
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                drop(writer);
+                let _ = std::fs::remove_file(&part_path);
+                return Err(format!("Falha durante o download da atualização: {e}"));
+            }
+        };
+        if let Err(e) = writer.write_all(&buf[..n]) {
+            drop(writer);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(format!("Falha ao gravar instalador temporário: {e}"));
+        }
+        downloaded += n as u64;
+        if downloaded - last_notified >= PROGRESS_NOTIFY_BYTES {
+            last_notified = downloaded;
+            let (progress, status) = format_download_progress(version, downloaded, total_bytes);
+            {
+                let mut s = sh.lock().unwrap();
+                s.update_progress = progress;
+                s.update_status = status;
+            }
+            engine::notify(sh);
+        }
+    }
+
+    if let Err(e) = writer.flush() {
+        drop(writer);
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("Falha ao finalizar gravação do instalador: {e}"));
+    }
+    drop(writer);
+
+    if dest_path.exists() {
+        let _ = std::fs::remove_file(dest_path);
+    }
+    if let Err(e) = std::fs::rename(&part_path, dest_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("Falha ao preparar arquivo do instalador: {e}"));
+    }
+
+    match validate_downloaded_installer(dest_path) {
+        Ok(len) => {
+            {
+                let mut s = sh.lock().unwrap();
+                s.update_progress = 1.0;
+            }
+            engine::notify(sh);
+            Ok(len)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(dest_path);
+            Err(e)
+        }
+    }
+}
+
+pub fn download_and_install_update(sh: &SharedHandle, installer_url: String, version: String) {
+    {
+        let mut s = sh.lock().unwrap();
+        if s.update_downloading {
+            return;
+        }
+        s.update_downloading = true;
+        s.update_progress = 0.0;
+        s.update_status = format!("Baixando Workploy v{version}...");
+    }
+    engine::notify(sh);
+
+    let sh2 = sh.clone();
+    std::thread::spawn(move || {
+        let url = installer_url.trim().to_string();
+        if url.is_empty() {
+            finish_update_download_error(&sh2, "URL do instalador não informada.".into());
+            return;
+        }
+
+        let clean_ver = sanitize_installer_version(&version);
+        let temp_exe = std::env::temp_dir().join(format!("Workploy-Setup-{clean_ver}.exe"));
+        let token = resolve_github_token(&sh2, None);
+
+        if let Err(err) = download_installer_stream(&sh2, &url, &version, &temp_exe, token.as_deref()) {
+            finish_update_download_error(&sh2, err);
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let current_exe = std::env::current_exe().ok();
+            let args = build_installer_args(current_exe.as_deref());
+            match std::process::Command::new(&temp_exe).args(&args).spawn() {
+                Ok(_) => {
+                    {
+                        let mut s = sh2.lock().unwrap();
+                        s.update_progress = 1.0;
+                        s.update_status = "Reiniciando para concluir atualização...".into();
+                    }
+                    engine::notify(&sh2);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    finish_update_download_error(
+                        &sh2,
+                        format!("Não foi possível iniciar o instalador da atualização: {e}"),
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            {
+                let mut s = sh2.lock().unwrap();
+                s.update_downloading = false;
+                s.update_progress = 1.0;
+                let msg = format!(
+                    "Atualização v{version} baixada em {}.",
+                    temp_exe.display()
+                );
+                s.update_status = msg.clone();
+                record_update_event(&mut s, true, msg);
+            }
+            engine::notify(&sh2);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,5 +1580,142 @@ mod tests {
         assert_eq!(roots[2].kind, "docker-compose");
         assert_eq!(roots[3].kind, "node");
         assert_eq!(roots[4].kind, "rust");
+    }
+
+    #[test]
+    fn installer_args_include_dir_for_installed_exe_and_omit_for_target() {
+        let installed = Path::new(r"C:\Users\maestro\AppData\Local\Programs\Workploy\workploy.exe");
+        let args_installed = build_installer_args(Some(installed));
+        assert_eq!(
+            args_installed,
+            vec![
+                OsString::from("--dir"),
+                OsString::from(r"C:\Users\maestro\AppData\Local\Programs\Workploy"),
+                OsString::from("--silent"),
+                OsString::from("--launch"),
+            ]
+        );
+
+        let dev_debug = Path::new(r"C:\Projects\w-workploy\app\target\debug\workploy.exe");
+        assert_eq!(
+            build_installer_args(Some(dev_debug)),
+            vec![OsString::from("--silent"), OsString::from("--launch")]
+        );
+
+        assert_eq!(
+            build_installer_args(None),
+            vec![OsString::from("--silent"), OsString::from("--launch")]
+        );
+        assert_eq!(sanitize_installer_version("v0.1.4"), "0.1.4");
+    }
+
+    #[test]
+    fn download_installer_stream_validates_mz_size_and_updates_progress() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let mut valid_payload = vec![b'A'; 600 * 1024];
+        valid_payload[0] = b'M';
+        valid_payload[1] = b'Z';
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().unwrap();
+        let body = valid_payload.clone();
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let req_str = String::from_utf8_lossy(&req_buf);
+                if req_str.contains("GET /bad.exe") {
+                    let bad = b"<html>not an exe</html>";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bad.len()
+                    );
+                    stream.write_all(hdr.as_bytes()).unwrap();
+                    stream.write_all(bad).unwrap();
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(hdr.as_bytes()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("workploy-dl-test-{}", new_id("dir")));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let sh = std::sync::Arc::new(std::sync::Mutex::new(Shared::default()));
+        let ok_path = tmp.join("Workploy-Setup-0.1.4.exe");
+        let len = download_installer_stream(
+            &sh,
+            &format!("http://{addr}/Workploy-Setup-0.1.4.exe"),
+            "0.1.4",
+            &ok_path,
+            None,
+        )
+        .expect("valid exe should download");
+        assert_eq!(len, valid_payload.len() as u64);
+        assert!(ok_path.exists());
+        assert_eq!(sh.lock().unwrap().update_progress, 1.0);
+
+        let bad_path = tmp.join("bad.exe");
+        let err = download_installer_stream(
+            &sh,
+            &format!("http://{addr}/bad.exe"),
+            "0.1.4",
+            &bad_path,
+            None,
+        )
+        .expect_err("small/html response should fail validation");
+        assert!(err.contains("inválido") || err.contains("MZ"));
+        assert!(!bad_path.exists());
+
+        srv.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn download_and_install_update_records_error_event_on_http_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 404 server");
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req_buf = [0u8; 1024];
+            let _ = stream.read(&mut req_buf);
+            let hdr = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(hdr.as_bytes()).unwrap();
+        });
+
+        let sh = std::sync::Arc::new(std::sync::Mutex::new(Shared::default()));
+        download_and_install_update(&sh, format!("http://{addr}/missing.exe"), "0.1.4".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let s = sh.lock().unwrap();
+                if !s.update_downloading
+                    && let Some((seq, ok, msg)) = s.update_last_event.as_ref()
+                {
+                    assert_eq!(s.update_progress, 0.0);
+                    assert_eq!(*seq, 1);
+                    assert!(!ok);
+                    assert!(msg.contains("404"));
+                    assert_eq!(s.update_status, *msg);
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for error event");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        srv.join().unwrap();
     }
 }

@@ -584,6 +584,10 @@ pub struct Shared {
     #[serde(skip)]
     pub update_checking: bool,
     #[serde(skip)]
+    pub update_downloading: bool,
+    #[serde(skip)]
+    pub update_progress: f32,
+    #[serde(skip)]
     pub update_status: String,
     #[serde(skip)]
     pub latest_release: Option<ReleaseInfo>,

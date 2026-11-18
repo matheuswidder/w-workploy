@@ -601,6 +601,7 @@ pub struct AppState {
     pub modal: ModalState,
     pub next_uid: u64,
     pub toasts: ToastStack<ToastMsg>,
+    pub probe_queue: Vec<String>,
 
     // Motion & rune-fx timing state
     pub clock_t: f64,
@@ -681,6 +682,7 @@ impl AppState {
             modal: ModalState::None,
             next_uid: 100,
             toasts: ToastStack::default(),
+            probe_queue: Vec::new(),
             clock_t: 0.0,
             fx_phase: Phase::new(1.0),
             reduce_motion: false,
@@ -828,9 +830,11 @@ impl AppState {
         self.snapshot.runs.iter().any(|r| r.status.active())
             || self.snapshot.ssh_testing
             || self.snapshot.probing_server_id.is_some()
+            || !self.probe_queue.is_empty()
             || self.snapshot.provisioning_server_id.is_some()
             || self.snapshot.github_testing
             || self.snapshot.update_checking
+            || self.snapshot.update_downloading
             || self.snapshot.repo_branches_loading
             || self.snapshot.repo_workflows_loading
     }
@@ -1419,6 +1423,116 @@ impl AppState {
         }
         vps::probe_vps(&self.shared, server_id);
         self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
+    pub fn probe_all_servers(&mut self, tx: &mut Tx) {
+        if self.snapshot.settings.servers.is_empty() {
+            self.push_toast(
+                "probe-all-empty",
+                "Nenhuma VPS cadastrada",
+                Some("Cadastre servidores em Configurações → VPS & Motor para diagnosticar.".into()),
+                ToastKind::Info,
+                tx,
+            );
+            return;
+        }
+        if self.demo_mode {
+            let count = self.snapshot.settings.servers.len();
+            for srv in &mut self.snapshot.settings.servers {
+                let vcpus = srv.last_probe.as_ref().map(|p| p.vcpus).unwrap_or(4).max(2);
+                let ram = srv
+                    .last_probe
+                    .as_ref()
+                    .map(|p| p.ram_total_mb)
+                    .unwrap_or(8192)
+                    .max(4096);
+                let ram_free = srv
+                    .last_probe
+                    .as_ref()
+                    .map(|p| p.ram_free_mb)
+                    .filter(|&f| f > 0 && f <= ram)
+                    .unwrap_or(ram * 3 / 4);
+                let disk = srv
+                    .last_probe
+                    .as_ref()
+                    .map(|p| p.disk_free_gb)
+                    .unwrap_or(52)
+                    .max(32);
+                let cpu_pct = srv.last_probe.as_ref().map(|p| p.cpu_usage_pct).unwrap_or(18);
+                let disk_pct = srv.last_probe.as_ref().map(|p| p.disk_used_pct).unwrap_or(38);
+                let (tier, verdict) = vps::compute_capacity_tier(vcpus, ram, disk);
+                srv.last_probe = Some(VpsProbeResult {
+                    ok: true,
+                    os: srv
+                        .last_probe
+                        .as_ref()
+                        .map(|p| p.os.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Ubuntu 24.04.1 LTS".into()),
+                    arch: srv
+                        .last_probe
+                        .as_ref()
+                        .map(|p| p.arch.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "x86_64".into()),
+                    vcpus,
+                    ram_total_mb: ram,
+                    ram_free_mb: ram_free,
+                    disk_free_gb: disk,
+                    cpu_usage_pct: cpu_pct,
+                    disk_used_pct: disk_pct,
+                    has_git: true,
+                    has_docker: true,
+                    has_node: true,
+                    has_pnpm: srv.last_probe.as_ref().is_some_and(|p| p.has_pnpm),
+                    has_rust: srv.last_probe.as_ref().is_some_and(|p| p.has_rust)
+                        || tier == CapacityTier::Standard
+                        || tier == CapacityTier::Heavy,
+                    has_systemd: true,
+                    has_widder_runner: srv.runner_installed,
+                    runner_active: srv.runner_installed,
+                    tier,
+                    verdict,
+                    checked_at: "agora mesmo".into(),
+                });
+            }
+            self.snapshot.ssh_test = Some((
+                true,
+                format!("Diagnóstico concluído em {count} VPS(s) cadastrada(s)."),
+            ));
+            self.sync_connections_health_seen();
+            self.push_toast(
+                "probe-all-demo",
+                "Todas as VPSs inspecionadas",
+                Some(format!("{count} servidor(es) verificado(s) com sucesso.")),
+                ToastKind::Success,
+                tx,
+            );
+            return;
+        }
+
+        let ids: Vec<String> = self
+            .snapshot
+            .settings
+            .servers
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let active_id = self.snapshot.probing_server_id.clone();
+        self.probe_queue.clear();
+
+        if let Some(cur) = active_id {
+            for id in ids {
+                if id != cur && !self.probe_queue.contains(&id) {
+                    self.probe_queue.push(id);
+                }
+            }
+        } else if let Some((first, rest)) = ids.split_first() {
+            self.probe_queue.extend(rest.iter().cloned());
+            vps::probe_vps(&self.shared, first);
+            self.snapshot = self.shared.lock().unwrap().clone();
+        }
         tx.wake_after(std::time::Duration::from_millis(120));
     }
 
@@ -2240,6 +2354,44 @@ impl AppState {
         tx.wake_after(std::time::Duration::from_millis(120));
     }
 
+    pub fn install_latest_update(&mut self, tx: &mut Tx) {
+        let Some(rel) = self.snapshot.latest_release.clone() else {
+            return;
+        };
+        if !rel.has_update || self.snapshot.update_downloading {
+            return;
+        }
+        if self.demo_mode {
+            self.snapshot.update_downloading = true;
+            self.snapshot.update_progress = 0.42;
+            self.snapshot.update_status = format!(
+                "Baixando Workploy v{}... (simulação de progresso)",
+                rel.version
+            );
+            self.push_toast(
+                format!("upd-install-demo-{}", rel.version),
+                format!("Baixando Workploy v{}", rel.version),
+                Some("Download integrado iniciado no modo demonstração.".into()),
+                ToastKind::Info,
+                tx,
+            );
+            return;
+        }
+        if rel.installer_url.trim().is_empty() {
+            self.push_toast(
+                "upd-install-missing",
+                "Instalador indisponível",
+                Some("Não há URL direta do instalador para esta release.".into()),
+                ToastKind::Warning,
+                tx,
+            );
+            return;
+        }
+        github::download_and_install_update(&self.shared, rel.installer_url, rel.version);
+        self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
+    }
+
     pub fn open_external_url(url: &str) {
         let trimmed = url.trim();
         if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
@@ -2288,6 +2440,16 @@ pub fn poll_app(s: &mut AppState, t: f64, tx: &mut Tx) -> bool {
             }
             s.sync_connections_health_seen();
         }
+        changed = true;
+    }
+
+    if !s.demo_mode && s.snapshot.probing_server_id.is_none() && !s.probe_queue.is_empty() {
+        let next_id = s.probe_queue.remove(0);
+        vps::probe_vps(&s.shared, &next_id);
+        if let Ok(guard) = s.shared.lock() {
+            s.snapshot = guard.clone();
+        }
+        tx.wake_after(std::time::Duration::from_millis(120));
         changed = true;
     }
 

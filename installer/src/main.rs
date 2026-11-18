@@ -82,7 +82,7 @@ struct CliArgs {
     no_desktop: bool,
     no_shortcuts: bool,
     no_registry: bool,
-    launch: bool,
+    pub launch: bool,
     help: bool,
 }
 
@@ -504,18 +504,55 @@ fn decompress_to_file(gz_bytes: &[u8], dest: &Path) -> Result<u64, String> {
         return Err("Fluxo gzip inesperado após leitura completa.".to_string());
     }
 
-    if dest.exists() {
-        fs::remove_file(dest).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            format!("Falha ao substituir '{}': {e}", dest.display())
-        })?;
-    }
-    fs::rename(&tmp_path, dest).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("Falha ao mover '{}' para '{}': {e}", tmp_path.display(), dest.display())
-    })?;
+    replace_file_with_retry(&tmp_path, dest, 10, Duration::from_millis(300))?;
 
     Ok(copied)
+}
+
+fn is_retryable_fs_lock(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+fn replace_file_with_retry(
+    tmp_path: &Path,
+    dest: &Path,
+    max_attempts: usize,
+    delay: Duration,
+) -> Result<(), String> {
+    let attempts = max_attempts.max(1);
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        if dest.exists()
+            && let Err(e) = fs::remove_file(dest)
+        {
+            last_err = format!("Falha ao substituir '{}': {e}", dest.display());
+            if is_retryable_fs_lock(&e) && attempt + 1 < attempts {
+                thread::sleep(delay);
+                continue;
+            }
+            let _ = fs::remove_file(tmp_path);
+            return Err(last_err);
+        }
+        match fs::rename(tmp_path, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!(
+                    "Falha ao mover '{}' para '{}': {e}",
+                    tmp_path.display(),
+                    dest.display()
+                );
+                if is_retryable_fs_lock(&e) && attempt + 1 < attempts {
+                    thread::sleep(delay);
+                    continue;
+                }
+                let _ = fs::remove_file(tmp_path);
+                return Err(last_err);
+            }
+        }
+    }
+    let _ = fs::remove_file(tmp_path);
+    Err(last_err)
 }
 
 fn copy_self_as_uninstaller(dest: &Path) -> Result<bool, String> {
@@ -545,7 +582,7 @@ fn ensure_target_unlocked(target_exe: &Path) -> Result<(), String> {
         .status();
 
     for _ in 0..10 {
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(300));
         if OpenOptions::new().write(true).open(target_exe).is_ok() {
             return Ok(());
         }
@@ -1805,6 +1842,38 @@ mod tests {
             launch_after: false,
         };
         assert!(install_with_payload(&opts, &[], &[], &mut |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn parses_launch_flag_default_and_enabled() {
+        let off = parse_args(["--silent"]).expect("parse silent only");
+        assert!(off.silent);
+        assert!(!off.launch);
+
+        let on = parse_args(["--silent", "--launch"]).expect("parse silent + launch");
+        assert!(on.silent);
+        assert!(on.launch);
+    }
+
+    #[test]
+    fn replace_file_with_retry_succeeds_after_lock_release() {
+        let tmp = TempDir::new("retry-lock");
+        let dest = tmp.path.join("workploy.exe");
+        let staged = tmp.path.join("workploy.exe.tmp");
+        fs::write(&dest, b"old-binary").expect("write old");
+        fs::write(&staged, b"new-binary").expect("write staged");
+
+        // Mantém o arquivo aberto exclusivamente em Windows para forçar retry e libera em seguida.
+        let handle = OpenOptions::new().read(true).write(true).open(&dest).expect("open lock");
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(180));
+            drop(handle);
+        });
+
+        replace_file_with_retry(&staged, &dest, 10, Duration::from_millis(100))
+            .expect("retry should succeed once handle is dropped");
+        releaser.join().expect("join releaser");
+        assert_eq!(fs::read(&dest).expect("read replaced"), b"new-binary");
     }
 
     #[test]

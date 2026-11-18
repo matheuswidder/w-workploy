@@ -1,4 +1,40 @@
-use rune::Icon;
+use std::sync::OnceLock;
+
+use rune::{Icon, Pixels};
+
+fn decode_png_pixels(bytes: &[u8]) -> Pixels {
+    let px = Pixels::new();
+    if let Ok(img) = image::load_from_memory(bytes) {
+        let rgba = img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        px.set(w, h, rgba.into_raw());
+    }
+    px
+}
+
+pub fn brand_icon_dark() -> &'static Pixels {
+    static PX: OnceLock<Pixels> = OnceLock::new();
+    PX.get_or_init(|| decode_png_pixels(include_bytes!("../../assets/icon-medium.png")))
+}
+
+pub fn brand_icon_light() -> &'static Pixels {
+    static PX: OnceLock<Pixels> = OnceLock::new();
+    PX.get_or_init(|| decode_png_pixels(include_bytes!("../../assets/icon-inverted.png")))
+}
+
+#[allow(dead_code)]
+pub fn brand_icon_transparent() -> &'static Pixels {
+    static PX: OnceLock<Pixels> = OnceLock::new();
+    PX.get_or_init(|| decode_png_pixels(include_bytes!("../../assets/icon-transparent.png")))
+}
+
+pub fn brand_icon_for_theme(dark: bool) -> &'static Pixels {
+    if dark {
+        brand_icon_dark()
+    } else {
+        brand_icon_light()
+    }
+}
 
 pub static PLAY: Icon = Icon {
     name: "w-play",

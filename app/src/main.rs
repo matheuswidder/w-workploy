@@ -972,4 +972,107 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.nav, NavTarget::Onboarding);
     }
+
+    #[test]
+    fn about_tab_integrated_auto_update_shows_install_button_and_progress() {
+        let mut state = AppState::init_demo();
+        state.open_settings(SettingsTab::About);
+        state.snapshot.latest_release = Some(ReleaseInfo {
+            tag_name: "v0.9.0".into(),
+            version: "0.9.0".into(),
+            html_url: "https://github.com/matheuswidder/w-workploy/releases/tag/v0.9.0".into(),
+            installer_url: "https://github.com/matheuswidder/w-workploy/releases/download/v0.9.0/Workploy-Setup-0.9.0.exe".into(),
+            published_at: "2026-11-18T14:00:00Z".into(),
+            notes: "Atualização integrada".into(),
+            has_update: true,
+        });
+        state.snapshot.update_status = "Nova versão disponível: v0.9.0".into();
+
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.find("btn-update-install").is_some());
+        assert!(rt.find("btn-update-open").is_some());
+        assert!(rt.find("about-update-progress").is_none());
+        assert!(!rt.state.has_active_runs() || rt.state.snapshot.runs.iter().any(|r| r.status.active()));
+
+        // Click "Baixar e instalar v0.9.0 agora" in demo mode
+        let (ix, iy) = rt
+            .find("btn-update-install")
+            .expect("btn-update-install exists");
+        rt.pointer_down(ix, iy);
+        rt.pointer_up(ix, iy);
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.state.snapshot.update_downloading);
+        assert!(rt.state.has_active_runs());
+        assert!(rt.find("about-update-progress").is_some());
+        assert!(!rt.state.toasts.entries().is_empty());
+
+        // Clicking disabled install button again must not reset or fail
+        let (ix2, iy2) = rt
+            .find("btn-update-install")
+            .expect("disabled btn-update-install still exists");
+        let prev_progress = rt.state.snapshot.update_progress;
+        rt.pointer_down(ix2, iy2);
+        rt.pointer_up(ix2, iy2);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.snapshot.update_progress, prev_progress);
+    }
+
+    #[test]
+    fn connections_kpi_strip_test_all_and_log_visibility_work() {
+        let mut state = AppState::init_demo();
+        state.navigate_to(NavTarget::Connections);
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        for key in [
+            "conn-kpi-grid",
+            "kpi-servers-online",
+            "kpi-cpu-avg",
+            "kpi-ram-avg",
+            "kpi-disk-avg",
+            "kpi-github-auto",
+            "conn-test-all-vps",
+            "conn-test-github",
+            "conn-provision-log",
+        ] {
+            assert!(rt.find(key).is_some(), "expected element {key}");
+        }
+
+        // Test all VPSs
+        let (ax, ay) = rt
+            .find("conn-test-all-vps")
+            .expect("conn-test-all-vps exists");
+        rt.pointer_down(ax, ay);
+        rt.pointer_up(ax, ay);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .snapshot
+                .ssh_test
+                .as_ref()
+                .is_some_and(|(ok, msg)| *ok && msg.contains("2 VPS"))
+        );
+
+        // Clear activity log -> log card hides when both provision_log and runner_sync_status are empty
+        for _ in 0..8 {
+            let Some((_, cy)) = rt.find("btn-clear-prov-log") else { break };
+            if cy > 80.0 && cy < 780.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (lx, ly) = rt
+            .find("btn-clear-prov-log")
+            .expect("btn-clear-prov-log exists");
+        rt.pointer_down(lx, ly);
+        rt.pointer_up(lx, ly);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("conn-provision-log").is_none());
+    }
 }

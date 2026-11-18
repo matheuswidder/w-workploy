@@ -1,5 +1,6 @@
-use rune::{El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
-use workploy::model::{CapacityTier, VpsServer};
+use rune::color::Color;
+use rune::{El, Icon, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
+use workploy::model::{TriggerMode, VpsServer};
 
 use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{
@@ -12,7 +13,20 @@ use crate::ui::components::{
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
-pub fn view(s: &AppState, t: UiTheme) -> El {
+fn usage_bar_color(t: UiTheme, pct: u8) -> Color {
+    if pct >= 80 {
+        t.danger
+    } else if pct >= 65 {
+        t.warning
+    } else {
+        t.success
+    }
+}
+
+pub fn view(s: &AppState, t: UiTheme, main_w: f32) -> El {
+    let any_probing =
+        s.snapshot.probing_server_id.is_some() || !s.probe_queue.is_empty();
+
     let hdr = header_card(
         t,
         "connections-hdr",
@@ -36,7 +50,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                             .color(t.text_primary),
                     )
                     .child(
-                        text("Teste conexões SSH e GitHub, acompanhe capacidade (vCPU, RAM, disco, ferramentas e workploy-runner), veja logs e acione limpeza manual.")
+                        text("Visão analítica de disponibilidade, uso de recursos das VPSs e automação GitHub.")
                             .font(ty::SMALL)
                             .color(t.text_muted)
                             .wrap(),
@@ -50,24 +64,42 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     .child(
                         btn_neutral(
                             t,
-                            "conn-hdr-purge-rule",
-                            "Regra de limpeza (Purge)",
-                            Some(&icons::SLIDERS),
+                            "conn-test-all-vps",
+                            if any_probing {
+                                "Testando VPSs..."
+                            } else {
+                                "Testar todas as VPSs"
+                            },
+                            Some(&icons::SERVER),
                             34.0,
-                            |s: &mut AppState, _| s.open_purge_rule_modal(),
+                            |s: &mut AppState, tx: &mut Tx| {
+                                if s.snapshot.probing_server_id.is_none()
+                                    && s.probe_queue.is_empty()
+                                {
+                                    s.probe_all_servers(tx);
+                                }
+                            },
                         )
-                        .help("Configura a regra automática de limpeza de workspaces e cache Docker nas VPSs."),
+                        .help("Executa o diagnóstico SSH em todas as VPSs cadastradas e atualiza os KPIs."),
                     )
                     .child(
                         btn_neutral(
                             t,
-                            "conn-hdr-vps-settings",
-                            "Gerenciar VPSs",
-                            Some(&icons::SERVER),
+                            "conn-test-github",
+                            if s.snapshot.github_testing {
+                                "Testando GitHub..."
+                            } else {
+                                "Testar GitHub"
+                            },
+                            Some(&icons::BRANCH),
                             34.0,
-                            |s: &mut AppState, _| s.open_settings(SettingsTab::Vps),
+                            |s: &mut AppState, tx: &mut Tx| {
+                                if !s.snapshot.github_testing {
+                                    s.test_github_and_list(tx);
+                                }
+                            },
                         )
-                        .help("Abre Configurações → VPS & Motor para adicionar, editar ou remover servidores."),
+                        .help("Valida o token PAT salvo e atualiza o estado da conta GitHub."),
                     ),
             ),
     );
@@ -84,116 +116,17 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         .gap(14.0)
         .pb(16.0);
 
-    if !s.snapshot.runner_sync_status.trim().is_empty() {
-        let sync_lower = s.snapshot.runner_sync_status.to_lowercase();
-        let sync_err = sync_lower.contains("falha")
-            || sync_lower.contains("erro")
-            || sync_lower.contains("não foi possível");
-        scroll_col = scroll_col.child(
-            row()
-                .key("connections-sync-banner")
-                .w_full()
-                .px(14.0)
-                .py(10.0)
-                .gap(8.0)
-                .center_y()
-                .radius(8.0)
-                .fill(if sync_err { t.danger_bg } else { t.surface_1 })
-                .border(
-                    1.0,
-                    if sync_err {
-                        t.danger.alpha(0.35)
-                    } else {
-                        t.border_strong
-                    },
-                )
-                .child(
-                    icon(
-                        if sync_err {
-                            &icons::X_CIRCLE
-                        } else {
-                            &icons::SERVER
-                        },
-                        14.0,
-                    )
-                    .color(if sync_err { t.danger } else { t.accent }),
-                )
-                .child(
-                    text(s.snapshot.runner_sync_status.clone())
-                        .font(ty::SMALL)
-                        .color(if sync_err { t.danger } else { t.text_secondary })
-                        .grow(1.0)
-                        .shrink()
-                        .wrap(),
-                ),
-        );
+    scroll_col = scroll_col.child(kpi_strip(s, t, main_w));
+
+    if let Some(alert_banner) = health_alert_banner(s, t) {
+        scroll_col = scroll_col.child(alert_banner);
     }
 
-    let mut alert_entries: Vec<(ConnectionsHealth, String)> = Vec::new();
-    for srv in &s.snapshot.settings.servers {
-        let (h, alerts) = vps_health_status(srv);
-        if h != ConnectionsHealth::Healthy && !alerts.is_empty() {
-            alert_entries.push((h, format!("{}: {}", srv.name, alerts.join(" · "))));
-        }
-    }
-    if !alert_entries.is_empty() {
-        let has_danger = alert_entries
-            .iter()
-            .any(|(h, _)| *h == ConnectionsHealth::Danger);
-        let (bg, border, fg, title, ic) = if has_danger {
-            (
-                t.danger_bg,
-                t.danger.alpha(0.42),
-                t.danger,
-                "Atenção: falha de conexão ou agente inativo em VPS",
-                &icons::X_CIRCLE,
-            )
-        } else {
-            (
-                t.warning_bg,
-                t.warning.alpha(0.45),
-                t.warning,
-                "Alerta de capacidade (CPU, RAM ou Disco acima de 80%)",
-                &icons::BOLT,
-            )
-        };
-        let mut alert_lines = col().w_full().gap(3.0);
-        for (_, line) in &alert_entries {
-            alert_lines = alert_lines.child(
-                text(line.clone())
-                    .font(ty::SMALL)
-                    .color(t.text_primary)
-                    .wrap(),
-            );
-        }
-        scroll_col = scroll_col.child(
-            row()
-                .key("connections-health-alert-banner")
-                .w_full()
-                .px(14.0)
-                .py(12.0)
-                .gap(10.0)
-                .radius(10.0)
-                .fill(bg)
-                .border(1.0, border)
-                .child(icon(ic, 16.0).color(fg))
-                .child(
-                    col()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .gap(4.0)
-                        .child(text(title).font(ty::BODY_MED).color(fg))
-                        .child(alert_lines),
-                ),
-        );
-    }
+    scroll_col = scroll_col.child(vps_telemetry_section(s, t, main_w));
 
-    scroll_col = scroll_col
-        .child(github_quick_card(s, t))
-        .child(vps_diagnostics_card(s, t))
-        .child(logs_card(s, t))
-        .child(recommendations_card(t));
+    if has_recent_activity(s) {
+        scroll_col = scroll_col.child(activity_log_card(s, t));
+    }
 
     col()
         .key("connections-page")
@@ -209,186 +142,439 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         .child(scroll_col)
 }
 
-fn github_quick_card(s: &AppState, t: UiTheme) -> El {
-    let has_token = s.snapshot.settings.has_github_token;
-    let gh_user = &s.snapshot.settings.github_user;
-    let status_line = if !s.snapshot.github_status.trim().is_empty() {
-        s.snapshot.github_status.clone()
-    } else if !gh_user.is_empty() {
-        format!("Conectado como @{gh_user}")
-    } else if has_token {
-        "Token salvo no Cofre do Windows. Clique em 'Testar conexão' para validar.".into()
-    } else {
-        "Nenhum token configurado ainda. Cadastre seu PAT em Configurações → GitHub.".into()
-    };
+struct KpiSpec<'a> {
+    key: &'a str,
+    label: &'a str,
+    icon: &'static Icon,
+    value: String,
+    use_h1: bool,
+    subtext: String,
+    bar_frac: f32,
+    bar_color: Color,
+}
 
-    let status_lower = status_line.to_lowercase();
-    let status_is_err = !s.snapshot.github_testing
-        && (s
-            .snapshot
-            .github_last_event
-            .as_ref()
-            .is_some_and(|(_, ok, msg)| !*ok && msg == &status_line)
-            || status_lower.contains("erro")
-            || status_lower.contains("401")
-            || status_lower.contains("falha")
-            || status_lower.contains("inválido")
-            || status_lower.contains("expirado")
-            || status_lower.contains("não foi possível"));
-    let status_is_ok = !s.snapshot.github_testing
-        && !status_is_err
-        && (status_lower.starts_with("conectado") || (!gh_user.is_empty() && has_token));
-    let status_color = if status_is_err {
-        t.danger
-    } else if status_is_ok {
-        t.success
-    } else {
-        t.text_muted
-    };
+fn kpi_card(t: UiTheme, spec: KpiSpec<'_>) -> El {
+    let clamped = spec.bar_frac.clamp(0.0, 1.0);
+    let fill_frac = if clamped > 0.0 { clamped.max(0.04) } else { 0.0 };
 
     surface_card(
         t,
-        "conn-github-card",
-        12.0,
-        row()
-            .px(18.0)
-            .py(14.0)
-            .gap(12.0)
-            .center_y()
+        spec.key,
+        10.0,
+        col()
+            .px(14.0)
+            .py(12.0)
+            .gap(8.0)
             .justify_between()
-            .flex_wrap()
             .child(
-                row()
-                    .grow(1.0)
-                    .shrink()
-                    .min_w(200.0)
-                    .gap(10.0)
-                    .center_y()
-                    .child(runner_connected_dot(t, status_is_ok))
+                col()
+                    .w_full()
+                    .gap(5.0)
                     .child(
-                        col()
-                            .grow(1.0)
-                            .shrink()
-                            .min_w(0.0)
-                            .gap(3.0)
+                        row()
+                            .w_full()
+                            .gap(6.0)
+                            .center_y()
+                            .child(icon(spec.icon, 12.0).color(t.text_muted))
                             .child(
-                                row()
-                                    .gap(8.0)
-                                    .center_y()
-                                    .flex_wrap()
-                                    .child(
-                                        text("Conexão GitHub")
-                                            .font(ty::H3)
-                                            .color(t.text_primary),
-                                    )
-                                    .child(pill_badge(
-                                        t,
-                                        if has_token {
-                                            "PAT no Cofre do Windows"
-                                        } else {
-                                            "Sem token"
-                                        },
-                                        if has_token { t.success } else { t.text_muted },
-                                        if has_token { t.success_bg } else { t.surface_2 },
-                                    )),
-                            )
-                            .child(
-                                text(status_line)
-                                    .font(ty::SMALL)
-                                    .color(status_color)
-                                    .wrap(),
+                                text(spec.label.to_string())
+                                    .font(ty::EYEBROW)
+                                    .color(t.text_muted)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .truncate(),
                             ),
+                    )
+                    .child(
+                        text(spec.value)
+                            .font(if spec.use_h1 { ty::H1 } else { ty::H2 })
+                            .color(t.text_primary)
+                            .truncate(),
+                    )
+                    .child(
+                        text(spec.subtext)
+                            .font(ty::CAPTION)
+                            .color(t.text_muted)
+                            .wrap(),
                     ),
             )
             .child(
                 row()
-                    .gap(8.0)
-                    .center_y()
-                    .flex_wrap()
+                    .w_full()
+                    .h(5.0)
+                    .radius(999.0)
+                    .fill(t.surface_2)
+                    .border(1.0, t.border_subtle)
+                    .clip_soft(0.0)
                     .child(
-                        btn_neutral(
-                            t,
-                            "conn-test-github",
-                            if s.snapshot.github_testing {
-                                "Testando..."
-                            } else {
-                                "Testar conexão"
-                            },
-                            Some(&icons::BRANCH),
-                            32.0,
-                            |s: &mut AppState, tx: &mut Tx| {
-                                if !s.snapshot.github_testing {
-                                    s.test_github_and_list(tx);
-                                }
-                            },
-                        )
-                        .help("Valida o token PAT no GitHub e atualiza a lista de repositórios disponíveis."),
-                    )
-                    .child(
-                        btn_ghost(
-                            t,
-                            "conn-open-gh-settings",
-                            "Configurar GitHub",
-                            Some(&icons::EDIT),
-                            32.0,
-                            |s: &mut AppState, _| s.open_settings(SettingsTab::GitHub),
-                        )
-                        .help("Abre Configurações → GitHub para editar token, buscar repositórios e gerenciar vínculos."),
+                        el().h_full()
+                            .radius(999.0)
+                            .fill(spec.bar_color)
+                            .w_frac(fill_frac),
                     ),
             ),
     )
 }
 
-fn vps_diagnostics_card(s: &AppState, t: UiTheme) -> El {
-    let local_card = row()
-        .key("conn-local-card")
-        .w_full()
-        .px(14.0)
-        .py(12.0)
-        .gap(12.0)
-        .center_y()
-        .justify_between()
-        .flex_wrap()
-        .radius(10.0)
-        .fill(t.surface_2)
-        .border(1.0, t.border_subtle)
-        .child(
-            row()
-                .grow(1.0)
-                .shrink()
-                .min_w(180.0)
-                .gap(10.0)
-                .center_y()
-                .child(runner_connected_dot(t, true))
-                .child(
-                    col()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .gap(2.0)
-                        .child(
-                            text("Runner Local (Esta máquina)")
-                                .font(ty::BODY_MED)
-                                .color(t.text_primary),
-                        )
-                        .child(
-                            text("Execução direta neste computador · Sempre pronto")
-                                .font(ty::CAPTION)
-                                .color(t.text_muted)
-                                .wrap(),
-                        ),
-                ),
-        )
-        .child(pill_badge(t, "Online", t.success, t.success_bg));
+fn kpi_strip(s: &AppState, t: UiTheme, main_w: f32) -> El {
+    let servers = &s.snapshot.settings.servers;
+    let total_vps = servers.len();
+    let online_probes: Vec<_> = servers
+        .iter()
+        .filter_map(|srv| srv.last_probe.as_ref().filter(|p| p.ok))
+        .collect();
+    let online_vps = online_probes.len();
+    let active_runners = online_probes.iter().filter(|p| p.runner_active).count();
 
-    let mut vps_list = col().w_full().gap(10.0);
+    let servers_val = format!("{online_vps} / {total_vps}");
+    let servers_sub = if total_vps == 0 {
+        "Nenhuma VPS cadastrada".to_string()
+    } else {
+        let word = if active_runners == 1 {
+            "workploy-runner ativo"
+        } else {
+            "workploy-runners ativos"
+        };
+        format!("{active_runners} {word}")
+    };
+    let servers_frac = if total_vps == 0 {
+        0.0
+    } else {
+        online_vps as f32 / total_vps as f32
+    };
+    let servers_color = if total_vps == 0 {
+        t.text_muted
+    } else if online_vps == total_vps {
+        t.success
+    } else if online_vps > 0 {
+        t.warning
+    } else {
+        t.danger
+    };
+
+    let (cpu_val, cpu_sub, cpu_frac, cpu_color) = if online_probes.is_empty() {
+        (
+            "—".to_string(),
+            "Aguardando inspeção".to_string(),
+            0.0,
+            t.text_muted,
+        )
+    } else {
+        let sum_cpu: u64 = online_probes.iter().map(|p| p.cpu_usage_pct as u64).sum();
+        let avg_cpu = (sum_cpu as f64 / online_probes.len() as f64)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let total_vcpus: u32 = online_probes.iter().map(|p| p.vcpus).sum();
+        (
+            format!("{avg_cpu}%"),
+            format!("{total_vcpus} vCPU em {online_vps} VPS(s)"),
+            avg_cpu as f32 / 100.0,
+            usage_bar_color(t, avg_cpu),
+        )
+    };
+
+    let ram_probes: Vec<_> = online_probes
+        .iter()
+        .copied()
+        .filter(|p| p.ram_total_mb > 0)
+        .collect();
+    let (ram_val, ram_sub, ram_frac, ram_color) = if ram_probes.is_empty() {
+        (
+            "—".to_string(),
+            "Sem leitura de RAM".to_string(),
+            0.0,
+            t.text_muted,
+        )
+    } else {
+        let total_mb: u64 = ram_probes.iter().map(|p| p.ram_total_mb).sum();
+        let used_mb: u64 = ram_probes
+            .iter()
+            .map(|p| p.ram_total_mb.saturating_sub(p.ram_free_mb))
+            .sum();
+        let avg_ram = ((used_mb.saturating_mul(100)) / total_mb.max(1)).min(100) as u8;
+        (
+            format!("{avg_ram}%"),
+            format!(
+                "{:.1} / {:.1} GB",
+                used_mb as f64 / 1024.0,
+                total_mb as f64 / 1024.0
+            ),
+            avg_ram as f32 / 100.0,
+            usage_bar_color(t, avg_ram),
+        )
+    };
+
+    let (disk_val, disk_sub, disk_frac, disk_color) = if online_probes.is_empty() {
+        (
+            "—".to_string(),
+            "Sem leitura de disco".to_string(),
+            0.0,
+            t.text_muted,
+        )
+    } else {
+        let sum_disk: u64 = online_probes.iter().map(|p| p.disk_used_pct as u64).sum();
+        let avg_disk = (sum_disk as f64 / online_probes.len() as f64)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let free_gb: u64 = online_probes.iter().map(|p| p.disk_free_gb).sum();
+        (
+            format!("{avg_disk}%"),
+            format!("{free_gb} GB livres"),
+            avg_disk as f32 / 100.0,
+            usage_bar_color(t, avg_disk),
+        )
+    };
+
+    let gh_user = s.snapshot.settings.github_user.trim();
+    let has_token = s.snapshot.settings.has_github_token;
+    let gh_connected = has_token && !gh_user.is_empty();
+    let gh_val = if !gh_user.is_empty() {
+        format!("@{gh_user}")
+    } else if has_token {
+        "Token salvo".to_string()
+    } else {
+        "Desconectado".to_string()
+    };
+
+    let active_bindings: Vec<_> = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .filter(|b| b.enabled)
+        .collect();
+    let webhook_cnt = active_bindings
+        .iter()
+        .filter(|b| b.trigger_mode == TriggerMode::WebhookOnVps)
+        .count();
+    let poll_cnt = active_bindings
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.trigger_mode,
+                TriggerMode::PollOnVps | TriggerMode::PollOnDesktop
+            )
+        })
+        .count();
+    let bind_word = if active_bindings.len() == 1 {
+        "vínculo ativo"
+    } else {
+        "vínculos ativos"
+    };
+    let gh_sub = format!(
+        "{} {bind_word} ({webhook_cnt} Webhook · {poll_cnt} Sondagem)",
+        active_bindings.len()
+    );
+    let (gh_frac, gh_color) = if gh_connected {
+        (1.0, t.success)
+    } else if has_token {
+        (0.5, t.warning)
+    } else {
+        (0.0, t.text_muted)
+    };
+
+    let cards = vec![
+        kpi_card(
+            t,
+            KpiSpec {
+                key: "kpi-servers-online",
+                label: "SERVIDORES ONLINE",
+                icon: &icons::SERVER,
+                value: servers_val,
+                use_h1: true,
+                subtext: servers_sub,
+                bar_frac: servers_frac,
+                bar_color: servers_color,
+            },
+        ),
+        kpi_card(
+            t,
+            KpiSpec {
+                key: "kpi-cpu-avg",
+                label: "CPU MÉDIA",
+                icon: &icons::ACTIVITY,
+                value: cpu_val,
+                use_h1: true,
+                subtext: cpu_sub,
+                bar_frac: cpu_frac,
+                bar_color: cpu_color,
+            },
+        ),
+        kpi_card(
+            t,
+            KpiSpec {
+                key: "kpi-ram-avg",
+                label: "RAM MÉDIA",
+                icon: &icons::BOLT,
+                value: ram_val,
+                use_h1: true,
+                subtext: ram_sub,
+                bar_frac: ram_frac,
+                bar_color: ram_color,
+            },
+        ),
+        kpi_card(
+            t,
+            KpiSpec {
+                key: "kpi-disk-avg",
+                label: "DISCO MÉDIO",
+                icon: &icons::SHIELD,
+                value: disk_val,
+                use_h1: true,
+                subtext: disk_sub,
+                bar_frac: disk_frac,
+                bar_color: disk_color,
+            },
+        ),
+        kpi_card(
+            t,
+            KpiSpec {
+                key: "kpi-github-auto",
+                label: "GITHUB & AUTOMAÇÃO",
+                icon: &icons::BRANCH,
+                value: gh_val,
+                use_h1: false,
+                subtext: gh_sub,
+                bar_frac: gh_frac,
+                bar_color: gh_color,
+            },
+        ),
+    ];
+
+    if main_w >= 860.0 {
+        let mut r = row().key("conn-kpi-grid").w_full().gap(10.0).items_stretch();
+        for c in cards {
+            r = r.child(c.grow(1.0).shrink().min_w(0.0));
+        }
+        r
+    } else if main_w >= 520.0 {
+        let mut grid = col().key("conn-kpi-grid").w_full().gap(10.0);
+        for chunk in cards.chunks(2) {
+            let mut r = row().w_full().gap(10.0).items_stretch();
+            for c in chunk {
+                r = r.child(c.clone().grow(1.0).shrink().min_w(0.0));
+            }
+            if chunk.len() == 1 {
+                r = r.child(el().grow(1.0).shrink().min_w(0.0));
+            }
+            grid = grid.child(r);
+        }
+        grid
+    } else {
+        let mut grid = col().key("conn-kpi-grid").w_full().gap(10.0);
+        for c in cards {
+            grid = grid.child(c);
+        }
+        grid
+    }
+}
+
+fn health_alert_banner(s: &AppState, t: UiTheme) -> Option<El> {
+    let mut alert_entries: Vec<(ConnectionsHealth, String)> = Vec::new();
+    for srv in &s.snapshot.settings.servers {
+        let (h, alerts) = vps_health_status(srv);
+        if h != ConnectionsHealth::Healthy && !alerts.is_empty() {
+            alert_entries.push((h, format!("{}: {}", srv.name, alerts.join(" · "))));
+        }
+    }
+    if alert_entries.is_empty() {
+        return None;
+    }
+
+    let has_danger = alert_entries
+        .iter()
+        .any(|(h, _)| *h == ConnectionsHealth::Danger);
+    let (bg, border, fg, title, ic) = if has_danger {
+        (
+            t.danger_bg,
+            t.danger.alpha(0.42),
+            t.danger,
+            "Atenção: falha de conexão ou agente inativo em VPS",
+            &icons::X_CIRCLE,
+        )
+    } else {
+        (
+            t.warning_bg,
+            t.warning.alpha(0.45),
+            t.warning,
+            "Alerta de capacidade (CPU, RAM ou Disco acima de 80%)",
+            &icons::BOLT,
+        )
+    };
+
+    let mut alert_lines = col().w_full().gap(3.0);
+    for (_, line) in &alert_entries {
+        alert_lines = alert_lines.child(
+            text(line.clone())
+                .font(ty::SMALL)
+                .color(t.text_primary)
+                .wrap(),
+        );
+    }
+
+    Some(
+        row()
+            .key("connections-health-alert-banner")
+            .w_full()
+            .px(14.0)
+            .py(12.0)
+            .gap(10.0)
+            .radius(10.0)
+            .fill(bg)
+            .border(1.0, border)
+            .child(icon(ic, 16.0).color(fg))
+            .child(
+                col()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .child(text(title).font(ty::BODY_MED).color(fg))
+                    .child(alert_lines),
+            ),
+    )
+}
+
+fn vps_telemetry_section(s: &AppState, t: UiTheme, main_w: f32) -> El {
+    let mut header = row()
+        .w_full()
+        .justify_between()
+        .center_y()
+        .flex_wrap()
+        .gap(8.0)
+        .child(
+            col()
+                .gap(2.0)
+                .child(
+                    text("Telemetria por VPS")
+                        .font(ty::H3)
+                        .color(t.text_primary),
+                )
+                .child(
+                    text("Consumo em tempo real da última inspeção SSH, ferramentas e ações rápidas.")
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .wrap(),
+                ),
+        );
+
+    if let Some((ok, msg)) = &s.snapshot.ssh_test {
+        header = header.child(pill_badge(
+            t,
+            msg,
+            if *ok { t.success } else { t.danger },
+            if *ok { t.success_bg } else { t.danger_bg },
+        ));
+    }
+
+    let mut list = col().w_full().gap(10.0);
     if s.snapshot.settings.servers.is_empty() {
-        vps_list = vps_list.child(
+        list = list.child(
             row()
                 .key("conn-vps-empty")
                 .w_full()
                 .px(14.0)
-                .py(16.0)
+                .py(18.0)
                 .justify_between()
                 .center_y()
                 .flex_wrap()
@@ -397,7 +583,7 @@ fn vps_diagnostics_card(s: &AppState, t: UiTheme) -> El {
                 .fill(t.surface_2)
                 .border(1.0, t.border_subtle)
                 .child(
-                    text("Nenhuma VPS cadastrada ainda. Cadastre um servidor em Configurações → VPS & Motor.")
+                    text("Nenhuma VPS cadastrada ainda. Adicione seus servidores em Configurações → VPS & Motor.")
                         .font(ty::SMALL)
                         .color(t.text_muted)
                         .grow(1.0)
@@ -415,85 +601,66 @@ fn vps_diagnostics_card(s: &AppState, t: UiTheme) -> El {
         );
     } else {
         for srv in &s.snapshot.settings.servers {
-            vps_list = vps_list.child(vps_diag_row(s, t, srv));
+            list = list.child(vps_telemetry_card(s, t, srv, main_w));
         }
     }
 
-    let mut inner = col()
-        .px(18.0)
-        .py(16.0)
-        .gap(12.0)
+    surface_card(
+        t,
+        "conn-vps-card",
+        12.0,
+        col().px(18.0).py(16.0).gap(12.0).child(header).child(list),
+    )
+}
+
+fn mini_usage_bar(t: UiTheme, label: &str, detail: String, pct: u8) -> El {
+    let color = usage_bar_color(t, pct);
+    let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
+    let fill_frac = if pct > 0 { frac.max(0.04) } else { 0.0 };
+
+    col()
+        .gap(5.0)
+        .px(10.0)
+        .py(8.0)
+        .radius(8.0)
+        .fill(t.surface_1)
+        .border(1.0, t.border_subtle)
         .child(
             row()
                 .w_full()
                 .justify_between()
                 .center_y()
-                .flex_wrap()
-                .gap(8.0)
+                .gap(6.0)
                 .child(
-                    col()
-                        .gap(2.0)
-                        .child(
-                            text("Saúde das VPSs & Capacidade")
-                                .font(ty::H3)
-                                .color(t.text_primary),
-                        )
-                        .child(
-                            text("Verifique latência SSH, vCPU, RAM, disco livre, ferramentas e estado do agente workploy-runner.")
-                                .font(ty::CAPTION)
-                                .color(t.text_muted)
-                                .wrap(),
-                        ),
+                    text(label.to_string())
+                        .font(ty::CAPTION)
+                        .color(t.text_secondary),
+                )
+                .child(
+                    text(detail)
+                        .font(ty::MONO_SM)
+                        .color(t.text_primary)
+                        .truncate(),
                 ),
         )
-        .child(local_card)
-        .child(vps_list);
-
-    if let Some((ok, msg)) = &s.snapshot.ssh_test {
-        inner = inner.child(
+        .child(
             row()
-                .key("conn-ssh-test-banner")
                 .w_full()
-                .px(12.0)
-                .py(9.0)
-                .gap(8.0)
-                .center_y()
-                .radius(8.0)
-                .fill(if *ok { t.success_bg } else { t.danger_bg })
-                .border(
-                    1.0,
-                    if *ok {
-                        t.success.alpha(0.35)
-                    } else {
-                        t.danger.alpha(0.35)
-                    },
-                )
+                .h(6.0)
+                .radius(999.0)
+                .fill(t.surface_2)
+                .border(1.0, t.border_subtle)
+                .clip_soft(0.0)
                 .child(
-                    icon(
-                        if *ok {
-                            &icons::CHECK_CIRCLE
-                        } else {
-                            &icons::X_CIRCLE
-                        },
-                        14.0,
-                    )
-                    .color(if *ok { t.success } else { t.danger }),
-                )
-                .child(
-                    text(msg.clone())
-                        .font(ty::SMALL)
-                        .color(if *ok { t.success } else { t.danger })
-                        .grow(1.0)
-                        .shrink()
-                        .wrap(),
+                    el().h_full()
+                        .radius(999.0)
+                        .fill(color)
+                        .w_frac(fill_frac),
                 ),
-        );
-    }
-
-    surface_card(t, "conn-vps-card", 12.0, inner)
+        )
 }
 
-fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
+fn vps_telemetry_card(s: &AppState, t: UiTheme, srv: &VpsServer, main_w: f32) -> El {
     let is_probing = s.snapshot.probing_server_id.as_deref() == Some(srv.id.as_str());
     let is_provisioning = s.snapshot.provisioning_server_id.as_deref() == Some(srv.id.as_str());
     let (srv_health, srv_alerts) = vps_health_status(srv);
@@ -526,30 +693,35 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
         format!("{}@{}:{}", srv.user, srv.host, srv.port)
     };
 
-    let mut badges = row().gap(6.0).center_y().flex_wrap().child(pill_badge(
-        t,
-        srv.auth.label(),
-        t.text_secondary,
-        t.surface_3,
-    ));
-    if srv.runner_installed {
-        badges = badges.child(pill_badge(
-            t,
-            &format!("workploy-runner :{}", srv.runner_port),
-            t.success,
-            t.success_bg,
-        ));
-    }
+    let (health_label, health_fg, health_bg) = match &srv.last_probe {
+        None => ("Não inspecionada", t.text_muted, t.surface_3),
+        Some(p) if !p.ok => ("Offline", t.danger, t.danger_bg),
+        Some(_) => match srv_health {
+            ConnectionsHealth::Danger => ("Offline", t.danger, t.danger_bg),
+            ConnectionsHealth::Warning => ("Recurso >=80%", t.warning, t.warning_bg),
+            ConnectionsHealth::Healthy => ("Saudável", t.success, t.success_bg),
+        },
+    };
+
+    let sys_subtitle = match &srv.last_probe {
+        Some(p) if p.ok => format!(
+            "{} ({}) · {} vCPU · Verificado {}",
+            p.os, p.arch, p.vcpus, p.checked_at
+        ),
+        Some(p) if !p.checked_at.trim().is_empty() => {
+            format!("Última tentativa: {}", p.checked_at)
+        }
+        _ => "Aguardando primeira inspeção SSH".to_string(),
+    };
 
     let id_probe = srv.id.clone();
-    let id_sync = srv.id.clone();
     let id_purge = srv.id.clone();
-    let id_prov = srv.id.clone();
 
     let actions = row()
         .gap(6.0)
         .center_y()
         .flex_wrap()
+        .child(pill_badge(t, health_label, health_fg, health_bg))
         .child(
             btn_neutral(
                 t,
@@ -557,28 +729,17 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 if is_probing {
                     "Testando..."
                 } else {
-                    "Testar conexão"
+                    "Testar agora"
                 },
                 Some(&icons::SERVER),
-                30.0,
+                28.0,
                 move |s: &mut AppState, tx: &mut Tx| {
                     if !is_probing {
                         s.probe_server(&id_probe, tx);
                     }
                 },
             )
-            .help("Testa a conexão SSH e coleta métricas de vCPU, RAM, disco e ferramentas da VPS."),
-        )
-        .child(
-            btn_neutral(
-                t,
-                format!("conn-sync-vps-{}", srv.id),
-                "Sincronizar",
-                Some(&icons::REFRESH),
-                30.0,
-                move |s: &mut AppState, tx: &mut Tx| s.sync_server_runs(&id_sync, tx),
-            )
-            .help("Sincroniza regras, vínculos e execuções recentes com o agente workploy-runner da VPS."),
+            .help("Testa a conexão SSH e atualiza CPU, RAM, disco e ferramentas desta VPS."),
         )
         .child(
             btn_neutral(
@@ -586,25 +747,10 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 format!("conn-purge-vps-{}", srv.id),
                 "Limpar agora",
                 Some(&icons::TRASH),
-                30.0,
+                28.0,
                 move |s: &mut AppState, tx: &mut Tx| s.purge_server(&id_purge, tx),
             )
-            .help("Aciona imediatamente a limpeza de workspaces antigos e cache Docker nesta VPS."),
-        )
-        .child(
-            btn_ghost(
-                t,
-                format!("conn-prov-vps-{}", srv.id),
-                if is_provisioning {
-                    "Provisionando..."
-                } else {
-                    "Provisionar Motor"
-                },
-                Some(&icons::BOLT),
-                30.0,
-                move |s: &mut AppState, _| s.open_provision_modal(&id_prov),
-            )
-            .help("Abre o assistente para instalar ou atualizar Git, Docker, Node, Rust e workploy-runner."),
+            .help("Executa imediatamente a limpeza manual de workspaces antigos e cache Docker nesta VPS."),
         );
 
     let mut card = col()
@@ -622,7 +768,7 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 ConnectionsHealth::Warning => t.warning.alpha(0.45),
                 ConnectionsHealth::Healthy => {
                     if probe_ok && runner_online {
-                        t.success.alpha(0.32)
+                        t.success.alpha(0.30)
                     } else {
                         t.border_subtle
                     }
@@ -640,7 +786,7 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                     row()
                         .grow(1.0)
                         .shrink()
-                        .min_w(180.0)
+                        .min_w(200.0)
                         .gap(10.0)
                         .center_y()
                         .child(status_dot)
@@ -649,7 +795,7 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                                 .grow(1.0)
                                 .shrink()
                                 .min_w(0.0)
-                                .gap(3.0)
+                                .gap(2.0)
                                 .child(
                                     row()
                                         .gap(8.0)
@@ -666,7 +812,12 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                                                 .color(t.accent),
                                         ),
                                 )
-                                .child(badges),
+                                .child(
+                                    text(sys_subtitle)
+                                        .font(ty::CAPTION)
+                                        .color(t.text_muted)
+                                        .wrap(),
+                                ),
                         ),
                 )
                 .child(actions),
@@ -674,25 +825,45 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
 
     if let Some(probe) = &srv.last_probe {
         if probe.ok {
-            let (tier_fg, tier_bg) = match probe.tier {
-                CapacityTier::Heavy | CapacityTier::Standard => (t.success, t.success_bg),
-                CapacityTier::Light => (t.warning, t.warning_bg),
-                CapacityTier::Insufficient => (t.danger, t.danger_bg),
-            };
             let ram_pct = vps_ram_used_pct(probe);
-            let specs_line = format!(
-                "{} ({})  ·  {} vCPU (CPU {}%)  ·  RAM {}% ({:.1}/{:.1} GB livres)  ·  Disco {}% ({} GB livres)  ·  Verificado: {}",
-                probe.os,
-                probe.arch,
-                probe.vcpus,
+            let ram_used_gb = probe.ram_total_mb.saturating_sub(probe.ram_free_mb) as f64 / 1024.0;
+            let ram_total_gb = probe.ram_total_mb as f64 / 1024.0;
+
+            let cpu_bar = mini_usage_bar(
+                t,
+                "CPU",
+                format!("{}%", probe.cpu_usage_pct),
                 probe.cpu_usage_pct,
-                ram_pct,
-                probe.ram_free_mb as f64 / 1024.0,
-                probe.ram_total_mb as f64 / 1024.0,
-                probe.disk_used_pct,
-                probe.disk_free_gb,
-                probe.checked_at
             );
+            let ram_bar = mini_usage_bar(
+                t,
+                "RAM",
+                format!("{ram_pct}% ({ram_used_gb:.1}/{ram_total_gb:.1} GB)"),
+                ram_pct,
+            );
+            let disk_bar = mini_usage_bar(
+                t,
+                "Disco",
+                format!("{}% ({} GB livres)", probe.disk_used_pct, probe.disk_free_gb),
+                probe.disk_used_pct,
+            );
+
+            let bars = if main_w >= 580.0 {
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .items_stretch()
+                    .child(cpu_bar.grow(1.0).shrink().min_w(0.0))
+                    .child(ram_bar.grow(1.0).shrink().min_w(0.0))
+                    .child(disk_bar.grow(1.0).shrink().min_w(0.0))
+            } else {
+                col()
+                    .w_full()
+                    .gap(8.0)
+                    .child(cpu_bar)
+                    .child(ram_bar)
+                    .child(disk_bar)
+            };
 
             let tools_row = row()
                 .w_full()
@@ -701,7 +872,6 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 .child(tool_chip(t, "Git", probe.has_git))
                 .child(tool_chip(t, "Docker", probe.has_docker))
                 .child(tool_chip(t, "Node", probe.has_node))
-                .child(tool_chip(t, "pnpm", probe.has_pnpm))
                 .child(tool_chip(t, "Rust", probe.has_rust))
                 .child(tool_chip(
                     t,
@@ -710,46 +880,10 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                     } else {
                         "workploy-runner"
                     },
-                    probe.has_widder_runner,
+                    probe.has_widder_runner && probe.runner_active,
                 ));
 
-            let mut details_col = col()
-                .w_full()
-                .px(12.0)
-                .py(10.0)
-                .gap(8.0)
-                .radius(8.0)
-                .fill(t.surface_1)
-                .border(1.0, t.border_subtle)
-                .child(
-                    row()
-                        .w_full()
-                        .justify_between()
-                        .center_y()
-                        .flex_wrap()
-                        .gap(8.0)
-                        .child(
-                            text(specs_line)
-                                .font(ty::CAPTION)
-                                .color(t.text_secondary)
-                                .grow(1.0)
-                                .shrink()
-                                .wrap(),
-                        )
-                        .child(pill_badge(
-                            t,
-                            &format!("Capacidade {}", probe.tier.label()),
-                            tier_fg,
-                            tier_bg,
-                        )),
-                )
-                .child(tools_row)
-                .child(
-                    text(probe.verdict.clone())
-                        .font(ty::CAPTION)
-                        .color(t.text_muted)
-                        .wrap(),
-                );
+            card = card.child(bars).child(tools_row);
 
             if !srv_alerts.is_empty() {
                 let is_danger = srv_health == ConnectionsHealth::Danger;
@@ -768,7 +902,7 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                         &icons::BOLT,
                     )
                 };
-                details_col = details_col.child(
+                card = card.child(
                     row()
                         .key(format!("conn-srv-alert-{}", srv.id))
                         .w_full()
@@ -790,8 +924,6 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                         ),
                 );
             }
-
-            card = card.child(details_col);
         } else {
             card = card.child(
                 row()
@@ -816,7 +948,7 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
         }
     } else {
         card = card.child(
-            text("Ainda não inspecionada. Clique em 'Testar conexão' para coletar vCPU, RAM, disco e ferramentas.")
+            text("Ainda não inspecionada. Clique em 'Testar agora' para coletar CPU, RAM, disco e ferramentas.")
                 .font(ty::CAPTION)
                 .color(t.text_muted)
                 .wrap(),
@@ -826,13 +958,28 @@ fn vps_diag_row(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
     card
 }
 
-fn logs_card(s: &AppState, t: UiTheme) -> El {
+fn has_recent_activity(s: &AppState) -> bool {
+    s.snapshot.provisioning_server_id.is_some()
+        || !s.snapshot.provision_log.trim().is_empty()
+        || !s.snapshot.runner_sync_status.trim().is_empty()
+}
+
+fn activity_log_card(s: &AppState, t: UiTheme) -> El {
     let tail: String = {
         let lines: Vec<&str> = s.snapshot.provision_log.lines().collect();
-        let start = lines.len().saturating_sub(24);
+        let start = lines.len().saturating_sub(20);
         lines[start..].join("\n")
     };
     let active = s.snapshot.provisioning_server_id.is_some();
+    let sync = s.snapshot.runner_sync_status.trim();
+
+    let body_text = if !tail.is_empty() && !sync.is_empty() {
+        format!("{sync}\n\n{tail}")
+    } else if !tail.is_empty() {
+        tail
+    } else {
+        sync.to_string()
+    };
 
     surface_card(
         t,
@@ -854,35 +1001,35 @@ fn logs_card(s: &AppState, t: UiTheme) -> El {
                             .gap(8.0)
                             .center_y()
                             .child(
-                                text("Logs de provisionamento e sincronização")
+                                text("Log de atividade")
                                     .font(ty::H3)
                                     .color(t.text_primary),
                             )
                             .child(if active {
                                 pill_badge(t, "Em andamento", t.info, t.info_bg)
-                            } else if !tail.is_empty() {
-                                pill_badge(t, "Última execução", t.text_secondary, t.surface_2)
                             } else {
-                                pill_badge(t, "Sem saída recente", t.text_muted, t.surface_2)
+                                pill_badge(t, "Recente", t.text_secondary, t.surface_2)
                             }),
                     )
                     .child(
                         btn_ghost(
                             t,
                             "btn-clear-prov-log",
-                            "Limpar log",
+                            "Limpar",
                             None,
                             28.0,
                             |s: &mut AppState, _| {
                                 s.snapshot.provision_log.clear();
+                                s.snapshot.runner_sync_status.clear();
                                 if !s.demo_mode
                                     && let Ok(mut g) = s.shared.lock()
                                 {
                                     g.provision_log.clear();
+                                    g.runner_sync_status.clear();
                                 }
                             },
                         )
-                        .help("Limpa a saída de provisionamento exibida abaixo."),
+                        .help("Limpa o log de atividade recente exibido nesta sessão."),
                     ),
             )
             .child(
@@ -892,84 +1039,11 @@ fn logs_card(s: &AppState, t: UiTheme) -> El {
                     .fill(t.surface_code)
                     .border(1.0, t.border_subtle)
                     .child(
-                        text(if tail.is_empty() {
-                            if s.snapshot.runner_sync_status.trim().is_empty() {
-                                "Nenhum log de provisionamento ou sincronização registrado nesta sessão.".to_string()
-                            } else {
-                                format!("Último status de sincronização:\n{}", s.snapshot.runner_sync_status)
-                            }
-                        } else {
-                            tail
-                        })
-                        .font(ty::MONO_SM)
-                        .color(rune::color::hex("#e2e8f0").unwrap_or(t.text_primary))
-                        .wrap(),
-                    ),
-            ),
-    )
-}
-
-fn recommendations_card(t: UiTheme) -> El {
-    let mut rows = col().w_full().gap(8.0);
-    for (tier, spec, usage) in CapacityTier::recommendations() {
-        let (fg, bg) = match tier {
-            CapacityTier::Light => (t.warning, t.warning_bg),
-            CapacityTier::Standard => (t.accent, t.accent_soft),
-            CapacityTier::Heavy => (t.success, t.success_bg),
-            CapacityTier::Insufficient => (t.danger, t.danger_bg),
-        };
-        rows = rows.child(
-            row()
-                .w_full()
-                .px(12.0)
-                .py(9.0)
-                .gap(12.0)
-                .center_y()
-                .flex_wrap()
-                .radius(8.0)
-                .fill(t.surface_2)
-                .border(1.0, t.border_subtle)
-                .child(pill_badge(t, tier.label(), fg, bg))
-                .child(
-                    text((*spec).to_string())
-                        .font(ty::SMALL_MED)
-                        .color(t.text_primary)
-                        .min_w(200.0),
-                )
-                .child(
-                    text((*usage).to_string())
-                        .font(ty::CAPTION)
-                        .color(t.text_muted)
-                        .grow(1.0)
-                        .shrink()
-                        .wrap(),
-                ),
-        );
-    }
-
-    surface_card(
-        t,
-        "conn-vps-recommendations",
-        12.0,
-        col()
-            .px(18.0)
-            .py(14.0)
-            .gap(10.0)
-            .child(
-                col()
-                    .gap(2.0)
-                    .child(
-                        text("Faixas recomendadas de capacidade VPS")
-                            .font(ty::H3)
-                            .color(t.text_primary),
-                    )
-                    .child(
-                        text("Referência usada pelo inspetor automático ao testar uma VPS.")
-                            .font(ty::CAPTION)
-                            .color(t.text_muted)
+                        text(body_text)
+                            .font(ty::MONO_SM)
+                            .color(rune::color::hex("#e2e8f0").unwrap_or(t.text_primary))
                             .wrap(),
                     ),
-            )
-            .child(rows),
+            ),
     )
 }

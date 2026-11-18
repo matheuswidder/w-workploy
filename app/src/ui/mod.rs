@@ -24,6 +24,9 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let narrow = cx
         .layout_with("workploy-shell", |r| r[2] < 820.0)
         .unwrap_or(false);
+    let main_w = cx
+        .layout_with("workploy-main", |r| r[2])
+        .unwrap_or(1032.0);
 
     let t = UiTheme::new(s.dark, cx.env().scale);
     let k = t.build_kit();
@@ -37,7 +40,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         NavTarget::Runs => runs::view(s, t, &k, None, &mut layer),
         NavTarget::WorkflowRuns(id) => runs::view(s, t, &k, Some(id), &mut layer),
         NavTarget::Approvals => approvals::view(s, t),
-        NavTarget::Connections => connections::view(s, t),
+        NavTarget::Connections => connections::view(s, t, main_w),
         NavTarget::Settings => settings::view(s, t, &k, narrow),
         NavTarget::RunDetail { run_id, tab } => detail::view(s, t, &k, run_id, *tab),
     };

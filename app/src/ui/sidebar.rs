@@ -337,11 +337,10 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     .gap(9.0)
                     .center_y()
                     .child(
-                        el().size(26.0, 26.0)
-                            .radius(6.0)
-                            .fill(t.primary_bg)
-                            .center()
-                            .child(icon(&icons::BOLT, 14.0).color(t.primary_fg)),
+                        el().pixels(icons::brand_icon_for_theme(s.dark))
+                            .w(28.0)
+                            .h(28.0)
+                            .radius(6.0),
                     )
                     .child(
                         col()
