@@ -2,7 +2,7 @@
 
 Orquestrador desktop em Rust para CI/CD e deploy self-hosted multi-VPS.
 
-[![Versão](https://img.shields.io/badge/versão-0.1.10-d97706)](https://github.com/matheuswidder/w-workploy/releases)
+[![Versão](https://img.shields.io/badge/versão-0.1.11-d97706)](https://github.com/matheuswidder/w-workploy/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-b45309?logo=rust)](app/Cargo.toml)
 [![Plataforma](https://img.shields.io/badge/Plataforma-Windows%20%7C%20Linux-0078D6)](https://github.com/matheuswidder/w-workploy/releases)
 [![Licença MIT](https://img.shields.io/badge/licença-MIT-16a34a)](LICENSE)
@@ -20,7 +20,7 @@ O Workploy divide a execução contínua na sua infraestrutura do controle visua
 
 Rodar pipelines nas próprias VPSs elimina limites de minutos em nuvem e mantém credenciais e código na sua rede.
 
-## Novidades da v0.1.10
+## Novidades da v0.1.11
 
 - **Importação direta de `.github/workflows/*.yml` com Jobs e Sub-etapas expansíveis:** importe workflows do GitHub Actions e visualize jobs agrupados por tipo (`Typecheck + Tests + Smoke`, `Secret scan`, `Contracts Zod`, `Deploy VPS`) com sub-etapas expansíveis, no mesmo padrão do GitHub Actions.
 - **Sidebar agrupada por Projeto e Dashboard do Projeto:** navegue por projeto na barra lateral e abra o painel dedicado com KPIs de onde o projeto roda, recursos recomendados, tempo médio dos runs, taxa de sucesso e commits recentes.
@@ -90,7 +90,7 @@ flowchart LR
     end
 
     Desktop <-->|"HTTPS (PAT)"| API
-    Sobre -->|"Consulta e baixa v0.1.10+"| Releases
+    Sobre -->|"Consulta e baixa v0.1.11+"| Releases
     Sync <-->|"SSH (logs, runs, métricas e aprovações)"| Runner
     Hook -->|"POST Webhook"| Runner
     Runner -->|"Sondagem 24/7 & git clone/fetch"| API
@@ -98,18 +98,18 @@ flowchart LR
 
 ## Instalação (Windows)
 
-Baixe o pacote da versão `0.1.10` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
+Baixe o pacote da versão `0.1.11` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
 
-- **`Workploy-Setup-0.1.10.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
-- **`workploy-0.1.10-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
+- **`Workploy-Setup-0.1.11.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
+- **`workploy-0.1.11-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
 
 ## Instalação (Linux x86_64)
 
-Baixe o pacote `workploy-0.1.10-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
+Baixe o pacote `workploy-0.1.11-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
 
 ```bash
-tar -xzf workploy-0.1.10-linux-x86_64.tar.gz
-cd workploy-0.1.10-linux-x86_64
+tar -xzf workploy-0.1.11-linux-x86_64.tar.gz
+cd workploy-0.1.11-linux-x86_64
 ./install.sh
 ```
 
@@ -120,7 +120,7 @@ O script instala o binário em `~/.local/bin/workploy`, o ícone e o atalho `.de
 O Workploy verifica e aplica novas versões na interface em **Configurações → Sobre**:
 
 1. Clique em **Buscar atualizações** para consultar a release oficial mais recente no GitHub.
-2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.10 agora** (ou na versão indicada).
+2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.11 agora** (ou na versão indicada).
 3. No Windows, o app baixa o instalador oficial (`.exe`), aplica a atualização e reinicia. No Linux, o auto-update integrado baixa o pacote `.tar.gz`, substitui o binário instalado e reinicia o aplicativo.
 
 ## Compilação e desenvolvimento local
@@ -159,7 +159,7 @@ cargo run --manifest-path app/Cargo.toml -- --demo
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 ```
 
-O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.10.exe` e `workploy-0.1.10-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
+O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.11.exe` e `workploy-0.1.11-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
 
 ## Estrutura do projeto
 

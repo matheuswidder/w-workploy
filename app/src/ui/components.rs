@@ -187,19 +187,31 @@ pub fn chip<S: 'static>(
     active: bool,
     on_press: impl Fn(&mut S, &mut Tx) + 'static,
 ) -> El {
+    chip_with_icon(t, key, label, None, active, on_press)
+}
+
+pub fn chip_with_icon<S: 'static>(
+    t: UiTheme,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    ic: Option<&'static Icon>,
+    active: bool,
+    on_press: impl Fn(&mut S, &mut Tx) + 'static,
+) -> El {
     let label = label.into();
     let (fill, border, fg) = if active {
         (t.accent_soft, t.accent.alpha(0.45), t.accent)
     } else {
         (t.surface_2, t.border_subtle, t.text_secondary)
     };
-    row()
+    let mut r = row()
         .key(key)
         .role("button")
         .label(label.clone())
         .checked(active)
         .h(30.0)
         .px(11.0)
+        .gap(6.0)
         .center()
         .radius(6.0)
         .fill(fill)
@@ -211,8 +223,11 @@ pub fn chip<S: 'static>(
         .press(t.press)
         .press_scale(0.98)
         .motion(motion::SNAPPY)
-        .on_press_tx(on_press)
-        .child(text(label).font(ty::SMALL_MED).color(fg).a11y_hidden())
+        .on_press_tx(on_press);
+    if let Some(i) = ic {
+        r = r.child(icon(i, 13.0).color(fg).a11y_hidden());
+    }
+    r.child(text(label).font(ty::SMALL_MED).color(fg).a11y_hidden())
 }
 
 pub fn header_card(t: UiTheme, key: impl Into<String>, radius: f32, inner: El) -> El {

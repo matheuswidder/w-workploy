@@ -17,6 +17,12 @@ const SUB_ROW_PITCH: f32 = 30.0;
 const SECTION_H: f32 = 24.0;
 
 fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) -> String {
+    let has_active_binding = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .any(|b| b.enabled);
     match target {
         NavTarget::Onboarding => "nav-onboarding".into(),
         NavTarget::Runs => {
@@ -31,6 +37,24 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                         .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == wf_id))
                 {
                     return format!("nav-proj-wf-{pid}-{wf_id}");
+                }
+                if has_active_binding {
+                    if let Some(pid) = &s.selected_project_id
+                        && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+                    {
+                        return format!("nav-proj-{pid}");
+                    }
+                    if !collapsed
+                        && let Some(b) = s
+                            .snapshot
+                            .settings
+                            .repo_bindings
+                            .iter()
+                            .find(|b| s.project_workflows(b).iter().any(|w| &w.id == wf_id))
+                    {
+                        return format!("nav-proj-wf-{}-{wf_id}", b.id);
+                    }
+                    return "nav-runs".into();
                 }
                 format!("wf-{wf_id}")
             } else if let Some(pid) = &s.selected_project_id
@@ -52,6 +76,23 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                     .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == id))
             {
                 format!("nav-proj-wf-{pid}-{id}")
+            } else if has_active_binding {
+                if let Some(pid) = &s.selected_project_id
+                    && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+                {
+                    return format!("nav-proj-{pid}");
+                }
+                if !collapsed
+                    && let Some(b) = s
+                        .snapshot
+                        .settings
+                        .repo_bindings
+                        .iter()
+                        .find(|b| s.project_workflows(b).iter().any(|w| &w.id == id))
+                {
+                    return format!("nav-proj-wf-{}-{id}", b.id);
+                }
+                "nav-runs".into()
             } else {
                 format!("wf-{id}")
             }
@@ -253,7 +294,11 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                                 s.selected_workflow_id = Some(wfid_sub.clone());
                                 s.navigate_to(NavTarget::Runs);
                             })
-                            .child(icon(&icons::PLAY, 11.5).color(ic_col).a11y_hidden())
+                            .child(
+                                icon(icons::workflow_icon(&wf_name), 12.5)
+                                    .color(ic_col)
+                                    .a11y_hidden(),
+                            )
                             .child(
                                 text(wf_name)
                                     .font(if is_sub_sel { ty::SMALL_MED } else { ty::SMALL })
@@ -268,75 +313,87 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                 }
             }
         }
-        y += 8.0;
     }
 
-    // 3. Receitas de fluxo
-    if !collapsed {
-        items.push(
-            row()
-                .key("hdr-wfs")
-                .absolute(0.0, y)
-                .size(w, SECTION_H)
-                .px(18.0)
-                .center_y()
-                .justify_between()
-                .help("Receitas reutilizáveis (o que fazer). Onde e quando rodar é definido nos Vínculos em Configurações → GitHub.")
-                .child(
-                    text("RECEITAS DE FLUXO")
-                        .font(ty::EYEBROW)
-                        .color(t.text_muted),
-                ),
-        );
-        y += SECTION_H + 2.0;
-    }
+    let has_active_binding = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .any(|b| b.enabled);
 
-    for wf in &s.snapshot.workflows {
-        let key = format!("wf-{}", wf.id);
-        let is_sel = selected_id == key;
-        if is_sel {
-            sel_y = y;
-            sel_h = ROW_H;
+    // 3. Receitas de fluxo (visível apenas quando não há nenhum RepoBinding ativo)
+    if !has_active_binding {
+        if !s.snapshot.settings.repo_bindings.is_empty() {
+            y += 8.0;
         }
-        let wf_id = wf.id.clone();
-        let count = s
-            .snapshot
-            .runs
-            .iter()
-            .filter(|r| r.workflow_id == wf.id)
-            .count();
-        let badge = (!collapsed && count > 0).then(|| {
-            text(count.to_string())
-                .font(ty::CAPTION)
-                .color(if is_sel { t.text_primary } else { t.text_muted })
-        });
-        items.push(nav_row(
-            t,
-            key,
-            wf.name.clone(),
-            &icons::PLAY,
-            badge,
-            is_sel,
-            collapsed,
-            PILL_INSET,
-            y,
-            pill_w,
-            move |s: &mut AppState| {
-                s.selected_project_id = None;
-                s.selected_workflow_id = Some(wf_id.clone());
-                s.navigate_to(NavTarget::WorkflowRuns(wf_id.clone()));
-            },
-        ));
-        y += ROW_PITCH;
+        if !collapsed {
+            items.push(
+                row()
+                    .key("hdr-wfs")
+                    .absolute(0.0, y)
+                    .size(w, SECTION_H)
+                    .px(18.0)
+                    .center_y()
+                    .justify_between()
+                    .help("Receitas reutilizáveis (o que fazer). Onde e quando rodar é definido nos Vínculos em Configurações → GitHub.")
+                    .child(
+                        text("RECEITAS DE FLUXO")
+                            .font(ty::EYEBROW)
+                            .color(t.text_muted),
+                    ),
+            );
+            y += SECTION_H + 2.0;
+        }
+
+        for wf in &s.snapshot.workflows {
+            let key = format!("wf-{}", wf.id);
+            let is_sel = selected_id == key;
+            if is_sel {
+                sel_y = y;
+                sel_h = ROW_H;
+            }
+            let wf_id = wf.id.clone();
+            let count = s
+                .snapshot
+                .runs
+                .iter()
+                .filter(|r| r.workflow_id == wf.id)
+                .count();
+            let badge = (!collapsed && count > 0).then(|| {
+                text(count.to_string())
+                    .font(ty::CAPTION)
+                    .color(if is_sel { t.text_primary } else { t.text_muted })
+            });
+            items.push(nav_row(
+                t,
+                key,
+                wf.name.clone(),
+                &icons::WORKFLOW,
+                badge,
+                is_sel,
+                collapsed,
+                PILL_INSET,
+                y,
+                pill_w,
+                move |s: &mut AppState| {
+                    s.selected_project_id = None;
+                    s.selected_workflow_id = Some(wf_id.clone());
+                    s.navigate_to(NavTarget::WorkflowRuns(wf_id.clone()));
+                },
+            ));
+            y += ROW_PITCH;
+        }
     }
 
     // "+ Novo fluxo"
+    let new_wf_help = "Cria uma nova receita de fluxo genérica não vinculada a um projeto.";
     let new_btn = if collapsed {
         row()
             .key("nav-new-wf")
             .role("button")
-            .label("Novo fluxo")
-            .help("Criar novo fluxo")
+            .label("+ Novo fluxo")
+            .help(new_wf_help)
             .absolute(PILL_INSET, y + 2.0)
             .size(pill_w, ROW_H)
             .center()
@@ -349,12 +406,17 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             .press(t.press)
             .press_scale(0.97)
             .on_press(|s: &mut AppState| s.open_new_workflow_modal())
-            .child(icon(&icons::PLUS, 14.0).color(t.text_secondary).a11y_hidden())
+            .child(
+                icon(&icons::WORKFLOW, 14.0)
+                    .color(t.text_secondary)
+                    .a11y_hidden(),
+            )
     } else {
         row()
             .key("nav-new-wf")
             .role("button")
-            .label("Novo fluxo")
+            .label("+ Novo fluxo")
+            .help(new_wf_help)
             .absolute(PILL_INSET, y + 2.0)
             .size(pill_w, ROW_H)
             .px(10.0)
@@ -369,9 +431,13 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             .press(t.press)
             .press_scale(0.98)
             .on_press(|s: &mut AppState| s.open_new_workflow_modal())
-            .child(icon(&icons::PLUS, 13.0).color(t.text_secondary).a11y_hidden())
             .child(
-                text("Novo fluxo")
+                icon(&icons::WORKFLOW, 13.5)
+                    .color(t.text_secondary)
+                    .a11y_hidden(),
+            )
+            .child(
+                text("+ Novo fluxo")
                     .font(ty::SMALL_MED)
                     .color(t.text_secondary)
                     .a11y_hidden(),

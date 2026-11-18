@@ -1753,8 +1753,97 @@ pub fn remote_approve_or_cancel(sh: &SharedHandle, server_id: &str, run_id: &str
     });
 }
 
-pub fn webhook_endpoint_and_secret(server: &VpsServer) -> (String, Option<String>) {
-    let host = server.host.trim();
+#[cfg(test)]
+thread_local! {
+    static TEST_SSH_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn ssh_config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(custom) = TEST_SSH_CONFIG_PATH.with(|c| c.borrow().clone()) {
+        return Some(custom);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|s| !s.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| {
+            match (
+                std::env::var_os("HOMEDRIVE"),
+                std::env::var_os("HOMEPATH"),
+            ) {
+                (Some(d), Some(p)) if !d.is_empty() && !p.is_empty() => {
+                    Some(PathBuf::from(d).join(p))
+                }
+                _ => None,
+            }
+        })?;
+    Some(home.join(".ssh").join("config"))
+}
+
+fn parse_ssh_config_hostname(config_text: &str, alias: &str) -> Option<String> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return None;
+    }
+    let mut in_matching_host = false;
+    for raw_line in config_text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(sep_idx) = line.find(|c: char| c.is_whitespace() || c == '=') else {
+            continue;
+        };
+        let keyword = line[..sep_idx].trim();
+        let rest = line[sep_idx..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+            .trim();
+        if rest.is_empty() {
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("Host") {
+            in_matching_host = rest
+                .split_whitespace()
+                .any(|pattern| pattern.trim_matches('"') == alias);
+        } else if keyword.eq_ignore_ascii_case("Match") {
+            in_matching_host = false;
+        } else if in_matching_host
+            && keyword.eq_ignore_ascii_case("HostName")
+            && let Some(val) = rest.split_whitespace().next()
+        {
+            let cleaned = val.trim_matches('"').trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn resolve_ssh_alias_host(alias_or_host: &str) -> Option<String> {
+    let target = alias_or_host.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.contains('.')
+        || target.contains(':')
+        || target.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Some(target.to_string());
+    }
+    let path = ssh_config_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_ssh_config_hostname(&content, target)
+}
+
+pub fn webhook_endpoint_and_secret(server: &VpsServer) -> (String, Option<String>, bool) {
+    let raw_host = server.host.trim();
+    let (host, unresolved_alias) = match resolve_ssh_alias_host(raw_host) {
+        Some(resolved) => (resolved, false),
+        None => (raw_host.to_string(), !raw_host.is_empty()),
+    };
     let port = if server.runner_port == 0 {
         8787
     } else {
@@ -1765,7 +1854,7 @@ pub fn webhook_endpoint_and_secret(server: &VpsServer) -> (String, Option<String
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    (url, secret)
+    (url, secret, unresolved_alias)
 }
 
 fn begin_vps_purge(s: &mut Shared, server_id: &str) -> Option<VpsServer> {
@@ -2081,9 +2170,84 @@ RUNNER_ACTIVE=1\r\n";
         assert!(!script.contains("cargo --version || true"));
     }
 
+    struct TempSshConfigGuard {
+        path: PathBuf,
+    }
+
+    impl TempSshConfigGuard {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("workploy-test-ssh-cfg-{}", new_id("cfg")));
+            std::fs::write(&path, contents).unwrap();
+            TEST_SSH_CONFIG_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempSshConfigGuard {
+        fn drop(&mut self) {
+            TEST_SSH_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn resolve_ssh_alias_host_handles_direct_hosts_and_ssh_config_aliases() {
+        let _cfg = TempSshConfigGuard::new(
+            "\
+# Comentário global
+Host *
+    ServerAliveInterval 30
+
+Host concef-vps
+    HostName 72.61.28.1
+    User root
+    Port 22
+
+Host staging-box prod-alias
+    HostName = 198.51.100.77
+    User deploy
+",
+        );
+
+        // Domínio direto
+        assert_eq!(
+            resolve_ssh_alias_host("ci.workploy.com.br"),
+            Some("ci.workploy.com.br".into())
+        );
+        // IPv4 direto
+        assert_eq!(
+            resolve_ssh_alias_host("72.61.28.1"),
+            Some("72.61.28.1".into())
+        );
+        // IPv6 com ':'
+        assert_eq!(
+            resolve_ssh_alias_host("2001:db8::1"),
+            Some("2001:db8::1".into())
+        );
+        // Alias resolvido via bloco Host exato
+        assert_eq!(
+            resolve_ssh_alias_host("concef-vps"),
+            Some("72.61.28.1".into())
+        );
+        // Alias resolvido em lista separada por espaço
+        assert_eq!(
+            resolve_ssh_alias_host("prod-alias"),
+            Some("198.51.100.77".into())
+        );
+        // Alias ausente -> None
+        assert_eq!(resolve_ssh_alias_host("alias-inexistente"), None);
+    }
+
     #[test]
     fn webhook_endpoint_and_secret_formats_url_with_port_fallback_and_reads_vault() {
         let _guard = vault::test_lock();
+        let _cfg = TempSshConfigGuard::new(
+            "\
+Host concef-vps
+    HostName 72.61.28.1
+    User root
+",
+        );
         let mut srv = VpsServer {
             id: "vps-webhook-helper-test".into(),
             name: "Prod".into(),
@@ -2099,15 +2263,33 @@ RUNNER_ACTIVE=1\r\n";
         let key = vault::vps_webhook_secret_key(&srv.id);
         let _ = vault::delete_secret(&key);
 
-        let (url_default, sec_none) = webhook_endpoint_and_secret(&srv);
+        let (url_default, sec_none, unresolved_default) = webhook_endpoint_and_secret(&srv);
         assert_eq!(url_default, "http://203.0.113.42:8787/webhook/github");
         assert_eq!(sec_none, None);
+        assert!(!unresolved_default);
 
         srv.runner_port = 9095;
         vault::save_secret(&key, "whsec-test-123").unwrap();
-        let (url_custom, sec_some) = webhook_endpoint_and_secret(&srv);
+        let (url_custom, sec_some, unresolved_custom) = webhook_endpoint_and_secret(&srv);
         assert_eq!(url_custom, "http://203.0.113.42:9095/webhook/github");
         assert_eq!(sec_some, Some("whsec-test-123".into()));
+        assert!(!unresolved_custom);
+
+        // Alias resolvido do ~/.ssh/config deve usar o HostName real e unresolved = false
+        srv.host = "concef-vps".into();
+        srv.runner_port = 8787;
+        let (url_alias_ok, _, unresolved_alias_ok) = webhook_endpoint_and_secret(&srv);
+        assert_eq!(url_alias_ok, "http://72.61.28.1:8787/webhook/github");
+        assert!(!unresolved_alias_ok);
+
+        // Alias ausente no ~/.ssh/config faz fallback para o texto original e sinaliza unresolved = true
+        srv.host = "alias-sem-config".into();
+        let (url_alias_missing, _, unresolved_alias_missing) = webhook_endpoint_and_secret(&srv);
+        assert_eq!(
+            url_alias_missing,
+            "http://alias-sem-config:8787/webhook/github"
+        );
+        assert!(unresolved_alias_missing);
 
         let _ = vault::delete_secret(&key);
     }

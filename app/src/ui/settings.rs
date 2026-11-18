@@ -726,6 +726,35 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
                         ),
                 );
             }
+            if b.trigger_mode == TriggerMode::WebhookOnVps
+                && let Some(sid) = b.target_server_id.as_deref()
+                && let Some(srv) = s.snapshot.settings.servers.iter().find(|v| v.id == sid)
+                && workploy::vps::webhook_endpoint_and_secret(srv).2
+            {
+                info_col = info_col.child(
+                    row()
+                        .key(format!("binding-webhook-alias-warn-{}", b.id))
+                        .w_full()
+                        .min_w(0.0)
+                        .px(9.0)
+                        .py(6.0)
+                        .gap(6.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(t.warning_bg)
+                        .border(1.0, t.warning.alpha(0.38))
+                        .child(icon(&icons::BOLT, 12.5).color(t.warning).a11y_hidden())
+                        .child(
+                            text("A URL do webhook usa um alias SSH que o GitHub não alcança — use o IP/domínio público da VPS ou prefira Sondagem 24/7.")
+                                .font(ty::CAPTION)
+                                .color(t.warning)
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .wrap(),
+                        ),
+                );
+            }
 
             bindings_col = bindings_col.child(
                 row()

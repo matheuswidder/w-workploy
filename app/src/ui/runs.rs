@@ -148,7 +148,7 @@ pub fn view(
                     t,
                     "btn-new-wf-top",
                     "Novo fluxo",
-                    Some(&icons::PLUS),
+                    Some(&icons::WORKFLOW),
                     34.0,
                     |s: &mut AppState, _| s.open_new_workflow_modal(),
                 )
@@ -167,6 +167,29 @@ pub fn view(
             );
     }
 
+    let title_el = if let Some(w) = wf {
+        row()
+            .w_full()
+            .min_w(0.0)
+            .gap(8.0)
+            .center_y()
+            .child(
+                icon(icons::workflow_icon(&w.name), 18.0)
+                    .color(t.accent)
+                    .a11y_hidden(),
+            )
+            .child(
+                text(title)
+                    .font(ty::H1)
+                    .color(t.text_primary)
+                    .shrink()
+                    .min_w(0.0)
+                    .truncate(),
+            )
+    } else {
+        text(title).font(ty::H1).color(t.text_primary).truncate()
+    };
+
     let hdr_card = header_card(
         t,
         "runs-header-card",
@@ -183,7 +206,7 @@ pub fn view(
                     .shrink()
                     .min_w(170.0)
                     .gap(4.0)
-                    .child(text(title).font(ty::H1).color(t.text_primary).truncate())
+                    .child(title_el)
                     .child(text(subtitle).font(ty::SMALL).color(t.text_muted).truncate()),
             )
             .child(header_actions),
@@ -1611,7 +1634,11 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
                             .gap(10.0)
                             .center_y()
                             .flex_wrap()
-                            .child(icon(&icons::PLAY, 13.0).color(t.accent).a11y_hidden())
+                            .child(
+                                icon(icons::workflow_icon(&wf.name), 14.5)
+                                    .color(t.accent)
+                                    .a11y_hidden(),
+                            )
                             .child(
                                 text(wf.name.clone())
                                     .font(ty::BODY_MED)
@@ -1646,7 +1673,7 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         row()
             .gap(5.0)
             .center_y()
-            .child(icon(&icons::ACTIVITY, 13.0).color(t.accent))
+            .child(icon(icons::workflow_icon(&w.name), 13.5).color(t.accent))
             .child(
                 text("Pipeline:")
                     .font(ty::CAPTION)
@@ -1815,9 +1842,19 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
     meta = meta.child(status_pill(t, r.status));
     if show_wf_name {
         meta = meta.child(
-            text(r.workflow_name.clone())
-                .font(ty::CAPTION)
-                .color(t.accent),
+            row()
+                .gap(4.0)
+                .center_y()
+                .child(
+                    icon(icons::workflow_icon(&r.workflow_name), 12.0)
+                        .color(t.accent)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(r.workflow_name.clone())
+                        .font(ty::CAPTION)
+                        .color(t.accent),
+                ),
         );
     }
     if let Some(repo) = &r.repo_name

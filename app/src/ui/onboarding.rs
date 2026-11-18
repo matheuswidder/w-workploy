@@ -265,7 +265,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     t,
                     "onb-btn-new",
                     "Novo fluxo",
-                    Some(&icons::PLUS),
+                    Some(&icons::WORKFLOW),
                     32.0,
                     |s: &mut AppState, _| s.open_new_workflow_modal(),
                 )

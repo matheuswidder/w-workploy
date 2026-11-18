@@ -2737,17 +2737,29 @@ impl AppState {
             );
             return;
         };
-        let (url, _) = vps::webhook_endpoint_and_secret(srv);
+        let (url, _, unresolved_alias) = vps::webhook_endpoint_and_secret(srv);
         tx.copy(url.clone());
-        self.push_toast(
-            format!("copy-wh-url-{server_id}"),
-            "URL do Webhook copiada",
-            Some(format!(
-                "{url} — cole em Settings → Webhooks no repositório GitHub."
-            )),
-            ToastKind::Success,
-            tx,
-        );
+        if unresolved_alias {
+            self.push_toast(
+                format!("copy-wh-url-{server_id}"),
+                "URL do Webhook copiada (alias SSH não resolvido)",
+                Some(format!(
+                    "{url} — o host configurado é um alias SSH que o GitHub não alcança. Use o IP/domínio público da VPS ou troque para 'Sondagem 24/7 na VPS'."
+                )),
+                ToastKind::Warning,
+                tx,
+            );
+        } else {
+            self.push_toast(
+                format!("copy-wh-url-{server_id}"),
+                "URL do Webhook copiada",
+                Some(format!(
+                    "{url} — cole em Settings → Webhooks no repositório GitHub."
+                )),
+                ToastKind::Success,
+                tx,
+            );
+        }
     }
 
     pub fn copy_binding_webhook_secret(&mut self, server_id: &str, tx: &mut Tx) {
@@ -2767,7 +2779,7 @@ impl AppState {
             );
             return;
         };
-        let (_, secret) = vps::webhook_endpoint_and_secret(srv);
+        let (_, secret, _) = vps::webhook_endpoint_and_secret(srv);
         let resolved = if let Some(sec) = secret {
             Some(sec)
         } else if self.demo_mode && srv.webhook_secret_key.is_some() {

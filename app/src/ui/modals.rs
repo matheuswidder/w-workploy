@@ -8,7 +8,9 @@ use crate::state::{
     AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind, WorkflowPreset,
     platform_compat_warning,
 };
-use crate::ui::components::{btn_danger, btn_icon, btn_neutral, chip, pill_badge, primary_button};
+use crate::ui::components::{
+    btn_danger, btn_icon, btn_neutral, chip, chip_with_icon, pill_badge, primary_button,
+};
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
@@ -25,18 +27,19 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
 
             let mut presets_row = row().gap(6.0).flex_wrap();
             for preset in WorkflowPreset::ALL {
-                let key = match preset {
-                    WorkflowPreset::NodePnpmCi => "ed-preset-node",
-                    WorkflowPreset::RustCargoCi => "ed-preset-rust",
-                    WorkflowPreset::DockerComposeRedeploy => "ed-preset-docker",
-                    WorkflowPreset::AuditAndSmoke => "ed-preset-audit",
+                let (key, preset_icon) = match preset {
+                    WorkflowPreset::NodePnpmCi => ("ed-preset-node", &icons::WORKFLOW),
+                    WorkflowPreset::RustCargoCi => ("ed-preset-rust", &icons::WORKFLOW),
+                    WorkflowPreset::DockerComposeRedeploy => ("ed-preset-docker", &icons::DEPLOY),
+                    WorkflowPreset::AuditAndSmoke => ("ed-preset-audit", &icons::WORKFLOW),
                 };
                 let active = draft.name.text.trim() == preset.label();
                 presets_row = presets_row.child(
-                    chip(
+                    chip_with_icon(
                         t,
                         key,
                         preset.label(),
+                        Some(preset_icon),
                         active,
                         move |s: &mut AppState, _| {
                             s.next_uid += 1;

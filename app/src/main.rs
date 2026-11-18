@@ -1797,6 +1797,26 @@ mod tests {
                 .iter()
                 .any(|t| t.options.title == "Segredo do Webhook copiado")
         );
+
+        // Unresolved SSH alias shows inline warning banner and Warning toast when copying URL
+        assert!(rt.find("binding-webhook-alias-warn-rb-erp").is_none());
+        rt.update(|s, _| {
+            s.snapshot.settings.servers[0].host = "workploy-nonexistent-alias-test".into();
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("binding-webhook-alias-warn-rb-erp").is_some());
+
+        let (ux2, uy2) = rt.find("btn-copy-wh-url-rb-erp").unwrap();
+        rt.pointer_down(ux2, uy2);
+        rt.pointer_up(ux2, uy2);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.toasts.entries().iter().any(|t| {
+                t.options.kind == state::ToastKind::Warning
+                    && t.options.title.contains("alias SSH")
+            }),
+            "expected Warning toast when copying webhook URL for unresolved SSH alias"
+        );
     }
 
     #[test]
@@ -2481,5 +2501,73 @@ mod tests {
                 .any(|e| e.text.as_deref() == Some("▸ Varredura profunda")),
             "expected ::workploy-substep:: line rendered as '▸ Varredura profunda' while active substep stays open"
         );
+    }
+
+    #[test]
+    fn reicon_workflow_deploy_icons_and_sidebar_deduplication_work() {
+        let wf_cov = rune::text::icon_coverage(&ui::icons::WORKFLOW, 24);
+        let dp_cov = rune::text::icon_coverage(&ui::icons::DEPLOY, 24);
+        assert!(
+            wf_cov.iter().filter(|&&c| c > 0).count() > 20,
+            "WORKFLOW icon must rasterize non-empty pixels"
+        );
+        assert!(
+            dp_cov.iter().filter(|&&c| c > 0).count() > 20,
+            "DEPLOY icon must rasterize non-empty pixels"
+        );
+        assert!(std::ptr::eq(
+            ui::icons::workflow_icon("Deploy VPS"),
+            &ui::icons::DEPLOY
+        ));
+        assert!(std::ptr::eq(
+            ui::icons::workflow_icon("Docker Compose Redeploy"),
+            &ui::icons::DEPLOY
+        ));
+        assert!(std::ptr::eq(
+            ui::icons::workflow_icon("CI Principal"),
+            &ui::icons::WORKFLOW
+        ));
+
+        // 1. With active RepoBinding(s), RECEITAS DE FLUXO is hidden while "+ Novo fluxo" remains
+        let mut rt_active = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt_active.frame(0.0);
+        rt_active.frame(1.0 / 60.0);
+        assert!(rt_active.find("hdr-projs").is_some());
+        assert!(rt_active.find("hdr-wfs").is_none());
+        assert!(rt_active.find("wf-wf-ci-principal").is_none());
+        assert!(rt_active.find("wf-wf-deploy-vps").is_none());
+        let els_active = rt_active.elements();
+        let new_wf_btn = els_active
+            .iter()
+            .find(|e| e.key.as_deref() == Some("nav-new-wf"))
+            .expect("nav-new-wf exists");
+        assert_eq!(
+            new_wf_btn.help.as_deref(),
+            Some("Cria uma nova receita de fluxo genérica não vinculada a um projeto.")
+        );
+        assert!(rt_active.find("btn-new-wf-top").is_some());
+
+        // 2. With no active RepoBinding, RECEITAS DE FLUXO is visible
+        let mut empty_state = AppState::init_demo();
+        for b in &mut empty_state.snapshot.settings.repo_bindings {
+            b.enabled = false;
+        }
+        let mut rt_inactive = Runtime::new(
+            empty_state,
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt_inactive.frame(0.0);
+        rt_inactive.frame(1.0 / 60.0);
+        assert!(rt_inactive.find("hdr-wfs").is_some());
+        assert!(rt_inactive.find("wf-wf-ci-principal").is_some());
+        assert!(rt_inactive.find("wf-wf-deploy-vps").is_some());
+        assert!(rt_inactive.find("nav-new-wf").is_some());
     }
 }
