@@ -36,7 +36,71 @@ fn on_key(s: &mut AppState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     false
 }
 
+const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:48731";
+
+fn is_demo_mode() -> bool {
+    rune::tooling::extra_args()
+        .iter()
+        .any(|a| a == "--demo" || a == "-demo")
+        || std::env::args().any(|a| a == "--demo" || a == "-demo")
+}
+
+fn try_acquire_single_instance(addr: &str) -> Result<std::net::TcpListener, bool> {
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => Ok(listener),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            if let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>()
+                && let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                    &sock_addr,
+                    std::time::Duration::from_millis(500),
+                )
+            {
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                let _ = std::io::Write::write_all(&mut stream, b"SHOW\n");
+                let _ = std::io::Write::flush(&mut stream);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(true)
+        }
+        Err(_) => Err(false),
+    }
+}
+
+fn spawn_single_instance_listener<F>(listener: std::net::TcpListener, on_show: F)
+where
+    F: Fn() + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buf = [0u8; 64];
+            if let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
+                let cmd = String::from_utf8_lossy(&buf[..n]);
+                if cmd.lines().any(|line| line.trim() == "SHOW") {
+                    on_show();
+                }
+            }
+        }
+    });
+}
+
 fn main() {
+    let is_headless = rune::tooling::is_headless();
+    let demo_mode = is_demo_mode();
+
+    let single_instance_listener = if !is_headless && !demo_mode {
+        match try_acquire_single_instance(SINGLE_INSTANCE_ADDR) {
+            Ok(listener) => Some(listener),
+            Err(true) => return,
+            Err(false) => None,
+        }
+    } else {
+        None
+    };
+
     let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").to_vec());
 
     let spec = AppSpec::<AppState> {
@@ -70,9 +134,17 @@ fn main() {
         .keep_running()
         .on_close(on_close);
 
-    let _tray = if !rune::tooling::is_headless() {
+    let handle = app.handle();
+    if let Some(listener) = single_instance_listener {
+        let show_handle = handle.clone();
+        spawn_single_instance_listener(listener, move || {
+            show_handle.open();
+        });
+    }
+
+    let _tray = if !is_headless {
         load_tray_icon().and_then(|tray_icon| {
-            let handle = app.handle();
+            let tray_handle = handle.clone();
             let tray_spec = TraySpec::new("br.com.widder.workploy", "Workploy", tray_icon)
                 .tooltip("Workploy — CI/CD & Deploy self-hosted")
                 .menu(vec![
@@ -81,9 +153,9 @@ fn main() {
                     TrayItem::action("quit", "Sair"),
                 ]);
             Tray::new(tray_spec, move |ev| match ev {
-                TrayEvent::Activate { .. } => handle.open(),
-                TrayEvent::Menu(id) if id == "open" => handle.open(),
-                TrayEvent::Menu(id) if id == "quit" => handle.quit(),
+                TrayEvent::Activate { .. } => tray_handle.open(),
+                TrayEvent::Menu(id) if id == "open" => tray_handle.open(),
+                TrayEvent::Menu(id) if id == "quit" => tray_handle.quit(),
                 _ => {}
             })
             .ok()
@@ -1074,5 +1146,192 @@ mod tests {
         rt.pointer_up(lx, ly);
         rt.frame(1.0 / 60.0);
         assert!(rt.find("conn-provision-log").is_none());
+    }
+
+    #[test]
+    fn provision_modal_states_wrapping_and_responsive_viewports_work() {
+        let long_log = "Created symlink /etc/systemd/system/multi-user.target.wants/workploy-runner-very-long-unit-name-without-spaces-to-test-wrap.service -> /etc/systemd/system/workploy-runner.service.\n=== Provisionamento concluído! ===";
+
+        // 1. Check wrapping and container bounds across 360px, 768px, 1440px
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            state.open_provision_modal("vps-prod");
+            state.snapshot.provision_log = long_log.into();
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            let dialog = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("provision-modal-dialog"))
+                .expect("provision-modal-dialog exists");
+            let log_box = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("prov-log-box"))
+                .expect("prov-log-box exists");
+            let log_text = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("prov-log-text"))
+                .expect("prov-log-text exists");
+
+            assert!(
+                dialog.rect[2] <= vw + 0.5,
+                "dialog wider than viewport {vw}: {:?}",
+                dialog.rect
+            );
+            assert!(
+                log_box.rect[0] + log_box.rect[2] <= dialog.rect[0] + dialog.rect[2] + 0.5,
+                "log_box overflows dialog at {vw}px: box={:?}, dialog={:?}",
+                log_box.rect,
+                dialog.rect
+            );
+            assert!(
+                log_text.rect[0] + log_text.rect[2] <= log_box.rect[0] + log_box.rect[2] + 0.5,
+                "log_text overflows log_box at {vw}px: text={:?}, box={:?}",
+                log_text.rect,
+                log_box.rect
+            );
+        }
+
+        // 2. While is_provisioning is true: animated indicator + disabled "Em andamento..." button
+        let mut state_running = AppState::init_demo();
+        state_running.open_provision_modal("vps-prod");
+        state_running.snapshot.provisioning_server_id = Some("vps-prod".into());
+        state_running.snapshot.provision_log = "Conectando via SSH...".into();
+        let mut rt_running = Runtime::new(
+            state_running,
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt_running.frame(0.0);
+        rt_running.frame(1.0 / 60.0);
+
+        assert!(rt_running.find("prov-progress-indicator").is_some());
+        assert!(rt_running.find("prov-active-pulse").is_some());
+        let els_run = rt_running.elements();
+        let start_btn = els_run
+            .iter()
+            .find(|e| e.key.as_deref() == Some("prov-start"))
+            .expect("prov-start exists while running");
+        assert_eq!(start_btn.label.as_deref(), Some("Em andamento..."));
+        assert!(!start_btn.focusable, "disabled button must not take focus");
+
+        // Clicking disabled "Em andamento..." does not overwrite provision_log
+        let (sx, sy) = rt_running.find("prov-start").unwrap();
+        rt_running.pointer_down(sx, sy);
+        rt_running.pointer_up(sx, sy);
+        rt_running.frame(1.0 / 60.0);
+        assert_eq!(
+            rt_running.state.snapshot.provision_log,
+            "Conectando via SSH..."
+        );
+
+        // 3. After completion ("=== Provisionamento concluído! ==="): badge, banner, "Executar novamente", "Concluir"
+        let mut state_done = AppState::init_demo();
+        state_done.open_provision_modal("vps-prod");
+        let mut rt_done =
+            Runtime::new(state_done, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt_done.frame(0.0);
+        rt_done.frame(1.0 / 60.0);
+
+        let (psx, psy) = rt_done.find("prov-start").expect("prov-start exists");
+        rt_done.pointer_down(psx, psy);
+        rt_done.pointer_up(psx, psy);
+        for _ in 0..30 {
+            rt_done.frame(1.0 / 60.0);
+        }
+
+        assert!(rt_done.find("prov-success-badge").is_some());
+        assert!(rt_done.find("prov-success-banner").is_some());
+        assert!(rt_done.find("prov-progress-indicator").is_none());
+
+        let els_done = rt_done.elements();
+        let rerun_btn = els_done
+            .iter()
+            .find(|e| e.key.as_deref() == Some("prov-rerun"))
+            .expect("prov-rerun exists after completion");
+        assert_eq!(rerun_btn.label.as_deref(), Some("Executar novamente"));
+        let conclude_btn = els_done
+            .iter()
+            .find(|e| e.key.as_deref() == Some("prov-close"))
+            .expect("prov-close (Concluir) exists after completion");
+        assert_eq!(conclude_btn.label.as_deref(), Some("Concluir"));
+
+        // Click "Executar novamente" -> stays open and keeps completion
+        let (rx, ry) = rt_done.find("prov-rerun").unwrap();
+        rt_done.pointer_down(rx, ry);
+        rt_done.pointer_up(rx, ry);
+        for _ in 0..30 {
+            rt_done.frame(1.0 / 60.0);
+        }
+        assert!(matches!(rt_done.state.modal, ModalState::ProvisionModal(_)));
+
+        // Click "Concluir" -> closes modal
+        let (cx, cy) = rt_done.find("prov-close").unwrap();
+        rt_done.pointer_down(cx, cy);
+        rt_done.pointer_up(cx, cy);
+        rt_done.frame(1.0 / 60.0);
+        assert!(matches!(rt_done.state.modal, ModalState::None));
+
+        // 4. Failure state ([erro] in log or "Provisionamento falhou" in runner_sync_status): error banner above "Tentar novamente"
+        for (log, sync_status) in [
+            ("[erro] Falha na conexão SSH", ""),
+            ("Conectando...", "Provisionamento falhou — consulte o log."),
+        ] {
+            let mut state_err = AppState::init_demo();
+            state_err.open_provision_modal("vps-prod");
+            state_err.snapshot.provision_log = log.into();
+            state_err.snapshot.runner_sync_status = sync_status.into();
+            let mut rt_err =
+                Runtime::new(state_err, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+            rt_err.frame(0.0);
+            rt_err.frame(1.0 / 60.0);
+
+            let els_err = rt_err.elements();
+            let banner = els_err
+                .iter()
+                .find(|e| e.key.as_deref() == Some("prov-error-banner"))
+                .expect("prov-error-banner exists on failure");
+            let retry_btn = els_err
+                .iter()
+                .find(|e| e.key.as_deref() == Some("prov-start"))
+                .expect("prov-start (Tentar novamente) exists on failure");
+            assert_eq!(retry_btn.label.as_deref(), Some("Tentar novamente"));
+            assert!(
+                banner.rect[1] + banner.rect[3] <= retry_btn.rect[1] + 0.5,
+                "error banner should sit above Tentar novamente: banner={:?}, retry={:?}",
+                banner.rect,
+                retry_btn.rect
+            );
+        }
+    }
+
+    #[test]
+    fn single_instance_notifies_primary_when_addr_in_use() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = try_acquire_single_instance("127.0.0.1:0")
+            .expect("ephemeral single-instance bind should succeed");
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let show_calls = Arc::new(AtomicUsize::new(0));
+        let show_calls_bg = Arc::clone(&show_calls);
+        spawn_single_instance_listener(listener, move || {
+            show_calls_bg.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let second = try_acquire_single_instance(&addr);
+        assert_eq!(second.err(), Some(true), "second bind must see AddrInUse");
+
+        for _ in 0..20 {
+            if show_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(show_calls.load(Ordering::SeqCst), 1);
     }
 }

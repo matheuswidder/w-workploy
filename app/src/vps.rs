@@ -368,6 +368,7 @@ pub fn parse_probe_output(raw: &str) -> VpsProbeResult {
 }
 
 const PROBE_REMOTE_SCRIPT: &str = r#"sh -c '
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 OS=$(. /etc/os-release 2>/dev/null && printf "%s" "$PRETTY_NAME" || uname -s)
 ARCH=$(uname -m 2>/dev/null || echo unknown)
 VCPUS=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
@@ -1312,6 +1313,7 @@ pub fn build_provision_script(
     let port = if opts.runner_port == 0 { 8787 } else { opts.runner_port };
     let mut s = String::from(
         "set -e\n\
+         export PATH=\"$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\"\n\
          if [ \"$(id -u)\" -eq 0 ]; then SUDO=''; \
          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO='sudo -n'; \
          else echo '[erro] Esta conta não tem privilégios root nem sudo sem senha.' >&2; exit 1; fi\n\
@@ -1367,7 +1369,8 @@ pub fn build_provision_script(
             "echo '=== [Extra] Conferindo Rust ==='\n\
              if ! command -v cargo >/dev/null 2>&1; then\n\
                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n\
-             fi\n",
+             fi\n\
+             rustc --version && cargo --version\n",
         );
     }
 
@@ -1392,6 +1395,7 @@ pub fn build_provision_script(
              \n\
              [Service]\n\
              Type=simple\n\
+             Environment=\"PATH=/root/.cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n\
              ExecStart=/usr/bin/python3 /opt/workploy/workploy_runner.py --port {port}\n\
              Restart=always\n\
              RestartSec=3\n\
@@ -1896,6 +1900,28 @@ RUNNER_ACTIVE=1\r\n";
         assert!(PROBE_REMOTE_SCRIPT.contains("workploy-runner"));
         assert!(PROBE_REMOTE_SCRIPT.contains("CPU_PCT"));
         assert!(PROBE_REMOTE_SCRIPT.contains("DISK_USED_PCT"));
+        assert!(PROBE_REMOTE_SCRIPT.contains("export PATH=\"$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\""));
         assert!(!PROBE_REMOTE_SCRIPT.contains("widder"));
+        assert!(script.contains("export PATH=\"$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\""));
+        assert!(script.contains(
+            "Environment=\"PATH=/root/.cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
+        ));
+    }
+
+    #[test]
+    fn provision_script_verifies_rust_installation_without_silencing_errors() {
+        let opts = ProvisionOptions {
+            install_git: false,
+            install_docker: false,
+            install_node: false,
+            install_rust: true,
+            install_runner_service: false,
+            runner_port: 8787,
+        };
+        let script = build_provision_script(&opts, "tok123", "whsec456");
+        assert!(script.starts_with("set -e\nexport PATH=\"$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\""));
+        assert!(script.contains("https://sh.rustup.rs"));
+        assert!(script.contains("rustc --version && cargo --version"));
+        assert!(!script.contains("cargo --version || true"));
     }
 }

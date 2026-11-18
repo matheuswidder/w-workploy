@@ -2,7 +2,7 @@
 
 Orquestrador desktop em Rust para CI/CD e deploy self-hosted multi-VPS.
 
-[![Versão](https://img.shields.io/badge/versão-0.1.4-d97706)](https://github.com/matheuswidder/w-workploy/releases)
+[![Versão](https://img.shields.io/badge/versão-0.1.5-d97706)](https://github.com/matheuswidder/w-workploy/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-b45309?logo=rust)](app/Cargo.toml)
 [![Plataforma](https://img.shields.io/badge/Plataforma-Windows%20%7C%20Linux-0078D6)](https://github.com/matheuswidder/w-workploy/releases)
 [![Licença MIT](https://img.shields.io/badge/licença-MIT-16a34a)](LICENSE)
@@ -63,7 +63,7 @@ flowchart LR
     end
 
     Desktop <-->|"HTTPS (PAT)"| API
-    Sobre -->|"Consulta e baixa v0.1.4+"| Releases
+    Sobre -->|"Consulta e baixa v0.1.5+"| Releases
     Sync <-->|"SSH (logs, runs, métricas e aprovações)"| Runner
     Hook -->|"POST Webhook"| Runner
     Runner -->|"Sondagem 24/7 & git clone/fetch"| API
@@ -71,18 +71,18 @@ flowchart LR
 
 ## Instalação (Windows)
 
-Baixe o pacote da versão `0.1.4` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
+Baixe o pacote da versão `0.1.5` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases):
 
-- **`Workploy-Setup-0.1.4.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
-- **`workploy-0.1.4-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
+- **`Workploy-Setup-0.1.5.exe`**: instalador nativo Win32 sem janela de console, com atalhos opcionais, registro em *Aplicativos Instalados* (`HKCU`) e desinstalador próprio.
+- **`workploy-0.1.5-win64-portable.zip`**: pacote portátil com `portable.flag` para extrair e executar em qualquer pasta sem alterar o registro do Windows.
 
 ## Instalação (Linux x86_64)
 
-Baixe o pacote `workploy-0.1.4-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
+Baixe o pacote `workploy-0.1.5-linux-x86_64.tar.gz` na página de [Releases](https://github.com/matheuswidder/w-workploy/releases) e execute o instalador incluído:
 
 ```bash
-tar -xzf workploy-0.1.4-linux-x86_64.tar.gz
-cd workploy-0.1.4-linux-x86_64
+tar -xzf workploy-0.1.5-linux-x86_64.tar.gz
+cd workploy-0.1.5-linux-x86_64
 ./install.sh
 ```
 
@@ -93,7 +93,7 @@ O script instala o binário em `~/.local/bin/workploy`, o ícone e o atalho `.de
 O Workploy verifica novas versões direto na interface em **Configurações -> Sobre**:
 
 1. Clique em **Buscar atualizações** para consultar a release oficial mais recente no GitHub.
-2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.4 agora** (ou na versão indicada).
+2. Quando houver nova versão disponível, clique em **Baixar e instalar v0.1.5 agora** (ou na versão indicada).
 3. No Windows, o aplicativo baixa o instalador oficial, aplica a atualização e reinicia sozinho. No Linux, você também pode abrir a página da release direto pelo botão **Ver no GitHub**.
 
 ## Compilação e desenvolvimento local
@@ -132,7 +132,7 @@ cargo run --manifest-path app/Cargo.toml -- --demo
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 ```
 
-O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.4.exe` e `workploy-0.1.4-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
+O script [`scripts/build-installer.ps1`](scripts/build-installer.ps1) compila `app` e `installer` em modo release, gera `Workploy-Setup-0.1.5.exe` e `workploy-0.1.5-win64-portable.zip` em `dist/` e exibe o hash SHA-256 de cada arquivo.
 
 ## Estrutura do projeto
 

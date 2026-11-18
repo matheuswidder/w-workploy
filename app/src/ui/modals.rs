@@ -1,8 +1,9 @@
 use rune::tok::motion;
-use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, el, icon, row, text};
-use rune_kit::{Kit, Switch, TextArea, TextInput};
+use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
+use rune_kit::{Kit, Progress, Switch, TextArea, TextInput};
 use workploy::model::{RunnerKind, Trigger, TriggerMode};
 
+use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{
     AppState, ModalState, PurgeSizeUnit, ServerAuthChoice, StepDraft, ToastKind,
 };
@@ -1253,8 +1254,20 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
             mount_shell_dialog(t, "binding", title, 640.0, form, footer, layer);
         }
         ModalState::ProvisionModal(draft) => {
-            let is_running =
+            let is_provisioning =
                 s.snapshot.provisioning_server_id.as_deref() == Some(draft.server_id.as_str());
+            let has_other_provisioning =
+                s.snapshot.provisioning_server_id.is_some() && !is_provisioning;
+            let prov_succeeded = !is_provisioning
+                && s.snapshot
+                    .provision_log
+                    .contains("=== Provisionamento concluído! ===");
+            let prov_failed = !is_provisioning
+                && !prov_succeeded
+                && (s.snapshot.provision_log.contains("[erro]")
+                    || s.snapshot
+                        .runner_sync_status
+                        .contains("Provisionamento falhou"));
 
             let port_in = TextInput::new(&draft.runner_port)
                 .label("Porta do workploy-runner")
@@ -1269,6 +1282,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
 
             let checklist = col()
                 .w_full()
+                .min_w(0.0)
                 .padding(12.0)
                 .gap(10.0)
                 .radius(10.0)
@@ -1332,6 +1346,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
 
             let mut form = col()
                 .w_full()
+                .min_w(0.0)
                 .gap(12.0)
                 .child(
                     text("Selecione os componentes para instalar ou atualizar via SSH na sua VPS Linux.")
@@ -1342,41 +1357,152 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .child(checklist)
                 .child(labeled(t, "Porta HTTP do agente workploy-runner", port_in));
 
-            if is_running || !s.snapshot.provision_log.trim().is_empty() {
+            if is_provisioning {
+                let pulse_dot = el()
+                    .key("prov-active-pulse")
+                    .size(8.0, 8.0)
+                    .center()
+                    .child(
+                        effect(MARK_PULSE_RADAR)
+                            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                            .radius(4.0)
+                            .effect_bleed(8.0)
+                            .effect_data([4.0, 8.0, 1.6, 0.7]),
+                    )
+                    .child(el().size(8.0, 8.0).radius(4.0).fill(t.info));
+
+                form = form.child(
+                    col()
+                        .key("prov-progress-indicator")
+                        .w_full()
+                        .min_w(0.0)
+                        .padding(10.0)
+                        .gap(8.0)
+                        .radius(8.0)
+                        .fill(t.info_bg)
+                        .border(1.0, t.info.alpha(0.32))
+                        .child(
+                            row()
+                                .w_full()
+                                .min_w(0.0)
+                                .gap(8.0)
+                                .center_y()
+                                .child(pulse_dot)
+                                .child(
+                                    text("Provisionando servidor via SSH...")
+                                        .font(ty::SMALL_MED)
+                                        .color(t.info)
+                                        .grow(1.0)
+                                        .shrink()
+                                        .min_w(0.0)
+                                        .wrap(),
+                                )
+                                .child(pill_badge(t, "Ao vivo", t.info, t.surface_1)),
+                        )
+                        .child(Progress::new(None).build(k)),
+                );
+            }
+
+            if is_provisioning || !s.snapshot.provision_log.trim().is_empty() {
                 let tail: String = {
                     let lines: Vec<&str> = s.snapshot.provision_log.lines().collect();
                     let start = lines.len().saturating_sub(18);
                     lines[start..].join("\n")
                 };
+
+                let mut log_header = row()
+                    .w_full()
+                    .min_w(0.0)
+                    .justify_between()
+                    .center_y()
+                    .flex_wrap()
+                    .gap(6.0)
+                    .child(
+                        text(if is_provisioning {
+                            "Log ao vivo da instalação"
+                        } else {
+                            "Saída do provisionamento"
+                        })
+                        .font(ty::CAPTION)
+                        .color(t.text_secondary),
+                    );
+
+                if is_provisioning {
+                    log_header =
+                        log_header.child(pill_badge(t, "Em andamento", t.info, t.info_bg));
+                } else if prov_succeeded {
+                    log_header = log_header.child(
+                        pill_badge(t, "Concluído", t.success, t.success_bg)
+                            .key("prov-success-badge"),
+                    );
+                } else if prov_failed {
+                    log_header = log_header.child(
+                        pill_badge(t, "Falhou", t.danger, t.danger_bg)
+                            .key("prov-error-badge"),
+                    );
+                }
+
                 form = form.child(
                     col()
                         .w_full()
+                        .min_w(0.0)
                         .gap(6.0)
+                        .child(log_header)
                         .child(
-                            text(if is_running {
-                                "Log ao vivo da instalação"
-                            } else {
-                                "Saída do provisionamento"
-                            })
-                            .font(ty::CAPTION)
-                            .color(t.text_secondary),
-                        )
-                        .child(
-                            el().w_full()
+                            col()
+                                .key("prov-log-box")
+                                .w_full()
+                                .min_w(0.0)
                                 .padding(10.0)
                                 .radius(8.0)
                                 .fill(t.surface_code)
                                 .border(1.0, t.border_subtle)
+                                .clip_rounded(8.0)
+                                .clip_soft(0.0)
                                 .child(
                                     text(if tail.is_empty() {
                                         "Conectando à VPS...".to_string()
                                     } else {
                                         tail
                                     })
+                                    .key("prov-log-text")
+                                    .w_full()
+                                    .min_w(0.0)
+                                    .shrink()
                                     .font(ty::MONO_SM)
                                     .color(rune::color::hex("#e2e8f0").unwrap_or(t.text_primary))
-                                    .wrap(),
+                                    .wrap_anywhere(),
                                 ),
+                        ),
+                );
+            }
+
+            if prov_succeeded {
+                form = form.child(
+                    row()
+                        .key("prov-success-banner")
+                        .w_full()
+                        .min_w(0.0)
+                        .px(12.0)
+                        .py(8.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(8.0)
+                        .fill(t.success_bg)
+                        .border(1.0, t.success.alpha(0.38))
+                        .child(
+                            icon(&icons::CHECK_CIRCLE, 15.0)
+                                .color(t.success)
+                                .a11y_hidden(),
+                        )
+                        .child(
+                            text("Provisionamento concluído! O motor na VPS está pronto para uso.")
+                                .font(ty::SMALL)
+                                .color(t.success)
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .wrap(),
                         ),
                 );
             }
@@ -1385,34 +1511,174 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 form = form.child(error_banner(t, err));
             }
 
-            let footer = row()
-                .w_full()
-                .justify_end()
-                .gap(10.0)
-                .child(btn_neutral(
+            let buttons = if is_provisioning {
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(10.0)
+                    .child(btn_neutral(
+                        t,
+                        "prov-close",
+                        "Fechar",
+                        None,
+                        34.0,
+                        |s: &mut AppState, _| s.modal = ModalState::None,
+                    ))
+                    .child(
+                        primary_button(
+                            t,
+                            "prov-start",
+                            "Em andamento...",
+                            Some(&icons::REFRESH),
+                            34.0,
+                            |_: &mut AppState, _| {},
+                        )
+                        .disabled(true)
+                        .opacity(0.6)
+                        .cursor(Cursor::Default),
+                    )
+            } else if prov_succeeded {
+                let mut rerun_btn = btn_neutral(
                     t,
-                    "prov-close",
-                    "Fechar",
-                    None,
-                    34.0,
-                    |s: &mut AppState, _| s.modal = ModalState::None,
-                ))
-                .child(primary_button(
-                    t,
-                    "prov-start",
-                    if is_running {
-                        "Provisionando..."
-                    } else {
-                        "Iniciar provisionamento"
-                    },
-                    Some(&icons::BOLT),
+                    "prov-rerun",
+                    "Executar novamente",
+                    Some(&icons::REFRESH),
                     34.0,
                     move |s: &mut AppState, tx: &mut Tx| {
-                        if !is_running {
+                        if !has_other_provisioning {
                             s.start_provision(tx);
                         }
                     },
-                ));
+                );
+                if has_other_provisioning {
+                    rerun_btn = rerun_btn
+                        .disabled(true)
+                        .opacity(0.6)
+                        .cursor(Cursor::Default);
+                }
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(10.0)
+                    .child(rerun_btn)
+                    .child(primary_button(
+                        t,
+                        "prov-close",
+                        "Concluir",
+                        Some(&icons::CHECK_CIRCLE),
+                        34.0,
+                        |s: &mut AppState, _| s.modal = ModalState::None,
+                    ))
+            } else if prov_failed {
+                let mut retry_btn = primary_button(
+                    t,
+                    "prov-start",
+                    "Tentar novamente",
+                    Some(&icons::REFRESH),
+                    34.0,
+                    move |s: &mut AppState, tx: &mut Tx| {
+                        if !has_other_provisioning {
+                            s.start_provision(tx);
+                        }
+                    },
+                );
+                if has_other_provisioning {
+                    retry_btn = retry_btn
+                        .disabled(true)
+                        .opacity(0.6)
+                        .cursor(Cursor::Default);
+                }
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(10.0)
+                    .child(btn_neutral(
+                        t,
+                        "prov-close",
+                        "Fechar",
+                        None,
+                        34.0,
+                        |s: &mut AppState, _| s.modal = ModalState::None,
+                    ))
+                    .child(retry_btn)
+            } else {
+                let mut start_btn = primary_button(
+                    t,
+                    "prov-start",
+                    "Iniciar provisionamento",
+                    Some(&icons::BOLT),
+                    34.0,
+                    move |s: &mut AppState, tx: &mut Tx| {
+                        if !has_other_provisioning {
+                            s.start_provision(tx);
+                        }
+                    },
+                );
+                if has_other_provisioning {
+                    start_btn = start_btn
+                        .disabled(true)
+                        .opacity(0.6)
+                        .cursor(Cursor::Default);
+                }
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(10.0)
+                    .child(btn_neutral(
+                        t,
+                        "prov-close",
+                        "Fechar",
+                        None,
+                        34.0,
+                        |s: &mut AppState, _| s.modal = ModalState::None,
+                    ))
+                    .child(start_btn)
+            };
+
+            let footer = if prov_failed {
+                col()
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(10.0)
+                    .child(
+                        row()
+                            .key("prov-error-banner")
+                            .w_full()
+                            .min_w(0.0)
+                            .px(12.0)
+                            .py(8.0)
+                            .gap(8.0)
+                            .center_y()
+                            .radius(8.0)
+                            .fill(t.danger_bg)
+                            .border(1.0, t.danger.alpha(0.4))
+                            .child(
+                                icon(&icons::X_CIRCLE, 15.0)
+                                    .color(t.danger)
+                                    .a11y_hidden(),
+                            )
+                            .child(
+                                text("O provisionamento falhou. Verifique os erros no log acima e tente novamente.")
+                                    .font(ty::SMALL)
+                                    .color(t.danger)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .min_w(0.0)
+                                    .wrap(),
+                            ),
+                    )
+                    .child(buttons)
+            } else {
+                buttons
+            };
 
             mount_shell_dialog(
                 t,
@@ -1667,16 +1933,27 @@ fn mount_shell_dialog(
 
     let panel_inner = col()
         .w_full()
+        .min_w(0.0)
         .max_h(720.0)
         .min_h(0.0)
         .child(
             row()
                 .w_full()
+                .min_w(0.0)
                 .px(20.0)
                 .py(14.0)
                 .center_y()
                 .justify_between()
-                .child(text(title.to_string()).font(ty::H2).color(t.text_primary))
+                .gap(10.0)
+                .child(
+                    text(title.to_string())
+                        .font(ty::H2)
+                        .color(t.text_primary)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .truncate(),
+                )
                 .child(close_btn),
         )
         .child(el().w_full().h(t.hair).fill(t.border_subtle))
@@ -1684,6 +1961,7 @@ fn mount_shell_dialog(
             col()
                 .key(format!("{key}-modal-scroll"))
                 .w_full()
+                .min_w(0.0)
                 .max_h(520.0)
                 .min_h(0.0)
                 .px(20.0)
@@ -1695,7 +1973,7 @@ fn mount_shell_dialog(
                 .child(body),
         )
         .child(el().w_full().h(t.hair).fill(t.border_subtle))
-        .child(row().w_full().px(20.0).py(14.0).child(footer));
+        .child(row().w_full().min_w(0.0).px(20.0).py(14.0).child(footer));
 
     let panel = el()
         .key(format!("{key}-modal-dialog"))

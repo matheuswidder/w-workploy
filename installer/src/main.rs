@@ -42,6 +42,8 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, ES_AUTOHSCROLL,
@@ -395,6 +397,16 @@ fn install_with_payload(
         let size_kb = compute_estimated_size_kb(total_bytes);
         write_uninstall_registry(&target_dir, &ico_path, &uninstall_path, size_kb)?;
         registry_written = true;
+    }
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
     }
 
     progress(100, "Instalação concluída com sucesso!");
