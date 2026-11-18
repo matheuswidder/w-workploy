@@ -76,6 +76,19 @@ pub fn cancel(sh: &SharedHandle, run_id: &str) {
     update_run(sh, run_id, |r| r.cancel_requested = true);
 }
 
+pub fn clear_finished_runs(sh: &SharedHandle) -> usize {
+    let removed = {
+        let mut s = sh.lock().unwrap();
+        let before = s.runs.len();
+        s.runs.retain(|r| r.status.active());
+        let removed = before.saturating_sub(s.runs.len());
+        save_runs(&s);
+        removed
+    };
+    notify(sh);
+    removed
+}
+
 pub fn start_run(sh: &SharedHandle, workflow_id: &str, trigger_label: &str) -> Option<String> {
     start_run_full(sh, workflow_id, trigger_label, None)
 }
@@ -162,6 +175,7 @@ pub fn start_run_with_target(
         annotations: Vec::new(),
     };
     let run_id = run.id.clone();
+    let commit_sha_for_exec = run.commit.clone();
     {
         let mut s = sh.lock().unwrap();
         s.runs.insert(0, run);
@@ -178,6 +192,7 @@ pub fn start_run_with_target(
             target_server_override,
             clean_repo,
             Some(clean_branch),
+            commit_sha_for_exec,
         )
     });
     Some(run_id)
@@ -188,7 +203,7 @@ pub fn start_run_for_binding(
     binding_id: &str,
     trigger_label: &str,
 ) -> Option<String> {
-    let (binding, workflows) = {
+    let (binding, workflows, all_bindings) = {
         let s = sh.lock().unwrap();
         let b = s
             .settings
@@ -196,9 +211,9 @@ pub fn start_run_for_binding(
             .iter()
             .find(|x| x.id == binding_id)
             .cloned()?;
-        (b, s.workflows.clone())
+        (b, s.workflows.clone(), s.settings.repo_bindings.clone())
     };
-    let wf_ids = matching_workflows_for_binding(&workflows, &binding);
+    let wf_ids = matching_workflows_for_binding_with_bindings(&workflows, &binding, &all_bindings);
     let mut first_run_id = None;
     for wf_id in wf_ids {
         if let Some(rid) = start_run_with_target(
@@ -224,7 +239,7 @@ pub fn start_run_for_binding_commit(
     message: &str,
     branch: &str,
 ) -> Option<String> {
-    let (binding, workflows) = {
+    let (binding, workflows, all_bindings) = {
         let s = sh.lock().unwrap();
         let b = s
             .settings
@@ -232,9 +247,9 @@ pub fn start_run_for_binding_commit(
             .iter()
             .find(|x| x.id == binding_id)
             .cloned()?;
-        (b, s.workflows.clone())
+        (b, s.workflows.clone(), s.settings.repo_bindings.clone())
     };
-    let wf_ids = matching_workflows_for_binding(&workflows, &binding);
+    let wf_ids = matching_workflows_for_binding_with_bindings(&workflows, &binding, &all_bindings);
     let short: String = sha.chars().take(7).collect();
     let trigger_label = if short.is_empty() {
         format!("commit em {branch}")
@@ -286,6 +301,169 @@ fn finish_cancelled(
     });
 }
 
+pub fn safe_slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_dash = false;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "workspace".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn redact_between(text: &mut String, prefix: &str, stop_at: char, stop_before_slash: bool) {
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(prefix) {
+        let start = from + rel + prefix.len();
+        let rest = &text[start..];
+        if let Some(at_rel) = rest.find(stop_at) {
+            let segment = &rest[..at_rel];
+            if !stop_before_slash
+                || (!segment.contains('/') && !segment.chars().any(char::is_whitespace))
+            {
+                text.replace_range(start..start + at_rel, "***");
+                from = start + 3 + 1;
+                continue;
+            }
+        }
+        from = start;
+    }
+}
+
+pub fn mask_secrets_in_log(text: &str, known_tokens: &[&str]) -> String {
+    let mut out = text.to_string();
+    for tok in known_tokens {
+        let t = tok.trim();
+        if !t.is_empty() {
+            out = out.replace(t, "***");
+        }
+    }
+    redact_between(&mut out, "x-access-token:", '@', true);
+    redact_between(&mut out, "https://", '@', true);
+    out
+}
+
+pub fn build_vps_sync_script(
+    repo: &str,
+    branch: &str,
+    commit_sha: Option<&str>,
+) -> (String, String) {
+    let clean_repo = repo.trim();
+    let wd = format!("/var/lib/workploy/workspaces/{}", safe_slug(clean_repo));
+    let clean_branch = crate::github::expand_branch_targets(branch, "main")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "main".into());
+    let wd_q = shell_single_quote(&wd);
+    let repo_q = shell_single_quote(clean_repo);
+    let branch_q = shell_single_quote(&clean_branch);
+    let checkout_part = if let Some(sha) = commit_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        let sha_q = shell_single_quote(sha);
+        format!("git -C \"$WD\" checkout --force {sha_q}")
+    } else {
+        format!(
+            "(git -C \"$WD\" checkout {branch_q} 2>/dev/null || git -C \"$WD\" checkout -b {branch_q} \"origin/\"{branch_q}) && git -C \"$WD\" pull --ff-only origin {branch_q}"
+        )
+    };
+
+    let script = format!(
+        "set -e\n\
+         WS_ROOT='/var/lib/workploy/workspaces'\n\
+         WD={wd_q}\n\
+         REPO={repo_q}\n\
+         mkdir -p \"$WS_ROOT\"\n\
+         TOK=\"\"\n\
+         if [ -r /etc/workploy/github_token ]; then\n\
+           TOK=$(tr -d '\\r\\n' < /etc/workploy/github_token)\n\
+         elif command -v sudo >/dev/null 2>&1 && sudo -n test -r /etc/workploy/github_token 2>/dev/null; then\n\
+           TOK=$(sudo -n cat /etc/workploy/github_token 2>/dev/null | tr -d '\\r\\n')\n\
+         fi\n\
+         if [ -n \"$TOK\" ]; then\n\
+           REMOTE_URL=\"https://x-access-token:${{TOK}}@github.com/${{REPO}}.git\"\n\
+         else\n\
+           REMOTE_URL=\"https://github.com/${{REPO}}.git\"\n\
+         fi\n\
+         if [ ! -d \"$WD/.git\" ]; then\n\
+           git clone \"$REMOTE_URL\" \"$WD\"\n\
+         else\n\
+           git -C \"$WD\" remote set-url origin \"$REMOTE_URL\" 2>/dev/null || true\n\
+         fi\n\
+         git -C \"$WD\" fetch origin\n\
+         {checkout_part}\n\
+         echo \"[git sync] workspace=$WD ref=$(git -C \"$WD\" rev-parse --short HEAD 2>/dev/null || echo '?')\""
+    );
+    (wd, script)
+}
+
+pub fn build_vps_sync_command(
+    repo: &str,
+    branch: &str,
+    commit_sha: Option<&str>,
+) -> (String, String) {
+    let (wd, script) = build_vps_sync_script(repo, branch, commit_sha);
+    (wd, format!("sh -c {}", shell_single_quote(&script)))
+}
+
+fn run_vps_sync_step(
+    sh: &SharedHandle,
+    run_id: &str,
+    srv: &VpsServer,
+    sync_cmd: &str,
+    known_token: &str,
+) -> (bool, bool, f64) {
+    let start = Instant::now();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let ok = std::thread::scope(|scope| {
+        let cf = cancel_flag.clone();
+        let df = done_flag.clone();
+        scope.spawn(move || {
+            while !df.load(Ordering::Relaxed) {
+                if is_cancelled(sh, run_id) {
+                    cf.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let res = vps::ssh_run_streaming(srv, sync_cmd, Some(&cancel_flag), |line| {
+            let masked = mask_secrets_in_log(line, &[known_token]);
+            append_log(sh, run_id, 0, &format!("{masked}\n"));
+        });
+        done_flag.store(true, Ordering::Relaxed);
+        match res {
+            Ok(success) => success,
+            Err(e) => {
+                let masked = mask_secrets_in_log(&e, &[known_token]);
+                append_log(sh, run_id, 0, &format!("[erro SSH] {masked}\n"));
+                false
+            }
+        }
+    });
+    let secs = start.elapsed().as_secs_f64();
+    let cancelled = cancel_flag.load(Ordering::Relaxed);
+    if cancelled {
+        append_log(sh, run_id, 0, "[cancelado pelo usuário]\n");
+    } else if !ok {
+        append_log(sh, run_id, 0, "[git sync falhou — o fluxo para aqui]\n");
+    }
+    (ok, cancelled, secs)
+}
+
 fn execute_run(
     sh: SharedHandle,
     run_id: String,
@@ -293,8 +471,10 @@ fn execute_run(
     target_server_override: Option<String>,
     repo_name: Option<String>,
     branch: Option<String>,
+    commit_sha: Option<String>,
 ) {
     let total = Instant::now();
+    let mut synced_vps_workdir: Option<String> = None;
     for (i, step) in wf.steps.iter().enumerate() {
         if is_cancelled(&sh, &run_id) {
             finish_cancelled(&sh, &run_id, i, total.elapsed().as_secs_f64(), None);
@@ -343,12 +523,13 @@ fn execute_run(
                 st.started_ts = Some(now_ts());
             }
         });
-        let (runner, ssh_host, target_server, workdir) = {
+        let (runner, ssh_host, target_server, mut workdir, github_token) = {
             let s = sh.lock().unwrap();
             let override_sid = target_server_override
                 .as_deref()
                 .map(str::trim)
                 .filter(|x| !x.is_empty());
+            let tok = s.settings.github_token.clone();
             if let Some(sid) = override_sid {
                 let srv = s.settings.servers.iter().find(|v| v.id == sid).cloned();
                 (
@@ -356,6 +537,7 @@ fn execute_run(
                     s.settings.ssh_host.clone(),
                     srv,
                     wf.workdir.clone(),
+                    tok,
                 )
             } else {
                 let srv = wf
@@ -367,9 +549,64 @@ fn execute_run(
                     s.settings.ssh_host.clone(),
                     srv,
                     wf.workdir.clone(),
+                    tok,
                 )
             }
         };
+        if runner == RunnerKind::Ssh
+            && let Some(srv) = target_server.as_ref()
+            && let Some(repo) = repo_name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && wf.workdir.trim().is_empty()
+        {
+            if let Some(ref existing_wd) = synced_vps_workdir {
+                workdir = existing_wd.clone();
+            } else {
+                let (effective_wd, sync_cmd) = build_vps_sync_command(
+                    repo,
+                    branch.as_deref().unwrap_or("main"),
+                    commit_sha.as_deref(),
+                );
+                workdir = effective_wd.clone();
+                if i == 0 {
+                    append_log(
+                        &sh,
+                        &run_id,
+                        0,
+                        &format!("[git sync] preparando workspace {effective_wd}...\n"),
+                    );
+                    let (sync_ok, cancelled, sync_secs) =
+                        run_vps_sync_step(&sh, &run_id, srv, &sync_cmd, &github_token);
+                    if cancelled || is_cancelled(&sh, &run_id) {
+                        finish_cancelled(
+                            &sh,
+                            &run_id,
+                            0,
+                            total.elapsed().as_secs_f64(),
+                            Some(sync_secs),
+                        );
+                        return;
+                    }
+                    if !sync_ok {
+                        update_run(&sh, &run_id, |r| {
+                            if let Some(st) = r.steps.get_mut(0) {
+                                st.secs = sync_secs;
+                                st.status = StepStatus::Failed;
+                            }
+                            r.status = RunStatus::Failed;
+                            r.finished_at = Some(now_str());
+                            r.secs = total.elapsed().as_secs_f64();
+                            for st in r.steps.iter_mut().skip(1) {
+                                if st.status == StepStatus::Pending {
+                                    st.status = StepStatus::Skipped;
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    synced_vps_workdir = Some(effective_wd);
+                }
+            }
+        }
         let (ok, secs) = exec_step(
             &sh,
             &run_id,
@@ -379,6 +616,7 @@ fn execute_run(
             target_server.as_ref(),
             &workdir,
             &step.run,
+            &github_token,
         );
         if is_cancelled(&sh, &run_id) {
             finish_cancelled(
@@ -444,6 +682,7 @@ fn exec_step(
     target_server: Option<&VpsServer>,
     workdir: &str,
     cmd: &str,
+    known_token: &str,
 ) -> (bool, f64) {
     let start = Instant::now();
     if cmd.trim().is_empty() {
@@ -475,13 +714,15 @@ fn exec_step(
                 }
             });
             let res = vps::ssh_run_streaming(srv, &remote_cmd, Some(&cancel_flag), |line| {
-                append_log(sh, run_id, idx, &format!("{line}\n"));
+                let masked = mask_secrets_in_log(line, &[known_token]);
+                append_log(sh, run_id, idx, &format!("{masked}\n"));
             });
             done_flag.store(true, Ordering::Relaxed);
             match res {
                 Ok(success) => success,
                 Err(e) => {
-                    append_log(sh, run_id, idx, &format!("[erro SSH] {e}\n"));
+                    let masked = mask_secrets_in_log(&e, &[known_token]);
+                    append_log(sh, run_id, idx, &format!("[erro SSH] {masked}\n"));
                     false
                 }
             }
@@ -638,7 +879,28 @@ pub fn spawn_ssh_test(sh: SharedHandle) {
     });
 }
 
+fn is_windows_workdir(workdir: &str) -> bool {
+    let w = workdir.trim();
+    w.contains(":\\") || w.contains(":/")
+}
+
+fn is_windows_only_workflow(w: &Workflow) -> bool {
+    is_windows_workdir(&w.workdir)
+        || w.name.to_ascii_lowercase().contains("windows")
+        || w.steps
+            .iter()
+            .any(|st| st.run.to_ascii_lowercase().contains("powershell"))
+}
+
 pub fn matching_workflows_for_binding(workflows: &[Workflow], binding: &RepoBinding) -> Vec<String> {
+    matching_workflows_for_binding_with_bindings(workflows, binding, &[])
+}
+
+pub fn matching_workflows_for_binding_with_bindings(
+    workflows: &[Workflow],
+    binding: &RepoBinding,
+    all_bindings: &[RepoBinding],
+) -> Vec<String> {
     if let Some(wid) = &binding.workflow_id
         && workflows.iter().any(|w| &w.id == wid)
     {
@@ -652,9 +914,31 @@ pub fn matching_workflows_for_binding(workflows: &[Workflow], binding: &RepoBind
     if !by_repo.is_empty() {
         return by_repo;
     }
+    let is_vps_target = binding.target_server_id.is_some();
     workflows
         .iter()
-        .filter(|w| w.trigger == Trigger::Push)
+        .filter(|w| {
+            if w.trigger != Trigger::Push {
+                return false;
+            }
+            if w.repo_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|rid| !rid.is_empty())
+            {
+                return false;
+            }
+            let claimed_by_other_binding = all_bindings.iter().any(|other| {
+                other.id != binding.id && other.workflow_id.as_deref() == Some(w.id.as_str())
+            });
+            if claimed_by_other_binding {
+                return false;
+            }
+            if is_vps_target && is_windows_only_workflow(w) {
+                return false;
+            }
+            true
+        })
         .map(|w| w.id.clone())
         .collect()
 }
@@ -670,6 +954,7 @@ pub fn poll_binding_step(
     {
         let mut s = sh.lock().unwrap();
         let workflows = s.workflows.clone();
+        let all_bindings = s.settings.repo_bindings.clone();
         if let Some(b) = s.settings.repo_bindings.iter_mut().find(|x| x.id == binding_id) {
             let repo_name = b.full_name.clone();
             if b.last_sha.is_empty() {
@@ -678,7 +963,9 @@ pub fn poll_binding_step(
             } else if b.last_sha != sha {
                 b.last_sha = sha.to_string();
                 b.last_status = format!("Novo commit {short} — disparando execução");
-                for wf_id in matching_workflows_for_binding(&workflows, b) {
+                for wf_id in
+                    matching_workflows_for_binding_with_bindings(&workflows, b, &all_bindings)
+                {
                     to_trigger.push((wf_id, format!("push em {repo_name} ({short}): {message}")));
                 }
             } else {
@@ -710,6 +997,7 @@ pub fn poll_binding_branch_step(
     {
         let mut s = sh.lock().unwrap();
         let workflows = s.workflows.clone();
+        let all_bindings = s.settings.repo_bindings.clone();
         if let Some(b) = s.settings.repo_bindings.iter_mut().find(|x| x.id == binding_id) {
             let repo_name = b.full_name.clone();
             match prev {
@@ -724,7 +1012,9 @@ pub fn poll_binding_branch_step(
                     b.last_sha = sha.to_string();
                     b.last_status =
                         format!("Novo commit {short} em {branch} — disparando execução");
-                    for wf_id in matching_workflows_for_binding(&workflows, b) {
+                    for wf_id in
+                        matching_workflows_for_binding_with_bindings(&workflows, b, &all_bindings)
+                    {
                         to_trigger.push((
                             wf_id,
                             format!("push em {repo_name}@{branch} ({short}): {message}"),
@@ -1513,5 +1803,209 @@ mod tests {
         assert_eq!(r.repo_name.as_deref(), Some("matheuswidder/w-workploy"));
         assert_eq!(r.branch, "release/0.1.8");
         assert!(r.trigger_label.contains("deadbee"));
+    }
+
+    #[test]
+    fn matching_workflows_excludes_windows_and_other_repo_workflows_on_vps() {
+        let workflows = vec![
+            Workflow {
+                id: "wf-win-workdir".into(),
+                name: "Build Local".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: r"C:\Projects\w-workploy".into(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-win-slash".into(),
+                name: "Build Slash".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: "D:/Projects/outro".into(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-win-release".into(),
+                name: "Workploy Windows CI & Release".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![Step {
+                    name: "Build".into(),
+                    run: "powershell -NoProfile -File scripts/build-installer.ps1".into(),
+                    approval: false,
+                }],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-other-repo".into(),
+                name: "CI Outro Projeto".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: Some("rb-other".into()),
+            },
+            Workflow {
+                id: "wf-claimed-by-binding".into(),
+                name: "CI Vinculado".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+            Workflow {
+                id: "wf-generic-linux".into(),
+                name: "CI Principal".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Local,
+                workdir: String::new(),
+                steps: vec![Step {
+                    name: "Test".into(),
+                    run: "cargo test".into(),
+                    approval: false,
+                }],
+                on_success: None,
+                server_id: None,
+                repo_id: None,
+            },
+        ];
+
+        let other_binding = RepoBinding {
+            id: "rb-other".into(),
+            full_name: "matheuswidder/w-workploy".into(),
+            target_server_id: None,
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnDesktop,
+            workflow_id: Some("wf-claimed-by-binding".into()),
+            enabled: true,
+            ..RepoBinding::default()
+        };
+        let target_binding = RepoBinding {
+            id: "rb-vps".into(),
+            full_name: "matheuswidder/w-erp".into(),
+            target_server_id: Some("vps-1".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnDesktop,
+            workflow_id: None,
+            enabled: true,
+            ..RepoBinding::default()
+        };
+
+        // Sem all_bindings, ainda exclui caminhos Windows, receita Windows e outro repo_id
+        let basic = matching_workflows_for_binding(&workflows, &target_binding);
+        assert_eq!(basic, vec!["wf-claimed-by-binding", "wf-generic-linux"]);
+
+        // Com all_bindings, exclui também wf-claimed-by-binding (pertence a outro binding)
+        let scoped = matching_workflows_for_binding_with_bindings(
+            &workflows,
+            &target_binding,
+            &[other_binding, target_binding.clone()],
+        );
+        assert_eq!(scoped, vec!["wf-generic-linux"]);
+    }
+
+    #[test]
+    fn build_vps_sync_command_builds_workspace_and_masks_tokens() {
+        assert_eq!(safe_slug("matheuswidder/w-erp-central"), "matheuswidder-w-erp-central");
+        assert_eq!(safe_slug("///"), "workspace");
+
+        let (wd_branch, script_branch) =
+            build_vps_sync_script("matheuswidder/w-erp", "main, dev", None);
+        assert_eq!(wd_branch, "/var/lib/workploy/workspaces/matheuswidder-w-erp");
+        assert!(script_branch.contains("mkdir -p \"$WS_ROOT\""));
+        assert!(script_branch.contains("/etc/workploy/github_token"));
+        assert!(script_branch.contains("git clone"));
+        assert!(script_branch.contains("git -C \"$WD\" fetch origin"));
+        assert!(script_branch.contains("git -C \"$WD\" checkout 'main'"));
+        assert!(script_branch.contains("git -C \"$WD\" pull --ff-only origin 'main'"));
+        assert!(!script_branch.contains("--force"));
+
+        let (wd_cmd, cmd_branch) =
+            build_vps_sync_command("matheuswidder/w-erp", "main, dev", None);
+        assert_eq!(wd_cmd, wd_branch);
+        assert!(cmd_branch.starts_with("sh -c "));
+
+        let (wd_sha, script_sha) = build_vps_sync_script(
+            "matheuswidder/w-erp",
+            "main",
+            Some("deadbeef1234567890"),
+        );
+        assert_eq!(wd_sha, wd_branch);
+        assert!(script_sha.contains("git -C \"$WD\" checkout --force 'deadbeef1234567890'"));
+
+        let raw_log = "fatal: could not read from https://x-access-token:ghp_secret123456@github.com/org/repo.git and ghp_secret123456";
+        let masked = mask_secrets_in_log(raw_log, &["ghp_secret123456"]);
+        assert!(!masked.contains("ghp_secret123456"));
+        assert!(masked.contains("***"));
+    }
+
+    #[test]
+    fn clear_finished_runs_removes_only_inactive_runs_and_notifies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sh = Arc::new(Mutex::new(Shared::default()));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_c = wakes.clone();
+        set_wake_hook(
+            &sh,
+            Some(Arc::new(move || {
+                wakes_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        let mk_run = |id: &str, status: RunStatus| Run {
+            id: id.into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "CI".into(),
+            status,
+            trigger_label: "manual".into(),
+            title: "run".into(),
+            number: 1,
+            commit: None,
+            started_at: "18/11/2026 10:00".into(),
+            started_ts: None,
+            finished_at: None,
+            steps: Vec::new(),
+            approved: false,
+            cancel_requested: false,
+            secs: 0.0,
+            actor: "maestro".into(),
+            repo_name: None,
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: Vec::new(),
+        };
+
+        {
+            let mut s = sh.lock().unwrap();
+            s.runs.push(mk_run("r-queued", RunStatus::Queued));
+            s.runs.push(mk_run("r-running", RunStatus::Running));
+            s.runs.push(mk_run("r-wait", RunStatus::AwaitingApproval));
+            s.runs.push(mk_run("r-ok", RunStatus::Success));
+            s.runs.push(mk_run("r-fail", RunStatus::Failed));
+            s.runs.push(mk_run("r-cancel", RunStatus::Cancelled));
+        }
+
+        let before = wakes.load(Ordering::SeqCst);
+        let removed = clear_finished_runs(&sh);
+        assert_eq!(removed, 3);
+        assert!(wakes.load(Ordering::SeqCst) > before);
+
+        let s = sh.lock().unwrap();
+        let remaining_ids: Vec<&str> = s.runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(remaining_ids, vec!["r-queued", "r-running", "r-wait"]);
     }
 }

@@ -373,6 +373,18 @@ pub fn view(
         ));
     }
 
+    filter_bar = filter_bar.child(
+        btn_neutral(
+            t,
+            "btn-clear-runs",
+            "Limpar histórico",
+            Some(&icons::TRASH),
+            30.0,
+            |s: &mut AppState, tx: &mut Tx| s.clear_finished_runs_history(tx),
+        )
+        .help("Remove execuções antigas já finalizadas do histórico."),
+    );
+
     // Filter runs
     let q = s.search_runs.text.trim().to_lowercase();
     let filtered: Vec<&Run> = s
@@ -825,6 +837,7 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
     let bid_run = b.id.clone();
     let bid_cfg = b.id.clone();
     let bid_commits = b.id.clone();
+    let bid_gen = b.id.clone();
 
     let mut badges_row = row()
         .w_full()
@@ -963,6 +976,19 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
                 },
             )
             .help("Lista os últimos commits da branch e permite disparar o fluxo para um commit específico."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("gen-wf-binding-{}", b.id),
+                "Gerar receita",
+                Some(&icons::BOLT),
+                28.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.generate_workflow_for_binding(&bid_gen, tx);
+                },
+            )
+            .help("Lê package.json, Cargo.toml e docker-compose.yml no GitHub para criar passos reais de testes e redeploy automático."),
         )
         .child(
             primary_button(

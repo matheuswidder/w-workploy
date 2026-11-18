@@ -2093,4 +2093,209 @@ mod tests {
         );
         let _ = (b0, b1);
     }
+
+    #[test]
+    fn runs_generate_workflow_and_clear_history_work() {
+        for vw in [360.0_f32, 768.0, 1440.0] {
+            let mut state = AppState::init_demo();
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            for key in [
+                "gen-wf-binding-rb-erp",
+                "gen-wf-binding-rb-landing",
+                "btn-clear-runs",
+            ] {
+                let el = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("expected {key} at {vw}px"));
+                assert!(
+                    el.rect[0] + el.rect[2] <= vw + 0.5,
+                    "{key} overflowed {vw}px: {:?}",
+                    el.rect
+                );
+                assert!(
+                    el.help.as_deref().is_some_and(|h| !h.is_empty()),
+                    "expected tooltip (.help) on {key}"
+                );
+            }
+        }
+
+        // New binding modal must not show bind-gen-wf when draft.id is None
+        let mut new_bind_state = AppState::init_demo();
+        new_bind_state.open_new_binding_modal(None);
+        let mut rt_new =
+            Runtime::new(new_bind_state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt_new.frame(0.0);
+        assert!(rt_new.find("bind-gen-wf").is_none());
+
+        // Demo actions in Runs view
+        let mut rt = Runtime::new(
+            AppState::init_demo(),
+            ui::view,
+            (1280.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // Click "Gerar receita" on rb-erp
+        let (gx, gy) = rt
+            .find("gen-wf-binding-rb-erp")
+            .expect("gen-wf-binding-rb-erp exists");
+        rt.pointer_down(gx, gy);
+        rt.pointer_up(gx, gy);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.title == "Receita simulada do repositório")
+        );
+
+        // Open BindingEditor for existing binding -> click bind-gen-wf -> toast + closes modal
+        let (cx, cy) = rt
+            .find("cfg-binding-rb-erp")
+            .expect("cfg-binding-rb-erp exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::BindingEditor(_)));
+
+        for _ in 0..8 {
+            let Some((_, by)) = rt.find("bind-gen-wf") else {
+                break;
+            };
+            if by > 80.0 && by < 740.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (bgx, bgy) = rt.find("bind-gen-wf").expect("bind-gen-wf exists");
+        rt.pointer_down(bgx, bgy);
+        rt.pointer_up(bgx, bgy);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::None));
+
+        // Click "Limpar histórico" -> removes finished runs, retains active runs
+        let total_before = rt.state.snapshot.runs.len();
+        let active_expected = rt
+            .state
+            .snapshot
+            .runs
+            .iter()
+            .filter(|r| r.status.active())
+            .count();
+        assert!(total_before > active_expected);
+
+        let (clx, cly) = rt.find("btn-clear-runs").expect("btn-clear-runs exists");
+        rt.pointer_down(clx, cly);
+        rt.pointer_up(clx, cly);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.snapshot.runs.len(), active_expected);
+        assert!(rt.state.snapshot.runs.iter().all(|r| r.status.active()));
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.description.as_deref().is_some_and(|d| d.contains("execuções removidas")))
+        );
+
+        // Second click -> nothing left to clear
+        let (clx2, cly2) = rt.find("btn-clear-runs").expect("btn-clear-runs exists");
+        rt.pointer_down(clx2, cly2);
+        rt.pointer_up(clx2, cly2);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.description.as_deref() == Some("Nenhuma execução finalizada para limpar."))
+        );
+    }
+
+    #[test]
+    fn repo_commits_modal_alignment_and_clipping_bounds_work() {
+        for vw in [360.0_f32, 768.0, 1280.0] {
+            let mut state = AppState::init_demo();
+            if vw < 500.0 {
+                state.sidebar_collapsed = true;
+            }
+            let mut rt = Runtime::new(state, ui::view, (vw, 820.0), Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+
+            let (cx, cy) = rt
+                .find("commits-binding-rb-erp")
+                .expect("commits-binding-rb-erp exists");
+            rt.pointer_down(cx, cy);
+            rt.pointer_up(cx, cy);
+            rt.frame(1.0 / 60.0);
+
+            let els = rt.elements();
+            let dialog = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("commits-modal-dialog"))
+                .expect("commits-modal-dialog exists");
+            let branch_in = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("commits-branch-input"))
+                .expect("commits-branch-input exists");
+            let fetch_btn = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("commits-fetch-btn"))
+                .expect("commits-fetch-btn exists");
+            let scroll = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("commits-list-scroll"))
+                .expect("commits-list-scroll exists");
+
+            assert!(
+                (branch_in.rect[3] - 32.0).abs() < 0.5,
+                "branch input height must be 32.0 at {vw}px: {:?}",
+                branch_in.rect
+            );
+            assert!(
+                (fetch_btn.rect[3] - 32.0).abs() < 0.5,
+                "fetch btn height must be 32.0 at {vw}px: {:?}",
+                fetch_btn.rect
+            );
+            if vw >= 768.0 {
+                let c_in = branch_in.rect[1] + branch_in.rect[3] * 0.5;
+                let c_btn = fetch_btn.rect[1] + fetch_btn.rect[3] * 0.5;
+                assert!(
+                    (c_in - c_btn).abs() < 1.0,
+                    "branch input and fetch btn must be vertically centered at {vw}px: {c_in} vs {c_btn}"
+                );
+            }
+            assert!(
+                scroll.rect[0] + scroll.rect[2] <= dialog.rect[0] + dialog.rect[2] + 0.5,
+                "commits-list-scroll overflowed dialog at {vw}px: scroll={:?}, dialog={:?}",
+                scroll.rect,
+                dialog.rect
+            );
+            for idx in 0..3 {
+                let row_el = els
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(&format!("commit-row-{idx}")))
+                    .unwrap_or_else(|| panic!("commit-row-{idx} exists"));
+                assert!(
+                    row_el.rect[0] + row_el.rect[2] <= scroll.rect[0] + scroll.rect[2] + 0.5,
+                    "commit-row-{idx} overflowed scroll at {vw}px: row={:?}, scroll={:?}",
+                    row_el.rect,
+                    scroll.rect
+                );
+            }
+        }
+    }
 }

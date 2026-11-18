@@ -810,7 +810,11 @@ pub fn build_runner_config_json(settings: &Settings, workflows: &[Workflow], ser
 
     let mut needed_wf_ids: HashSet<String> = HashSet::new();
     for b in &bindings {
-        for wid in engine::matching_workflows_for_binding(workflows, b) {
+        for wid in engine::matching_workflows_for_binding_with_bindings(
+            workflows,
+            b,
+            &settings.repo_bindings,
+        ) {
             needed_wf_ids.insert(wid);
         }
     }
@@ -1026,6 +1030,482 @@ fn finish_sync_status(sh: &SharedHandle, server_id: &str, ok: bool, msg: String)
         save_settings(&s);
     }
     engine::notify(sh);
+}
+
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err("Conteúdo base64 com tamanho inválido.".into());
+    }
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let mut out = Vec::with_capacity(chunks.len() * 3);
+    for chunk in chunks {
+        let a = val(chunk[0]).ok_or_else(|| "Caractere base64 inválido.".to_string())?;
+        let b = val(chunk[1]).ok_or_else(|| "Caractere base64 inválido.".to_string())?;
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = val(chunk[2]).ok_or_else(|| "Caractere base64 inválido.".to_string())?;
+            out.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = val(chunk[3]).ok_or_else(|| "Caractere base64 inválido.".to_string())?;
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn decode_github_file_response(raw: &str) -> Result<String, String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw)
+        && v.get("encoding").and_then(|e| e.as_str()) == Some("base64")
+        && let Some(content) = v.get("content").and_then(|c| c.as_str())
+    {
+        let bytes = decode_base64(content)?;
+        return String::from_utf8(bytes)
+            .map_err(|_| "Arquivo do GitHub não está em UTF-8 válido.".to_string());
+    }
+    Ok(raw.to_string())
+}
+
+pub fn build_steps_from_package_json_scripts(
+    package_json: &serde_json::Value,
+    has_pnpm_lock: bool,
+) -> Vec<Step> {
+    let uses_pnpm = has_pnpm_lock
+        || package_json
+            .get("packageManager")
+            .and_then(|v| v.as_str())
+            .is_some_and(|pm| pm.trim().to_ascii_lowercase().starts_with("pnpm"));
+
+    let (pm, install_cmd) = if uses_pnpm {
+        ("pnpm", "pnpm install --frozen-lockfile")
+    } else {
+        ("npm", "npm ci")
+    };
+
+    let mut steps = vec![Step {
+        name: "Instalar dependências".into(),
+        run: install_cmd.into(),
+        approval: false,
+    }];
+
+    if let Some(scripts) = package_json.get("scripts").and_then(|v| v.as_object()) {
+        const KNOWN_SCRIPTS: &[(&str, &str)] = &[
+            ("typecheck", "Verificação de tipos (typecheck)"),
+            ("lint", "Lint"),
+            ("test", "Testes"),
+            ("test:unit", "Testes unitários"),
+            ("test:e2e", "Testes E2E"),
+            ("build", "Build"),
+        ];
+        for &(script_key, label) in KNOWN_SCRIPTS {
+            if scripts
+                .get(script_key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                steps.push(Step {
+                    name: label.into(),
+                    run: format!("{pm} run {script_key}"),
+                    approval: false,
+                });
+            }
+        }
+    }
+
+    steps
+}
+
+pub fn build_rust_ci_steps() -> Vec<Step> {
+    vec![
+        Step {
+            name: "Verificação de tipos (cargo check)".into(),
+            run: "cargo check --all-targets".into(),
+            approval: false,
+        },
+        Step {
+            name: "Lint Rust (clippy)".into(),
+            run: "cargo clippy --no-deps -- -D warnings".into(),
+            approval: false,
+        },
+        Step {
+            name: "Testes unitários (cargo test)".into(),
+            run: "cargo test".into(),
+            approval: false,
+        },
+    ]
+}
+
+pub fn build_generated_workflows_for_repo(
+    binding: &RepoBinding,
+    package_json: Option<&serde_json::Value>,
+    has_pnpm_lock: bool,
+    has_cargo_toml: bool,
+    has_compose: bool,
+    has_dockerfile: bool,
+) -> Result<(Workflow, Option<Workflow>), String> {
+    let mut ci_steps: Vec<Step> = Vec::new();
+    if let Some(pkg) = package_json {
+        ci_steps.extend(build_steps_from_package_json_scripts(pkg, has_pnpm_lock));
+    }
+    if has_cargo_toml {
+        ci_steps.extend(build_rust_ci_steps());
+    }
+    if ci_steps.is_empty() {
+        if has_compose {
+            ci_steps.push(Step {
+                name: "Validar Docker Compose".into(),
+                run: "docker compose config -q".into(),
+                approval: false,
+            });
+        } else if has_dockerfile {
+            ci_steps.push(Step {
+                name: "Validar build Docker".into(),
+                run: "docker build -t workploy-ci .".into(),
+                approval: false,
+            });
+        }
+    }
+    if ci_steps.is_empty() {
+        return Err(format!(
+            "Não foi possível detectar package.json, Cargo.toml ou Docker em '{}'.",
+            binding.full_name
+        ));
+    }
+
+    let clean_repo = binding.full_name.trim();
+    let repo_short = clean_repo.rsplit('/').next().unwrap_or(clean_repo);
+    let runner = if binding.target_server_id.is_some() {
+        RunnerKind::Ssh
+    } else {
+        RunnerKind::Local
+    };
+    let base_id = new_id("wf");
+
+    let deploy_wf = if has_compose || has_dockerfile || binding.target_server_id.is_some() {
+        Some(Workflow {
+            id: format!("{base_id}-deploy"),
+            name: format!("Deploy — {repo_short}"),
+            trigger: Trigger::Manual,
+            runner,
+            workdir: String::new(),
+            steps: vec![
+                Step {
+                    name: "Construir containers (docker compose build)".into(),
+                    run: "docker compose build".into(),
+                    approval: false,
+                },
+                Step {
+                    name: "Subir serviços (docker compose up)".into(),
+                    run: "docker compose up -d --remove-orphans".into(),
+                    approval: true,
+                },
+            ],
+            on_success: None,
+            server_id: binding.target_server_id.clone(),
+            repo_id: Some(binding.id.clone()),
+        })
+    } else {
+        None
+    };
+
+    let ci_wf = Workflow {
+        id: format!("{base_id}-ci"),
+        name: format!("CI — {repo_short}"),
+        trigger: Trigger::Push,
+        runner,
+        workdir: String::new(),
+        steps: ci_steps,
+        on_success: deploy_wf.as_ref().map(|d| d.id.clone()),
+        server_id: binding.target_server_id.clone(),
+        repo_id: Some(binding.id.clone()),
+    };
+
+    Ok((ci_wf, deploy_wf))
+}
+
+fn finish_generate_workflow_error(sh: &SharedHandle, binding_id: &str, msg: String) {
+    {
+        let mut s = sh.lock().unwrap();
+        if let Some(b) = s
+            .settings
+            .repo_bindings
+            .iter_mut()
+            .find(|x| x.id == binding_id)
+        {
+            b.last_status = short_sync_error(&msg);
+        }
+        s.runner_sync_status = msg.clone();
+        record_sync_event(&mut s, false, msg);
+    }
+    engine::notify(sh);
+}
+
+pub fn generate_workflow_from_repo(sh: &SharedHandle, binding_id: String) {
+    let (binding, default_branch) = {
+        let mut s = sh.lock().unwrap();
+        let Some(b) = s
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|x| x.id == binding_id)
+            .cloned()
+        else {
+            record_sync_event(&mut s, false, "Vínculo de repositório não encontrado.".into());
+            drop(s);
+            engine::notify(sh);
+            return;
+        };
+        if b.full_name.trim().is_empty() {
+            record_sync_event(
+                &mut s,
+                false,
+                "Informe o repositório (dono/repo) antes de gerar a receita.".into(),
+            );
+            drop(s);
+            engine::notify(sh);
+            return;
+        }
+        let def_br = s
+            .github_repos
+            .iter()
+            .find(|r| r.full_name.eq_ignore_ascii_case(b.full_name.trim()))
+            .map(|r| r.default_branch.clone())
+            .filter(|br| !br.trim().is_empty())
+            .unwrap_or_else(|| "main".into());
+        let status = format!("Analisando {} para gerar receita...", b.full_name.trim());
+        s.runner_sync_status = status.clone();
+        if let Some(entry) = s
+            .settings
+            .repo_bindings
+            .iter_mut()
+            .find(|x| x.id == binding_id)
+        {
+            entry.last_status = "Gerando receita...".into();
+        }
+        (b, def_br)
+    };
+    engine::notify(sh);
+
+    let sh2 = sh.clone();
+    std::thread::spawn(move || {
+        let repo = binding.full_name.trim().to_string();
+        let token = resolve_github_token(&sh2, None);
+        let branch = expand_branch_targets(&binding.branch, &default_branch)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| default_branch.clone());
+        let ref_query = format!("?ref={}", encode_query_component(&branch));
+
+        let root_url = format!("https://api.github.com/repos/{repo}/contents/{ref_query}");
+        let mut all_paths = Vec::new();
+        let root_entries = match github_get_request(&root_url, token.as_deref()).call() {
+            Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                Ok(v) => {
+                    all_paths.extend(collect_content_paths(&v));
+                    v
+                }
+                Err(_) => {
+                    finish_generate_workflow_error(
+                        &sh2,
+                        &binding_id,
+                        format!("Não foi possível ler os arquivos da raiz de {repo}."),
+                    );
+                    return;
+                }
+            },
+            Err(ureq::Error::Status(401, _)) => {
+                finish_generate_workflow_error(
+                    &sh2,
+                    &binding_id,
+                    "Token do GitHub inválido ou expirado (HTTP 401).".into(),
+                );
+                return;
+            }
+            Err(ureq::Error::Status(404, _)) => {
+                finish_generate_workflow_error(
+                    &sh2,
+                    &binding_id,
+                    format!("Repositório '{repo}' ou branch '{branch}' não encontrado."),
+                );
+                return;
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                finish_generate_workflow_error(
+                    &sh2,
+                    &binding_id,
+                    format!("GitHub retornou HTTP {code} ao analisar {repo}."),
+                );
+                return;
+            }
+            Err(ureq::Error::Transport(t)) => {
+                finish_generate_workflow_error(
+                    &sh2,
+                    &binding_id,
+                    format!("Falha de rede ao analisar {repo}: {t}"),
+                );
+                return;
+            }
+        };
+
+        let wf_url =
+            format!("https://api.github.com/repos/{repo}/contents/.github/workflows{ref_query}");
+        let mut gh_workflows = Vec::new();
+        if let Ok(resp) = github_get_request(&wf_url, token.as_deref()).call()
+            && let Ok(v) = resp.into_json::<serde_json::Value>()
+        {
+            all_paths.extend(collect_content_paths(&v));
+            gh_workflows = parse_github_workflows_dir_json(&v);
+        }
+
+        let root_names: Vec<String> = root_entries
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(|x| x.as_str()).unwrap_or("file") == "file")
+            .filter_map(|item| item.get("name").and_then(|x| x.as_str()))
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        let has_file = |target: &str| root_names.iter().any(|n| n == target);
+        let has_package_json = has_file("package.json");
+        let has_pnpm_lock = has_file("pnpm-lock.yaml");
+        let has_cargo_toml = has_file("Cargo.toml");
+        let has_compose = has_file("docker-compose.yml")
+            || has_file("docker-compose.yaml")
+            || has_file("compose.yml")
+            || has_file("compose.yaml");
+        let has_dockerfile = root_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("Dockerfile"));
+
+        let mut package_json: Option<serde_json::Value> = None;
+        if has_package_json {
+            let pkg_url =
+                format!("https://api.github.com/repos/{repo}/contents/package.json{ref_query}");
+            let req = github_get_request(&pkg_url, token.as_deref())
+                .set("Accept", "application/vnd.github.raw+json");
+            match req.call() {
+                Ok(resp) => match resp.into_string() {
+                    Ok(raw) => match decode_github_file_response(&raw) {
+                        Ok(decoded) => match serde_json::from_str::<serde_json::Value>(&decoded) {
+                            Ok(parsed) => package_json = Some(parsed),
+                            Err(e) => {
+                                finish_generate_workflow_error(
+                                    &sh2,
+                                    &binding_id,
+                                    format!("Falha ao interpretar package.json de {repo}: {e}"),
+                                );
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            finish_generate_workflow_error(&sh2, &binding_id, e);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        finish_generate_workflow_error(
+                            &sh2,
+                            &binding_id,
+                            format!("Falha ao ler package.json de {repo}: {e}"),
+                        );
+                        return;
+                    }
+                },
+                Err(ureq::Error::Status(code, _)) => {
+                    finish_generate_workflow_error(
+                        &sh2,
+                        &binding_id,
+                        format!("GitHub retornou HTTP {code} ao ler package.json de {repo}."),
+                    );
+                    return;
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    finish_generate_workflow_error(
+                        &sh2,
+                        &binding_id,
+                        format!("Falha de rede ao ler package.json de {repo}: {t}"),
+                    );
+                    return;
+                }
+            }
+        }
+
+        let (ci_wf, deploy_wf) = match build_generated_workflows_for_repo(
+            &binding,
+            package_json.as_ref(),
+            has_pnpm_lock,
+            has_cargo_toml,
+            has_compose,
+            has_dockerfile,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                finish_generate_workflow_error(&sh2, &binding_id, err);
+                return;
+            }
+        };
+
+        let detected_platform = detect_platform_from_paths(&all_paths);
+        let ci_id = ci_wf.id.clone();
+        let ci_name = ci_wf.name.clone();
+        let deploy_name = deploy_wf.as_ref().map(|d| d.name.clone());
+        let target_server_id = binding.target_server_id.clone();
+
+        {
+            let mut s = sh2.lock().unwrap();
+            s.workflows.push(ci_wf);
+            if let Some(dwf) = deploy_wf {
+                s.workflows.push(dwf);
+            }
+            save_workflows(&s);
+
+            if let Some(entry) = s
+                .settings
+                .repo_bindings
+                .iter_mut()
+                .find(|x| x.id == binding_id)
+            {
+                entry.workflow_id = Some(ci_id);
+                entry.last_status = "Receita gerada".into();
+            }
+            if !gh_workflows.is_empty() && s.repo_workflows_repo == repo {
+                s.repo_workflows = gh_workflows;
+            }
+            apply_detected_platform(&mut s, &repo, detected_platform);
+            save_settings(&s);
+
+            let msg = if let Some(dn) = deploy_name {
+                format!("Receita '{ci_name}' + '{dn}' gerada para {repo}.")
+            } else {
+                format!("Receita '{ci_name}' gerada para {repo}.")
+            };
+            s.runner_sync_status = msg.clone();
+            record_sync_event(&mut s, true, msg);
+        }
+        engine::notify(&sh2);
+
+        if let Some(srv_id) = target_server_id {
+            sync_repo_bindings_to_vps(&sh2, &srv_id);
+        }
+    });
 }
 
 fn parse_semver_tuple(raw: &str) -> Option<(u64, u64, u64)> {
@@ -2300,5 +2780,152 @@ mod tests {
         );
         assert_eq!(s.settings.repo_bindings[0].platform, PlatformTarget::Windows);
         assert_eq!(s.settings.repo_bindings[1].platform, PlatformTarget::Linux);
+    }
+
+    #[test]
+    fn build_steps_from_package_json_scripts_detects_pnpm_and_npm_real_commands() {
+        let pkg = serde_json::json!({
+            "name": "w-erp",
+            "scripts": {
+                "build": "vite build",
+                "test": "vitest run",
+                "lint": "eslint .",
+                "typecheck": "tsc --noEmit",
+                "test:unit": "vitest run unit",
+                "test:e2e": "playwright test",
+                "dev": "vite"
+            }
+        });
+
+        let pnpm_steps = build_steps_from_package_json_scripts(&pkg, true);
+        let pnpm_cmds: Vec<&str> = pnpm_steps.iter().map(|s| s.run.as_str()).collect();
+        assert_eq!(
+            pnpm_cmds,
+            vec![
+                "pnpm install --frozen-lockfile",
+                "pnpm run typecheck",
+                "pnpm run lint",
+                "pnpm run test",
+                "pnpm run test:unit",
+                "pnpm run test:e2e",
+                "pnpm run build",
+            ]
+        );
+        assert!(pnpm_steps.iter().all(|s| !s.run.starts_with("echo ")));
+
+        let npm_steps = build_steps_from_package_json_scripts(&pkg, false);
+        let npm_cmds: Vec<&str> = npm_steps.iter().map(|s| s.run.as_str()).collect();
+        assert_eq!(
+            npm_cmds,
+            vec![
+                "npm ci",
+                "npm run typecheck",
+                "npm run lint",
+                "npm run test",
+                "npm run test:unit",
+                "npm run test:e2e",
+                "npm run build",
+            ]
+        );
+
+        let pkg_pm = serde_json::json!({
+            "packageManager": "pnpm@9.1.0",
+            "scripts": { "test": "vitest", "empty": "   " }
+        });
+        let pm_steps = build_steps_from_package_json_scripts(&pkg_pm, false);
+        assert_eq!(pm_steps[0].run, "pnpm install --frozen-lockfile");
+        assert_eq!(pm_steps[1].run, "pnpm run test");
+        assert_eq!(pm_steps.len(), 2);
+    }
+
+    #[test]
+    fn build_generated_workflows_for_repo_creates_chained_ci_and_deploy() {
+        let vps_binding = RepoBinding {
+            id: "rb-erp".into(),
+            full_name: "matheuswidder/w-erp-central".into(),
+            target_server_id: Some("vps-prod".into()),
+            branch: "main".into(),
+            ..RepoBinding::default()
+        };
+        let pkg = serde_json::json!({
+            "scripts": { "typecheck": "tsc", "test": "vitest", "build": "vite build" }
+        });
+
+        let (ci, deploy_opt) = build_generated_workflows_for_repo(
+            &vps_binding,
+            Some(&pkg),
+            true,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+
+        let deploy = deploy_opt.expect("should generate chained deploy workflow");
+        assert_ne!(ci.id, deploy.id);
+        assert_eq!(ci.name, "CI — w-erp-central");
+        assert_eq!(ci.trigger, Trigger::Push);
+        assert_eq!(ci.runner, RunnerKind::Ssh);
+        assert_eq!(ci.workdir, "");
+        assert_eq!(ci.on_success.as_deref(), Some(deploy.id.as_str()));
+        assert_eq!(ci.server_id.as_deref(), Some("vps-prod"));
+        assert_eq!(ci.repo_id.as_deref(), Some("rb-erp"));
+        assert_eq!(ci.steps.len(), 4);
+
+        assert_eq!(deploy.name, "Deploy — w-erp-central");
+        assert_eq!(deploy.trigger, Trigger::Manual);
+        assert_eq!(deploy.runner, RunnerKind::Ssh);
+        assert_eq!(deploy.steps[0].run, "docker compose build");
+        assert_eq!(deploy.steps[1].run, "docker compose up -d --remove-orphans");
+        assert!(deploy.steps[1].approval);
+
+        // Rust local sem Docker não gera deploy encadeado
+        let local_binding = RepoBinding {
+            id: "rb-rust".into(),
+            full_name: "widder/cli-tool".into(),
+            target_server_id: None,
+            ..RepoBinding::default()
+        };
+        let (rust_ci, rust_deploy) =
+            build_generated_workflows_for_repo(&local_binding, None, false, true, false, false)
+                .unwrap();
+        assert!(rust_deploy.is_none());
+        assert_eq!(rust_ci.runner, RunnerKind::Local);
+        assert_eq!(
+            rust_ci
+                .steps
+                .iter()
+                .map(|s| s.run.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cargo check --all-targets",
+                "cargo clippy --no-deps -- -D warnings",
+                "cargo test",
+            ]
+        );
+
+        // Sem stack detectável retorna erro
+        assert!(
+            build_generated_workflows_for_repo(&local_binding, None, false, false, false, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_github_file_response_handles_raw_and_base64_json() {
+        let raw = r#"{"name":"app","scripts":{"test":"vitest"}}"#;
+        assert_eq!(decode_github_file_response(raw).unwrap(), raw);
+
+        // Base64 de `{"scripts":{"build":"vite build"}}`
+        let b64_payload = serde_json::json!({
+            "type": "file",
+            "encoding": "base64",
+            "content": "eyJzY3JpcHRzIjp7ImJ1aWxkIjoidml0ZSBidWlsZCJ9fQ==\n"
+        })
+        .to_string();
+        assert_eq!(
+            decode_github_file_response(&b64_payload).unwrap(),
+            r#"{"scripts":{"build":"vite build"}}"#
+        );
     }
 }

@@ -1217,36 +1217,54 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 && (workflows_match || s.snapshot.repo_workflows_repo.is_empty());
             let workflows_loading = s.snapshot.repo_workflows_loading;
 
+            let mut wf_actions = row()
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(wf_chips)
+                .child(
+                    btn_neutral(
+                        t,
+                        "bind-scan-workflows",
+                        if workflows_loading {
+                            "Buscando..."
+                        } else {
+                            "Buscar fluxos no repo"
+                        },
+                        Some(&icons::CODE),
+                        30.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            if !workflows_loading {
+                                s.scan_binding_workflows(tx);
+                            }
+                        },
+                    )
+                    .help("Procura arquivos de automação (.github/workflows, Dockerfile, etc.) no repositório."),
+                );
+            if let Some(binding_id) = draft.id.clone() {
+                wf_actions = wf_actions.child(
+                    btn_neutral(
+                        t,
+                        "bind-gen-wf",
+                        "Gerar receita do repo",
+                        Some(&icons::BOLT),
+                        30.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.generate_workflow_for_binding(&binding_id, tx);
+                            s.modal = ModalState::None;
+                        },
+                    )
+                    .help("Lê package.json, Cargo.toml e docker-compose.yml no GitHub para criar passos reais de testes e redeploy automático."),
+                );
+            }
+
             let mut wf_section = col()
                 .w_full()
+                .min_w(0.0)
                 .gap(8.0)
-                .child(
-                    row()
-                        .w_full()
-                        .gap(8.0)
-                        .center_y()
-                        .flex_wrap()
-                        .child(wf_chips)
-                        .child(
-                            btn_neutral(
-                                t,
-                                "bind-scan-workflows",
-                                if workflows_loading {
-                                    "Buscando..."
-                                } else {
-                                    "Buscar fluxos no repo"
-                                },
-                                Some(&icons::CODE),
-                                30.0,
-                                move |s: &mut AppState, tx: &mut Tx| {
-                                    if !workflows_loading {
-                                        s.scan_binding_workflows(tx);
-                                    }
-                                },
-                            )
-                            .help("Procura arquivos de automação (.github/workflows, Dockerfile, etc.) no repositório."),
-                        ),
-                );
+                .child(wf_actions);
 
             if show_wf_status {
                 let wf_st_lower = s.snapshot.repo_workflows_status.to_lowercase();
@@ -1380,6 +1398,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .label("Branch")
                 .placeholder("main")
                 .width(Some(220.0))
+                .height(32.0)
                 .on_edit(|s: &mut AppState| match &mut s.modal {
                     ModalState::RepoCommits { branch_input, .. } => branch_input,
                     _ => unreachable!(),
@@ -1533,7 +1552,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                 col()
                                     .grow(1.0)
                                     .shrink()
-                                    .min_w(160.0)
+                                    .min_w(0.0)
                                     .gap(4.0)
                                     .child(
                                         row()
@@ -1579,6 +1598,8 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                         })
                                         .font(ty::CAPTION)
                                         .color(t.text_muted)
+                                        .w_full()
+                                        .min_w(0.0)
                                         .wrap(),
                                     ),
                             )
@@ -1612,6 +1633,8 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     .min_w(0.0)
                     .max_h(360.0)
                     .min_h(0.0)
+                    .clip_rounded(8.0)
+                    .clip_soft(0.0)
                     .scroll(ScrollSpec {
                         stick_bottom: false,
                     })

@@ -2129,6 +2129,71 @@ impl AppState {
         tx.wake_after(std::time::Duration::from_millis(120));
     }
 
+    pub fn generate_workflow_for_binding(&mut self, binding_id: &str, tx: &mut Tx) {
+        let repo_name = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .map(|b| b.full_name.clone())
+            .unwrap_or_else(|| "repositório".to_string());
+
+        if self.demo_mode {
+            self.push_toast(
+                format!("gen-wf-demo-{binding_id}"),
+                "Receita simulada do repositório",
+                Some(format!(
+                    "Análise simulada de '{repo_name}': no modo real lê package.json, Cargo.toml e docker-compose.yml para criar passos automáticos."
+                )),
+                ToastKind::Info,
+                tx,
+            );
+            return;
+        }
+
+        github::generate_workflow_from_repo(&self.shared, binding_id.to_string());
+        self.snapshot = self.shared.lock().unwrap().clone();
+        tx.wake_after(std::time::Duration::from_millis(120));
+        self.push_toast(
+            format!("gen-wf-{binding_id}"),
+            "Gerando receita do repositório",
+            Some("Analisando repositório e gerando receita...".into()),
+            ToastKind::Info,
+            tx,
+        );
+    }
+
+    pub fn clear_finished_runs_history(&mut self, tx: &mut Tx) {
+        let removed = if self.demo_mode {
+            let before = self.snapshot.runs.len();
+            self.snapshot.runs.retain(|r| r.status.active());
+            before.saturating_sub(self.snapshot.runs.len())
+        } else {
+            let removed = engine::clear_finished_runs(&self.shared);
+            self.snapshot = self.shared.lock().unwrap().clone();
+            removed
+        };
+
+        if removed > 0 {
+            self.push_toast(
+                "clear-runs-ok",
+                "Histórico limpo",
+                Some(format!("Histórico limpo ({removed} execuções removidas).")),
+                ToastKind::Success,
+                tx,
+            );
+        } else {
+            self.push_toast(
+                "clear-runs-empty",
+                "Histórico sem alterações",
+                Some("Nenhuma execução finalizada para limpar.".into()),
+                ToastKind::Info,
+                tx,
+            );
+        }
+    }
+
     pub fn open_repo_commits_modal(&mut self, binding_id: &str, tx: &mut Tx) {
         let Some(binding) = self
             .snapshot
