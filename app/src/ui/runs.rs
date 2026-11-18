@@ -4,7 +4,7 @@ use rune::tok::motion;
 use rune::{Cursor, El, ScrollSpec, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::Placement;
 use rune_kit::{Kit, Select, SelectAppearance, TextInput};
-use workploy::model::{self, PlatformTarget, RepoBinding, Run, RunStatus, TriggerMode};
+use workploy::model::{self, PlatformTarget, RepoBinding, Run, RunStatus, StepStatus, TriggerMode};
 
 use crate::gfx::MARK_PULSE_RADAR;
 use crate::state::{AppState, ModalState, SettingsTab, StatusFilter, platform_compat_warning};
@@ -544,6 +544,58 @@ pub fn view(
         .child(top_hdr);
 
     if let Some(w) = wf {
+        // Aviso amarelo quando o yml no repo mudou desde a importação:
+        // banner compacto com a mensagem e "Atualizar do repo" direto.
+        if let Some((_, _, drift_msg)) = s
+            .snapshot
+            .workflow_drift
+            .iter()
+            .find(|(id, _, _)| id == &w.id)
+        {
+            let wid_up = w.id.clone();
+            let drift_msg = drift_msg.clone();
+            page = page.child(
+                row()
+                    .key("wf-drift-banner")
+                    .w_full()
+                    .min_w(0.0)
+                    .px(14.0)
+                    .py(10.0)
+                    .gap(10.0)
+                    .center_y()
+                    .flex_wrap()
+                    .radius(9.0)
+                    .fill(t.warning_bg)
+                    .border(1.0, t.warning.alpha(0.4))
+                    .child(
+                        icon(&icons::REFRESH, 15.0)
+                            .color(t.warning)
+                            .a11y_hidden(),
+                    )
+                    .child(
+                        text(drift_msg)
+                            .font(ty::SMALL)
+                            .color(t.warning)
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .wrap(),
+                    )
+                    .child(
+                        btn_neutral(
+                            t,
+                            format!("wf-drift-upd-repo-{}", w.id),
+                            "Atualizar do repo",
+                            Some(&icons::REFRESH),
+                            28.0,
+                            move |s: &mut AppState, tx: &mut Tx| {
+                                s.update_workflow_from_repo(&wid_up, tx);
+                            },
+                        )
+                        .help("Reimporta a versão atual do arquivo no repositório, preservando id, encadeamento e vínculos."),
+                    ),
+            );
+        }
         page = page.child(workflow_pipeline_summary(s, t, w));
         return page.child(filter_bar).child(
             col()
@@ -1189,6 +1241,7 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
 
     let bid_commits = b.id.clone();
     let bid_gen = b.id.clone();
+    let bid_imp = b.id.clone();
     let bid_cfg = b.id.clone();
     let bid_run = b.id.clone();
 
@@ -1237,6 +1290,19 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
                 },
             )
             .help("Lê package.json, Cargo.toml e docker-compose.yml no GitHub para criar passos reais de testes e redeploy automático."),
+        )
+        .child(
+            btn_neutral(
+                t,
+                format!("imp-repo-{}", b.id),
+                "Importar do repositório",
+                Some(&icons::DOCUMENTS),
+                32.0,
+                move |s: &mut AppState, tx: &mut Tx| {
+                    s.open_import_from_repo_modal(&bid_imp, tx);
+                },
+            )
+            .help("Busca o yml direto no repositório vinculado (.workploy.yml ou infra/workploy) — o repo vira a fonte da verdade."),
         )
         .child(
             btn_neutral(
@@ -1493,6 +1559,7 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
 
     if workflows.is_empty() {
         let bid_gen = b.id.clone();
+        let bid_imp = b.id.clone();
         list = list.child(
             row()
                 .key("proj-workflows-empty")
@@ -1524,6 +1591,19 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
                         },
                     )
                     .help("Gera automaticamente uma receita a partir dos arquivos do repositório."),
+                )
+                .child(
+                    btn_neutral(
+                        t,
+                        format!("imp-repo-{}", b.id),
+                        "Importar do repositório",
+                        Some(&icons::DOCUMENTS),
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.open_import_from_repo_modal(&bid_imp, tx);
+                        },
+                    )
+                    .help("Busca o yml direto no repositório vinculado (.workploy.yml ou infra/workploy) — o repo vira a fonte da verdade."),
                 ),
         );
     } else {
@@ -1804,7 +1884,57 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         }
     }
 
-    col()
+    // Receita importada do repo: linha compacta de proveniência
+    // (repo · caminho · SHA curto) com "Atualizar do repo" ao lado.
+    let mut source_row = None;
+    if let Some(src) = &w.source {
+        let sha_short = src
+            .sha
+            .as_deref()
+            .map(|sha| sha.chars().take(7).collect::<String>())
+            .unwrap_or_else(|| "sem SHA".into());
+        let prov = format!(
+            "Origem: {} · {} · {sha_short}",
+            src.repo.trim(),
+            src.path.trim()
+        );
+        let wid_up = w.id.clone();
+        source_row = Some(
+            row()
+                .key(format!("wf-source-row-{}", w.id))
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(icon(&icons::DOCUMENTS, 13.0).color(t.text_muted).a11y_hidden())
+                .child(
+                    text(prov)
+                        .font(ty::CAPTION)
+                        .color(t.text_muted)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .truncate()
+                        .a11y_hidden(),
+                )
+                .child(
+                    btn_ghost(
+                        t,
+                        format!("upd-repo-{}", w.id),
+                        "Atualizar do repo",
+                        Some(&icons::REFRESH),
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.update_workflow_from_repo(&wid_up, tx);
+                        },
+                    )
+                    .help("Traz de novo a versão do arquivo no repositório, preservando id, encadeamento e vínculos."),
+                ),
+        );
+    }
+
+    let mut summary = col()
         .key("wf-pipeline-summary")
         .w_full()
         .min_w(0.0)
@@ -1815,7 +1945,11 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         .fill(t.surface_1)
         .border(1.0, t.border_subtle)
         .child(chain)
-        .child(triggers_row)
+        .child(triggers_row);
+    if let Some(sr) = source_row {
+        summary = summary.child(sr);
+    }
+    summary
 }
 
 fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
@@ -1840,6 +1974,31 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
 
     let mut meta = row().gap(8.0).center_y().flex_wrap();
     meta = meta.child(status_pill(t, r.status));
+    // Execução "quente": vários jobs do mesmo fluxo falharam juntos.
+    if r.status == RunStatus::Failed {
+        let failed_jobs = r
+            .steps
+            .iter()
+            .filter(|st| st.status == StepStatus::Failed)
+            .count();
+        if failed_jobs >= 2 {
+            meta = meta.child(
+                row()
+                    .h(20.0)
+                    .px(7.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(5.0)
+                    .fill(t.danger_bg)
+                    .child(icon(&icons::FIRE, 11.0).color(t.danger).a11y_hidden())
+                    .child(
+                        text(format!("{failed_jobs} jobs falhos"))
+                            .font(ty::CAPTION)
+                            .color(t.danger),
+                    ),
+            );
+        }
+    }
     if show_wf_name {
         meta = meta.child(
             row()

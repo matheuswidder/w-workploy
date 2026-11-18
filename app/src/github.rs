@@ -1812,6 +1812,7 @@ pub fn build_workflows_from_repo_inspection(
             on_success: None,
             server_id: binding.target_server_id.clone(),
             repo_id: Some(binding.id.clone()),
+            source: None,
         })
     } else {
         build_deploy_fallback_steps(
@@ -1833,6 +1834,7 @@ pub fn build_workflows_from_repo_inspection(
             on_success: None,
             server_id: binding.target_server_id.clone(),
             repo_id: Some(binding.id.clone()),
+            source: None,
         })
     };
 
@@ -1892,6 +1894,7 @@ pub fn build_workflows_from_repo_inspection(
         on_success: deploy_wf.as_ref().map(|d| d.id.clone()),
         server_id: binding.target_server_id.clone(),
         repo_id: Some(binding.id.clone()),
+        source: None,
     };
 
     let mut extra_wfs = Vec::new();
@@ -1924,6 +1927,7 @@ pub fn build_workflows_from_repo_inspection(
             on_success: None,
             server_id: binding.target_server_id.clone(),
             repo_id: Some(binding.id.clone()),
+            source: None,
         });
     }
 
@@ -2069,6 +2073,7 @@ pub fn build_generated_workflows_for_repo(
             on_success: None,
             server_id: binding.target_server_id.clone(),
             repo_id: Some(binding.id.clone()),
+            source: None,
         })
     } else {
         None
@@ -2084,6 +2089,7 @@ pub fn build_generated_workflows_for_repo(
         on_success: deploy_wf.as_ref().map(|d| d.id.clone()),
         server_id: binding.target_server_id.clone(),
         repo_id: Some(binding.id.clone()),
+        source: None,
     };
 
     Ok((ci_wf, deploy_wf))
@@ -2373,6 +2379,465 @@ pub fn generate_workflow_from_repo(sh: &SharedHandle, binding_id: String) {
             sync_repo_bindings_to_vps(&sh2, &srv_id);
         }
     });
+}
+
+// ---------- Importar receita do repo + aviso anti-drift ----------
+
+/// Lê um arquivo do repo via Contents API e devolve `(texto, sha_atual)`.
+/// Reutiliza o mesmo plumbing de `fetch_github_raw_file`
+/// (`github_get_request` + `decode_github_file_response`), sem duplicar a
+/// decodificação base64/JSON. O SHA só existe quando a resposta é o JSON de
+/// metadados do Contents API (Accept padrão), e não o corpo bruto.
+fn fetch_repo_file_with_sha(
+    repo: &str,
+    path: &str,
+    ref_query: &str,
+    token: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let clean_path = path.trim().trim_start_matches('/');
+    if repo.trim().is_empty() || clean_path.is_empty() {
+        return Err("Informe o repositório e o caminho do arquivo YAML.".into());
+    }
+    let url = format!("https://api.github.com/repos/{repo}/contents/{clean_path}{ref_query}");
+    let resp = github_get_request(&url, token).call().map_err(|e| match e {
+        ureq::Error::Status(401, _) => "Token do GitHub inválido ou expirado (HTTP 401).".into(),
+        ureq::Error::Status(404, _) => {
+            format!("Arquivo '{clean_path}' não encontrado em {repo}.")
+        }
+        ureq::Error::Status(code, _) => {
+            format!("GitHub retornou HTTP {code} ao ler '{clean_path}'.")
+        }
+        ureq::Error::Transport(t) => {
+            format!("Falha de rede ao ler '{clean_path}': {t}")
+        }
+    })?;
+    let raw = resp
+        .into_string()
+        .map_err(|_| "Não foi possível ler a resposta do GitHub.".to_string())?;
+    let sha = parse_contents_sha(&raw);
+    let text = decode_github_file_response(&raw)?;
+    Ok((text, sha))
+}
+
+/// Extrai o SHA do arquivo da resposta JSON do Contents API.
+fn parse_contents_sha(raw: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| {
+            v.get("sha")
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Divergiu quando ambos os SHAs existem e são diferentes. Sem SHA conhecido
+/// (importação antiga) ou sem leitura atual, não há como afirmar drift.
+fn workflow_source_diverged(src: &WorkflowSource, current_sha: Option<&str>) -> bool {
+    let Some(known) = src.sha.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    current_sha
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|cur| cur != known)
+}
+
+/// Caminhos candidatos de receita Workploy no repo, em ordem de preferência:
+/// `.workploy.yml` e `.workploy.yaml` na raiz; quando a raiz não tem
+/// `.workploy.yml`, lista também `infra/workploy/*.yml|*.yaml` via Contents
+/// API. Faz rede (1–2 chamadas): chame fora da thread de UI.
+pub fn fetch_repo_yaml_candidates(sh: &SharedHandle, full_name: &str) -> Vec<String> {
+    let repo = full_name.trim();
+    if repo.is_empty() {
+        return Vec::new();
+    }
+    let token = resolve_github_token(sh, None);
+    let root_names: Vec<String> = match github_get_request(
+        &format!("https://api.github.com/repos/{repo}/contents/"),
+        token.as_deref(),
+    )
+    .call()
+    {
+        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+            Ok(v) => v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    item.get("type").and_then(|x| x.as_str()).unwrap_or("file") == "file"
+                })
+                .filter_map(|item| {
+                    item.get("name")
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .map(|s| s.to_string())
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    let has_yml = root_names.iter().any(|n| n == ".workploy.yml");
+    let has_yaml = root_names.iter().any(|n| n == ".workploy.yaml");
+    let mut out = Vec::new();
+    if has_yml {
+        out.push(".workploy.yml".into());
+    }
+    if has_yaml {
+        out.push(".workploy.yaml".into());
+    }
+    if !has_yml
+        && let Ok(resp) = github_get_request(
+            &format!("https://api.github.com/repos/{repo}/contents/infra/workploy"),
+            token.as_deref(),
+        )
+        .call()
+            && let Ok(v) = resp.into_json::<serde_json::Value>()
+            && let Some(arr) = v.as_array()
+    {
+        let mut infra: Vec<String> = arr
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(|x| x.as_str()).unwrap_or("file") == "file"
+            })
+            .filter_map(|item| {
+                let name = item
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())?;
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".yml") || lower.ends_with(".yaml") {
+                    Some(format!("infra/workploy/{name}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        infra.sort();
+        infra.dedup();
+        out.extend(infra);
+    }
+    out
+}
+
+/// Lê um yml de receita no repo (branch padrão) e devolve `(texto, sha)`.
+/// Faz rede: chame fora da thread de UI.
+pub fn fetch_repo_yaml(
+    sh: &SharedHandle,
+    full_name: &str,
+    path: &str,
+) -> Result<(String, Option<String>), String> {
+    let repo = full_name.trim().to_string();
+    let token = resolve_github_token(sh, None);
+    fetch_repo_file_with_sha(&repo, path, "", token.as_deref())
+}
+
+/// Resultado do merge de uma receita importada do repo.
+#[derive(Debug)]
+enum MergeKind {
+    /// Receita nova criada.
+    Created { id: String, name: String },
+    /// Receita existente atualizada in-place (id preservado).
+    Updated { id: String, name: String },
+    /// Já existe com o mesmo nome vindo de outra origem; nada foi alterado.
+    Skipped { name: String },
+}
+
+/// Grava uma receita vinda do repo em `Shared`, com anti-duplicação: quando
+/// já existe receita com o mesmo nome (e sem origem divergente), atualiza
+/// preservando `id`, `on_success`, `server_id` e `repo_id` em vez de
+/// duplicar; senão cria, herdando a VPS/vínculo quando o yml não trouxer.
+fn merge_repo_workflow(
+    s: &mut Shared,
+    binding: &RepoBinding,
+    mut wf: Workflow,
+    source: &WorkflowSource,
+) -> MergeKind {
+    let name = wf.name.clone();
+    let Some(idx) = s.workflows.iter().position(|w| w.name == name) else {
+        if wf.server_id.is_none() {
+            wf.server_id = binding.target_server_id.clone();
+        }
+        if wf.repo_id.is_none() {
+            wf.repo_id = Some(binding.id.clone());
+        }
+        wf.source = Some(source.clone());
+        let id = wf.id.clone();
+        s.workflows.push(wf);
+        return MergeKind::Created { id, name };
+    };
+    let (existing_id, existing_on_success, existing_server, existing_repo) = {
+        let existing = &s.workflows[idx];
+        if existing
+            .source
+            .as_ref()
+            .is_some_and(|cur| cur.repo != source.repo || cur.path != source.path)
+        {
+            return MergeKind::Skipped { name };
+        }
+        (
+            existing.id.clone(),
+            existing.on_success.clone(),
+            existing.server_id.clone(),
+            existing.repo_id.clone(),
+        )
+    };
+    wf.id = existing_id.clone();
+    wf.on_success = existing_on_success;
+    wf.server_id = existing_server;
+    wf.repo_id = existing_repo;
+    wf.source = Some(source.clone());
+    s.workflows[idx] = wf;
+    MergeKind::Updated {
+        id: existing_id,
+        name,
+    }
+}
+
+fn finish_import_error(sh: &SharedHandle, binding_id: &str, msg: String) -> String {
+    {
+        let mut s = sh.lock().unwrap();
+        if let Some(b) = s
+            .settings
+            .repo_bindings
+            .iter_mut()
+            .find(|x| x.id == binding_id)
+        {
+            b.last_status = short_sync_error(&msg);
+        }
+        s.runner_sync_status = msg.clone();
+        record_sync_event(&mut s, false, msg.clone());
+    }
+    engine::notify(sh);
+    msg
+}
+
+/// Importa (ou atualiza) a receita do yml do repo vinculado, gravando a
+/// proveniência para o aviso anti-drift. Aceita receita única ou lista
+/// `workflows:`. Bloqueia em rede: chame fora da thread de UI. Retorna
+/// `None` quando o vínculo não existe; `Some(msg)` traz a mensagem pt-BR do
+/// resultado (sucesso ou falha), também publicada em `runner_sync_status` e
+/// `sync_last_event`, com sincronização na VPS do vínculo quando a
+/// importação muda algo — o mesmo fluxo de `generate_workflow_from_repo`.
+pub fn import_workflow_from_repo(sh: &SharedHandle, binding_id: &str, path: &str) -> Option<String> {
+    let binding = {
+        let mut s = sh.lock().unwrap();
+        let b = s
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|x| x.id == binding_id)
+            .cloned()?;
+        if b.full_name.trim().is_empty() {
+            let msg = "Informe o repositório (dono/repo) antes de importar a receita.".to_string();
+            if let Some(entry) = s
+                .settings
+                .repo_bindings
+                .iter_mut()
+                .find(|x| x.id == binding_id)
+            {
+                entry.last_status = short_sync_error(&msg);
+            }
+            s.runner_sync_status = msg.clone();
+            record_sync_event(&mut s, false, msg.clone());
+            drop(s);
+            engine::notify(sh);
+            return Some(msg);
+        }
+        let status = format!("Importando receita de {}...", b.full_name.trim());
+        s.runner_sync_status = status.clone();
+        if let Some(entry) = s
+            .settings
+            .repo_bindings
+            .iter_mut()
+            .find(|x| x.id == binding_id)
+        {
+            entry.last_status = "Importando receita...".into();
+        }
+        b
+    };
+    engine::notify(sh);
+
+    let clean_path = path.trim().trim_start_matches('/');
+    if clean_path.is_empty() {
+        return Some(finish_import_error(
+            sh,
+            binding_id,
+            "Informe o caminho do arquivo YAML no repositório.".into(),
+        ));
+    }
+
+    let (yaml_text, sha) = match fetch_repo_yaml(sh, &binding.full_name, clean_path) {
+        Ok(v) => v,
+        Err(err) => return Some(finish_import_error(sh, binding_id, err)),
+    };
+    let recipes = match crate::yaml::import_yaml_multi(&yaml_text) {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = format!(
+                "Falha ao importar '{clean_path}' de {}: {err}",
+                binding.full_name.trim()
+            );
+            return Some(finish_import_error(sh, binding_id, msg));
+        }
+    };
+
+    let source = WorkflowSource {
+        repo: binding.full_name.trim().to_string(),
+        path: clean_path.to_string(),
+        sha,
+        imported_at: now_str(),
+    };
+
+    let mut created: Vec<(String, String)> = Vec::new();
+    let mut updated: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    {
+        let mut s = sh.lock().unwrap();
+        for wf in recipes {
+            match merge_repo_workflow(&mut s, &binding, wf, &source) {
+                MergeKind::Created { id, name } => created.push((id, name)),
+                MergeKind::Updated { id, name } => updated.push((id, name)),
+                MergeKind::Skipped { name } => skipped.push(name),
+            }
+        }
+        // A cópia local acabou de sair do repo: avisos anti-drift destas
+        // receitas não fazem mais sentido.
+        let refreshed: Vec<&String> = created
+            .iter()
+            .chain(updated.iter())
+            .map(|(id, _)| id)
+            .collect();
+        s.workflow_drift
+            .retain(|(id, _, _)| !refreshed.contains(&id));
+        save_workflows(&s);
+    }
+
+    let repo_label = binding.full_name.trim();
+    let total = created.len() + updated.len();
+    let skipped_names = skipped.join("', '");
+    let first_name = created
+        .iter()
+        .chain(updated.iter())
+        .next()
+        .map(|(_, n)| n.clone())
+        .unwrap_or_default();
+    let mut msg = if total == 0 {
+        format!(
+            "Nada importado de {repo_label}:{clean_path}: já existe receita com este nome vinda de outra origem ('{skipped_names}')."
+        )
+    } else if total == 1 && created.len() == 1 {
+        format!("Receita '{first_name}' importada de {repo_label}:{clean_path}.")
+    } else if total == 1 {
+        format!(
+            "Receita '{first_name}' atualizada a partir de {repo_label}:{clean_path} — vínculos preservados."
+        )
+    } else {
+        format!(
+            "{total} receitas de {repo_label}:{clean_path}: {} nova(s), {} atualizada(s).",
+            created.len(),
+            updated.len()
+        )
+    };
+    if !skipped.is_empty() && total > 0 {
+        msg.push_str(&format!(
+            " Ignorada(s) por origem diferente: '{skipped_names}'."
+        ));
+    }
+    let ok = total > 0;
+    {
+        let mut s = sh.lock().unwrap();
+        if let Some(entry) = s
+            .settings
+            .repo_bindings
+            .iter_mut()
+            .find(|x| x.id == binding_id)
+        {
+            entry.last_status = if ok {
+                "Receita importada do repo".into()
+            } else {
+                short_sync_error(&msg)
+            };
+        }
+        s.runner_sync_status = msg.clone();
+        record_sync_event(&mut s, ok, msg.clone());
+        save_settings(&s);
+    }
+    engine::notify(sh);
+
+    if ok
+        && let Some(srv_id) = binding.target_server_id.clone()
+    {
+        sync_repo_bindings_to_vps(sh, &srv_id);
+    }
+    Some(msg)
+}
+
+/// Anti-drift: para cada receita com proveniência, consulta o SHA atual do
+/// arquivo no repo (1 chamada Contents API por receita) e registra aviso em
+/// `Shared.workflow_drift` quando divergir do SHA da importação. Falha de
+/// rede ou arquivo ausente não vira falso aviso. Barato o bastante para rodar
+/// a cada ciclo do poller; não grava nada persistido.
+pub fn check_workflow_source_drift(sh: &SharedHandle) {
+    let tracked: Vec<(String, String, WorkflowSource)> = {
+        let s = sh.lock().unwrap();
+        s.workflows
+            .iter()
+            .filter_map(|w| {
+                let src = w.source.as_ref()?;
+                if src.repo.trim().is_empty() || src.path.trim().is_empty() {
+                    return None;
+                }
+                Some((w.id.clone(), w.name.clone(), src.clone()))
+            })
+            .collect()
+    };
+    if tracked.is_empty() {
+        let cleared = {
+            let mut s = sh.lock().unwrap();
+            if s.workflow_drift.is_empty() {
+                false
+            } else {
+                s.workflow_drift.clear();
+                true
+            }
+        };
+        if cleared {
+            engine::notify(sh);
+        }
+        return;
+    }
+    let token = resolve_github_token(sh, None);
+    let mut drift: Vec<(String, String, String)> = Vec::new();
+    for (id, name, src) in &tracked {
+        let Ok((_, current_sha)) =
+            fetch_repo_file_with_sha(&src.repo, &src.path, "", token.as_deref())
+        else {
+            continue;
+        };
+        if workflow_source_diverged(src, current_sha.as_deref()) {
+            drift.push((
+                id.clone(),
+                name.clone(),
+                "A receita mudou no repo — use Atualizar do repo.".into(),
+            ));
+        }
+    }
+    let changed = {
+        let mut s = sh.lock().unwrap();
+        if s.workflow_drift == drift {
+            false
+        } else {
+            s.workflow_drift = drift;
+            true
+        }
+    };
+    if changed {
+        engine::notify(sh);
+    }
 }
 
 fn parse_semver_tuple(raw: &str) -> Option<(u64, u64, u64)> {
@@ -3148,6 +3613,7 @@ mod tests {
                 on_success: Some("wf-deploy".into()),
                 server_id: Some("vps-a".into()),
                 repo_id: Some("rb-1".into()),
+                source: None,
             },
             Workflow {
                 id: "wf-deploy".into(),
@@ -3159,6 +3625,7 @@ mod tests {
                 on_success: None,
                 server_id: Some("vps-a".into()),
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-other".into(),
@@ -3170,6 +3637,7 @@ mod tests {
                 on_success: None,
                 server_id: Some("vps-b".into()),
                 repo_id: Some("rb-2".into()),
+                source: None,
             },
         ];
 
@@ -3656,6 +4124,7 @@ mod tests {
                 on_success: Some("wf-deploy-generic".into()),
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-deploy-generic".into(),
@@ -3667,6 +4136,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-unrelated-manual".into(),
@@ -3678,6 +4148,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
         ];
 
@@ -4234,6 +4705,255 @@ jobs:
         assert_eq!(
             default_installer_url_for_tag("v0.1.10", "0.1.10", true),
             "https://github.com/matheuswidder/w-workploy/releases/download/v0.1.10/workploy-0.1.10-linux-x86_64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn import_do_repo_atualiza_por_nome_preservando_id_e_vinculos() {
+        let binding = RepoBinding {
+            id: "rb-erp".into(),
+            full_name: "widder/erp".into(),
+            target_server_id: Some("vps-prod".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnVps,
+            workflow_id: Some("wf-ci".into()),
+            enabled: true,
+            last_sha: String::new(),
+            last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
+        };
+        // Receita existente, criada antes da importação, com vínculos próprios.
+        let mut s = Shared::default();
+        s.workflows.push(Workflow {
+            id: "wf-ci".into(),
+            name: "CI".into(),
+            trigger: Trigger::Push,
+            runner: RunnerKind::Ssh,
+            workdir: String::new(),
+            steps: vec![Step {
+                name: "Passo antigo".into(),
+                run: "echo antigo".into(),
+                approval: false,
+            }],
+            on_success: Some("wf-deploy".into()),
+            server_id: Some("vps-prod".into()),
+            repo_id: Some("rb-erp".into()),
+            source: None,
+        });
+
+        // yml novo do repo: mesmas etapas revisadas, mesmo nome.
+        let fresh = crate::yaml::import_yaml(
+            "name: CI\non: [push]\njobs:\n  build:\n    runs-on: local\n    steps:\n      - name: Passo novo\n        run: echo novo\n",
+            "wf-fresco".into(),
+        )
+        .unwrap();
+        let source = WorkflowSource {
+            repo: "widder/erp".into(),
+            path: ".workploy.yml".into(),
+            sha: Some("abc123".into()),
+            imported_at: "18/11/2026 10:00:00".into(),
+        };
+
+        match merge_repo_workflow(&mut s, &binding, fresh, &source) {
+            MergeKind::Updated { id, .. } => assert_eq!(id, "wf-ci"),
+            other => panic!("esperava Updated, veio {other:?}"),
+        }
+
+        // Preserva id, on_success, server_id e repo_id; atualiza steps e proveniência.
+        assert_eq!(s.workflows.len(), 1, "não deve duplicar a receita");
+        let wf = &s.workflows[0];
+        assert_eq!(wf.id, "wf-ci");
+        assert_eq!(wf.on_success.as_deref(), Some("wf-deploy"));
+        assert_eq!(wf.server_id.as_deref(), Some("vps-prod"));
+        assert_eq!(wf.repo_id.as_deref(), Some("rb-erp"));
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.steps[0].name, "Passo novo");
+        assert_eq!(wf.source.as_ref(), Some(&source));
+
+        // Reimportar do mesmo repo+path atualiza de novo (SHA novo, mesmo id).
+        let source2 = WorkflowSource { sha: Some("def456".into()), ..source.clone() };
+        let fresh2 = crate::yaml::import_yaml(
+            "name: CI\non: [push]\njobs:\n  build:\n    runs-on: local\n    steps:\n      - name: Passo novo\n        run: echo novo\n",
+            "wf-outro".into(),
+        )
+        .unwrap();
+        match merge_repo_workflow(&mut s, &binding, fresh2, &source2) {
+            MergeKind::Updated { id, .. } => assert_eq!(id, "wf-ci"),
+            other => panic!("esperava Updated no reimport, veio {other:?}"),
+        }
+        assert_eq!(s.workflows.len(), 1);
+        assert_eq!(s.workflows[0].source.as_ref().unwrap().sha.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn import_do_repo_cria_receita_nova_herdando_vps_do_vinculo() {
+        let binding = RepoBinding {
+            id: "rb-site".into(),
+            full_name: "widder/site".into(),
+            target_server_id: Some("vps-staging".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnVps,
+            workflow_id: None,
+            enabled: true,
+            last_sha: String::new(),
+            last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
+        };
+        let mut s = Shared::default();
+        let fresh = crate::yaml::import_yaml(
+            "name: CI do Site\non: [push]\njobs:\n  build:\n    runs-on: local\n    steps:\n      - name: Build\n        run: pnpm build\n",
+            "wf-novo".into(),
+        )
+        .unwrap();
+        let source = WorkflowSource {
+            repo: "widder/site".into(),
+            path: "infra/workploy/ci.yml".into(),
+            sha: None,
+            imported_at: "18/11/2026 10:00:00".into(),
+        };
+        match merge_repo_workflow(&mut s, &binding, fresh, &source) {
+            MergeKind::Created { id, name } => {
+                assert_eq!(id, "wf-novo");
+                assert_eq!(name, "CI do Site");
+            }
+            other => panic!("esperava Created, veio {other:?}"),
+        }
+        assert_eq!(s.workflows.len(), 1);
+        let wf = &s.workflows[0];
+        assert_eq!(wf.server_id.as_deref(), Some("vps-staging"), "herda a VPS do vínculo");
+        assert_eq!(wf.repo_id.as_deref(), Some("rb-site"), "fica vinculada ao repo");
+        assert_eq!(wf.source.as_ref(), Some(&source));
+    }
+
+    #[test]
+    fn import_do_repo_nao_sobrescreve_receita_de_outra_origem() {
+        let binding = RepoBinding {
+            id: "rb-erp".into(),
+            full_name: "widder/erp".into(),
+            target_server_id: None,
+            branch: "main".into(),
+            trigger_mode: TriggerMode::PollOnVps,
+            workflow_id: None,
+            enabled: true,
+            last_sha: String::new(),
+            last_status: String::new(),
+            platform: PlatformTarget::CrossPlatform,
+        };
+        let mut s = Shared::default();
+        let other_source = WorkflowSource {
+            repo: "widder/other".into(),
+            path: ".workploy.yml".into(),
+            sha: Some("aaa".into()),
+            imported_at: "01/01/2026 00:00:00".into(),
+        };
+        s.workflows.push(Workflow {
+            id: "wf-original".into(),
+            name: "CI".into(),
+            trigger: Trigger::Push,
+            runner: RunnerKind::Local,
+            workdir: String::new(),
+            steps: vec![Step {
+                name: "Original".into(),
+                run: "echo original".into(),
+                approval: false,
+            }],
+            on_success: None,
+            server_id: None,
+            repo_id: None,
+            source: Some(other_source),
+        });
+
+        let fresh = crate::yaml::import_yaml(
+            "name: CI\non: [push]\njobs:\n  build:\n    steps:\n      - name: Intruso\n        run: echo intruso\n",
+            "wf-intruso".into(),
+        )
+        .unwrap();
+        let divergente = WorkflowSource {
+            repo: "widder/erp".into(),
+            path: ".workploy.yml".into(),
+            sha: Some("bbb".into()),
+            imported_at: "18/11/2026 10:00:00".into(),
+        };
+        match merge_repo_workflow(&mut s, &binding, fresh, &divergente) {
+            MergeKind::Skipped { name } => assert_eq!(name, "CI"),
+            other => panic!("esperava Skipped, veio {other:?}"),
+        }
+        assert_eq!(s.workflows.len(), 1, "não duplica nem sobrescreve");
+        let wf = &s.workflows[0];
+        assert_eq!(wf.id, "wf-original");
+        assert_eq!(wf.steps[0].name, "Original");
+        assert_eq!(wf.source.as_ref().unwrap().repo, "widder/other");
+    }
+
+    #[test]
+    fn drift_detection_parseia_sha_e_detecta_divergencia() {
+        // Resposta do Contents API: JSON com sha + conteúdo base64 (com
+        // quebras de linha, que `decode_base64` filtra).
+        let yaml_body = "name: CI\non: [push]\njobs:\n  build:\n    steps:\n      - name: ok\n        run: echo ok\n";
+        let encoded = {
+            let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = yaml_body.as_bytes();
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                ];
+                out.push(table[b[0] as usize >> 2] as char);
+                out.push(table[((b[0] as usize & 0x03) << 4) | (b[1] as usize >> 4)] as char);
+                out.push(if chunk.len() > 1 {
+                    table[((b[1] as usize & 0x0f) << 2) | (b[2] as usize >> 6)] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    table[b[2] as usize & 0x3f] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        };
+        let contents_json = serde_json::json!({
+            "name": "ci.yml",
+            "path": "infra/workploy/ci.yml",
+            "sha": "sha-atual-no-repo",
+            "type": "file",
+            "encoding": "base64",
+            "content": encoded
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_contents_sha(&contents_json).as_deref(),
+            Some("sha-atual-no-repo")
+        );
+        let (text, sha) = {
+            let raw = contents_json.clone();
+            (
+                decode_github_file_response(&raw).unwrap(),
+                parse_contents_sha(&raw),
+            )
+        };
+        assert_eq!(sha.as_deref(), Some("sha-atual-no-repo"));
+        assert!(text.contains("name: CI"), "texto do yml deve voltar intacto");
+
+        // Divergência só com dois SHAs presentes e diferentes.
+        let local = WorkflowSource {
+            repo: "widder/erp".into(),
+            path: "infra/workploy/ci.yml".into(),
+            sha: Some("sha-importado-antes".into()),
+            imported_at: "18/11/2026 10:00:00".into(),
+        };
+        assert!(workflow_source_diverged(&local, Some("sha-atual-no-repo")));
+        assert!(!workflow_source_diverged(&local, Some("sha-importado-antes")));
+        assert!(!workflow_source_diverged(&local, Some("")), "sha vazio não é leitura");
+        assert!(!workflow_source_diverged(&local, None), "falha de leitura não vira falso aviso");
+        let sem_sha = WorkflowSource { sha: None, ..local.clone() };
+        assert!(
+            !workflow_source_diverged(&sem_sha, Some("sha-atual-no-repo")),
+            "importação antiga sem sha não acusa drift"
         );
     }
 }

@@ -173,7 +173,112 @@ pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
         on_success,
         server_id,
         repo_id,
+        source: None,
     })
+}
+
+/// Importa um YAML que pode ser uma receita única (formato clássico) ou um
+/// documento com a chave `workflows:` listando várias receitas. Cada receita
+/// da lista é reutilizada por `import_yaml`, recebendo um id novo.
+pub fn import_yaml_multi(text: &str) -> Result<Vec<Workflow>, String> {
+    let is_list_doc = text.lines().any(|l| {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        let has_indent = l.len() > l.trim_start().len();
+        !has_indent && trimmed.starts_with("workflows:")
+    });
+    if !is_list_doc {
+        let wf = import_yaml(text, new_id("wf"))?;
+        return Ok(vec![wf]);
+    }
+    let items = split_workflow_list_items(text);
+    if items.is_empty() {
+        return Err("Nenhuma receita encontrada na lista 'workflows'.".into());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let wf = import_yaml(item, new_id("wf")).map_err(|e| {
+            format!("Receita {} da lista 'workflows' é inválida: {e}", idx + 1)
+        })?;
+        out.push(wf);
+    }
+    Ok(out)
+}
+
+/// Coluna da primeira chave de um item de lista (`"  - name:"` → 4).
+fn list_item_key_indent(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b' ') {
+        i += 1;
+    }
+    i
+}
+
+/// Divide um documento com `workflows:` no corpo de cada receita da lista,
+/// dedentado para o formato de receita única que `import_yaml` entende.
+/// Linhas antes do primeiro item (a própria chave `workflows:`, comentários)
+/// são ignoradas; um novo item começa em `- ` com o mesmo recuo do primeiro.
+fn split_workflow_list_items(text: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    // (recuo da chave, buffer do item em andamento)
+    let mut cur: Option<(usize, String)> = None;
+    let mut item_indent: Option<usize> = None;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            if let Some((_, buf)) = cur.as_mut() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let starts_item = trimmed == "-" || trimmed.starts_with("- ");
+        if starts_item && item_indent.is_none_or(|base| indent == base) {
+            if let Some((key_indent, buf)) = cur.take()
+                && !buf.trim().is_empty()
+            {
+                items.push(dedent_block(&buf, key_indent));
+            }
+            let key_indent = list_item_key_indent(line);
+            item_indent = Some(indent);
+            // Troca o marcador `-` por espaço: a primeira chave fica no mesmo
+            // recuo das seguintes e o bloco dedenta por igual.
+            let mut first = String::with_capacity(line.len());
+            first.push_str(&line[..indent]);
+            first.push(' ');
+            first.push_str(&line[indent + 1..]);
+            cur = Some((key_indent, format!("{first}\n")));
+        } else if let Some((_, buf)) = cur.as_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if let Some((key_indent, buf)) = cur.take()
+        && !buf.trim().is_empty()
+    {
+        items.push(dedent_block(&buf, key_indent));
+    }
+    items
+}
+
+/// Remove até `key_indent` espaços do início de cada linha do bloco.
+fn dedent_block(buf: &str, key_indent: usize) -> String {
+    let mut out = String::with_capacity(buf.len());
+    for raw in buf.lines() {
+        let bytes = raw.as_bytes();
+        let mut drop = 0;
+        while drop < key_indent && drop < bytes.len() && bytes[drop] == b' ' {
+            drop += 1;
+        }
+        out.push_str(&raw[drop..]);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -197,6 +302,7 @@ mod tests {
                 on_success: Some("next".into()),
                 server_id: Some("vps-1".into()),
                 repo_id: Some("rb-1".into()),
+                source: None,
             };
             let imported = import_yaml(&export_yaml(&wf), "a".into()).unwrap();
             assert_eq!(imported.runner, runner);
@@ -216,5 +322,72 @@ mod tests {
         assert_eq!(wf.steps.len(), 4);
         assert!(!wf.steps[0].approval);
         assert!(wf.steps[3].approval);
+    }
+
+    #[test]
+    fn import_yaml_multi_aceita_formato_antigo_de_receita_unica() {
+        let raw = include_str!("../../.workploy.yml");
+        let list = import_yaml_multi(raw).expect("receita única deve continuar importando");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Workploy Windows CI & Release");
+        assert_eq!(list[0].steps.len(), 4);
+    }
+
+    #[test]
+    fn import_yaml_multi_importa_lista_de_receitas() {
+        let doc = "\
+workflows:
+  - name: CI do Site
+    on: [push]
+    jobs:
+      build:
+        runs-on: local
+        steps:
+          - name: Instalar dependências
+            run: pnpm install --frozen-lockfile
+          - name: Testes
+            run: |
+              pnpm test
+              pnpm lint
+  - name: Deploy VPS
+    on: [workflow_dispatch]
+    x-server: vps-prod
+    jobs:
+      build:
+        runs-on: self-hosted
+        steps:
+          - name: Subir serviços
+            run: docker compose up -d
+            x-approval: true
+";
+        let list = import_yaml_multi(doc).expect("lista deve importar");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "CI do Site");
+        assert_eq!(list[0].trigger, Trigger::Push);
+        assert_eq!(list[0].runner, RunnerKind::Local);
+        assert_eq!(list[0].steps.len(), 2);
+        assert_eq!(list[0].steps[0].name, "Instalar dependências");
+        // O parser clássico de bloco `run: |` mantém a quebra final quando o
+        // documento acaba dentro do bloco; a lista preserva essa paridade.
+        assert_eq!(list[0].steps[1].run.trim_end(), "pnpm test\npnpm lint");
+        assert_ne!(list[0].id, list[1].id, "cada receita recebe id próprio");
+        assert_eq!(list[1].name, "Deploy VPS");
+        assert_eq!(list[1].runner, RunnerKind::Ssh);
+        assert_eq!(list[1].server_id.as_deref(), Some("vps-prod"));
+        assert!(list[1].steps[0].approval);
+    }
+
+    #[test]
+    fn import_yaml_multi_erro_aponta_a_receita_invalida() {
+        let doc = "workflows:\n  - name: Boa\n    jobs:\n      build:\n        steps:\n          - name: ok\n            run: echo ok\n  - name: Vazia\n    on: [push]\n";
+        let err = import_yaml_multi(doc).unwrap_err();
+        assert!(err.contains("Receita 2"), "erro deve citar a receita 2: {err}");
+        assert!(err.contains("steps"), "erro deve citar o motivo: {err}");
+    }
+
+    #[test]
+    fn import_yaml_multi_lista_vazia_da_erro_claro() {
+        let err = import_yaml_multi("workflows: []\n").unwrap_err();
+        assert!(err.contains("'workflows'"), "erro deve citar a lista: {err}");
     }
 }

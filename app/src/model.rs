@@ -45,6 +45,17 @@ pub struct Step {
     pub approval: bool,
 }
 
+/// Proveniência de uma receita importada do repositório (anti-drift):
+/// de onde ela veio e o SHA do arquivo no instante da importação, para
+/// avisar quando o yml no repo mudar e a cópia local ficar desatualizada.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkflowSource {
+    pub repo: String,
+    pub path: String,
+    pub sha: Option<String>,
+    pub imported_at: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct Workflow {
     pub id: String,
@@ -60,6 +71,10 @@ pub struct Workflow {
     pub server_id: Option<String>,
     #[serde(default)]
     pub repo_id: Option<String>,
+    /// Origem no repo quando a receita foi importada de lá. `#[serde(default)]`
+    /// mantém o `workflows.json` legado abrindo sem migração.
+    #[serde(default)]
+    pub source: Option<WorkflowSource>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -89,6 +104,156 @@ impl RunStatus {
             RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval
         )
     }
+}
+
+/// Fase de uma execução ativa, derivada da fração de passos concluídos.
+/// Guia qual spinner de progresso exibir (suave no comecinho, mais vivo no fim).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunPhase {
+    /// Acabou de sair da fila / primeiro passo (< 20% concluído).
+    Starting,
+    /// Avançando entre passos (20%–60%).
+    Progress,
+    /// Mais da metade, ainda com trabalho pela frente (60%–85%).
+    Slow,
+    /// Último passo em execução ou >= 85% concluído.
+    Finishing,
+}
+
+impl RunPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            RunPhase::Starting => "Iniciando",
+            RunPhase::Progress => "Em progresso",
+            RunPhase::Slow => "Avançado",
+            RunPhase::Finishing => "Finalizando",
+        }
+    }
+}
+
+/// Família visual do spinner de execução (svg-spinners recriado em rune-fx).
+/// Fluxos de CI/build/teste usam a família `pulse-*`; fluxos de deploy, a
+/// família `blocks-*`; a fase da execução escolhe o membro da família.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpinnerKind {
+    /// `pulse-2`: dois pontos suaves alternando (CI, começando).
+    PulseSoft,
+    /// `pulse-multiple`: três pontos em sequência (CI, em progresso).
+    PulseMultiple,
+    /// `pulse-rings-2`: dois anéis expandindo (CI, mais da metade).
+    PulseRings2,
+    /// `pulse-rings-3`: três anéis acelerando (CI, finalizando).
+    PulseRings3,
+    /// `blocks-scale`: blocos subindo em sequência (Deploy, começando).
+    BlocksScale,
+    /// `blocks-shuffle-2`: dois blocos alternando (Deploy, em progresso).
+    BlocksShuffle2,
+    /// `blocks-shuffle-3`: três blocos em rodízio (Deploy, mais da metade).
+    BlocksShuffle3,
+    /// `blocks-wave`: onda diagonal final de blocos (Deploy, finalizando).
+    BlocksWave,
+}
+
+/// Receita de deploy: entrega/reinicia serviços (deploy, redeploy, compose, up -d).
+pub fn is_deploy_workflow(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("deploy") || n.contains("docker compose") || n.contains("up -d")
+}
+
+/// Receita de CI/build/teste: valida código antes de liberar (ci, test, check,
+/// lint, audit, smoke). Receitas sem palavra-chave seguem a família `pulse-*`.
+pub fn is_ci_workflow(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("ci")
+        || n.contains("test")
+        || n.contains("check")
+        || n.contains("lint")
+        || n.contains("audit")
+        || n.contains("smoke")
+}
+
+/// Spinner que representa a execução: família pelo tipo de fluxo, membro pela fase.
+/// Deploy → família `blocks-*`; CI (e receitas genéricas) → família `pulse-*`.
+pub fn run_phase_spinner_kind(run: &Run, workflow_name: &str) -> SpinnerKind {
+    if is_deploy_workflow(workflow_name) {
+        match run_phase(run) {
+            RunPhase::Starting => SpinnerKind::BlocksScale,
+            RunPhase::Progress => SpinnerKind::BlocksShuffle2,
+            RunPhase::Slow => SpinnerKind::BlocksShuffle3,
+            RunPhase::Finishing => SpinnerKind::BlocksWave,
+        }
+    } else {
+        match run_phase(run) {
+            RunPhase::Starting => SpinnerKind::PulseSoft,
+            RunPhase::Progress => SpinnerKind::PulseMultiple,
+            RunPhase::Slow => SpinnerKind::PulseRings2,
+            RunPhase::Finishing => SpinnerKind::PulseRings3,
+        }
+    }
+}
+
+/// Fração de progresso da execução: passos concluídos sobre o total, refinada
+/// pela última sub-etapa ativa (o passo em execução contribui parcialmente).
+pub fn run_progress_frac(run: &Run) -> f32 {
+    let total = run.steps.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let done = run
+        .steps
+        .iter()
+        .filter(|st| matches!(st.status, StepStatus::Success | StepStatus::Skipped))
+        .count();
+    let mut frac = done as f32 / total as f32;
+    if let Some(active) = run.steps.iter().find(|st| st.status == StepStatus::Running)
+        && !active.substeps.is_empty()
+    {
+        let sub_total = active.substeps.len();
+        let sub_done = active
+            .substeps
+            .iter()
+            .filter(|s| matches!(s.status, StepStatus::Success | StepStatus::Skipped))
+            .count();
+        frac += (sub_done as f32 / sub_total as f32) / total as f32;
+    }
+    frac.clamp(0.0, 1.0)
+}
+
+/// Fase da execução para escolher o spinner animado correspondente.
+/// Execuções encerradas não têm fase de progresso e devolvem `Starting`.
+pub fn run_phase(run: &Run) -> RunPhase {
+    let total = run.steps.len();
+    if total == 0 || !run.status.active() {
+        return RunPhase::Starting;
+    }
+    // Último passo em execução: está acabando, mesmo antes dos 85%.
+    if run.steps[total - 1].status == StepStatus::Running {
+        return RunPhase::Finishing;
+    }
+    let frac = run_progress_frac(run);
+    if frac < 0.2 {
+        RunPhase::Starting
+    } else if frac < 0.6 {
+        RunPhase::Progress
+    } else if frac < 0.85 {
+        RunPhase::Slow
+    } else {
+        RunPhase::Finishing
+    }
+}
+
+/// Percentual inteiro de passos concluídos (para rótulos "Running · 67%").
+pub fn steps_completed_pct(run: &Run) -> u8 {
+    let total = run.steps.len();
+    if total == 0 {
+        return 0;
+    }
+    let done = run
+        .steps
+        .iter()
+        .filter(|st| matches!(st.status, StepStatus::Success | StepStatus::Skipped))
+        .count();
+    ((done as f32 / total as f32) * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -658,6 +823,10 @@ pub struct Shared {
     pub repo_commits: Vec<RepoCommitItem>,
     #[serde(skip)]
     pub repo_commits_status: String,
+    /// Avisos anti-drift por receita: `(workflow_id, workflow_name, msg)` —
+    /// o arquivo no repo mudou desde a importação registrada em `source`.
+    #[serde(skip)]
+    pub workflow_drift: Vec<(String, String, String)>,
     #[serde(skip)]
     pub detected_platform: Option<(String, PlatformTarget)>,
     #[serde(skip)]
@@ -902,6 +1071,7 @@ fn seed(s: &mut Shared) {
         on_success: Some(redeploy_id.clone()),
         server_id: None,
         repo_id: None,
+        source: None,
     });
     s.workflows.push(Workflow {
         id: redeploy_id,
@@ -929,6 +1099,7 @@ fn seed(s: &mut Shared) {
         on_success: None,
         server_id: None,
         repo_id: None,
+        source: None,
     });
     s.workflows.push(Workflow {
         id: rls_id,
@@ -951,6 +1122,7 @@ fn seed(s: &mut Shared) {
         on_success: None,
         server_id: None,
         repo_id: None,
+        source: None,
     });
 }
 
@@ -1423,6 +1595,246 @@ mod duration_tests {
         assert_eq!(step.elapsed_secs(), 1.25);
     }
 
+    fn phase_step(status: StepStatus) -> StepRun {
+        StepRun {
+            name: "passo".into(),
+            status,
+            log: String::new(),
+            secs: 0.0,
+            substeps: Vec::new(),
+            started_ts: None,
+        }
+    }
+
+    fn phase_run(status: RunStatus, steps: Vec<StepRun>) -> Run {
+        Run {
+            id: "run-phase-test".into(),
+            workflow_id: "wf-x".into(),
+            workflow_name: "X".into(),
+            status,
+            trigger_label: "manual".into(),
+            title: String::new(),
+            number: 1,
+            commit: None,
+            started_at: String::new(),
+            started_ts: None,
+            finished_at: None,
+            steps,
+            approved: false,
+            cancel_requested: false,
+            secs: 0.0,
+            actor: String::new(),
+            repo_name: None,
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_phase_maps_step_fraction_and_last_step() {
+        // Fila, sem passo em execução → Starting.
+        let queued = phase_run(
+            RunStatus::Queued,
+            vec![phase_step(StepStatus::Pending), phase_step(StepStatus::Pending)],
+        );
+        assert_eq!(run_phase(&queued), RunPhase::Starting);
+
+        // Primeiro passo rodando, nada concluído (< 0.2) → Starting.
+        let starting = phase_run(
+            RunStatus::Running,
+            vec![phase_step(StepStatus::Running), phase_step(StepStatus::Pending)],
+        );
+        assert_eq!(run_phase(&starting), RunPhase::Starting);
+        assert_eq!(steps_completed_pct(&starting), 0);
+
+        // 1 de 3 concluído (0.33) → Progress.
+        let progress = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(run_phase(&progress), RunPhase::Progress);
+        assert_eq!(steps_completed_pct(&progress), 33);
+
+        // 3 de 5 concluídos, passo ativo no meio (0.6) → Slow.
+        let slow = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(run_phase(&slow), RunPhase::Slow);
+        assert_eq!(steps_completed_pct(&slow), 60);
+
+        // Último passo rodando → Finishing, mesmo abaixo de 85% (0.5 aqui).
+        let last_running = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+            ],
+        );
+        assert_eq!(run_phase(&last_running), RunPhase::Finishing);
+
+        // Sub-etapas refinam a fração: 2/3 + (1/2)/3 ≈ 0.83 → Slow (não 0.85).
+        let mut sub_slow = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        sub_slow.steps[2].substeps = vec![
+            phase_step(StepStatus::Success),
+            phase_step(StepStatus::Running),
+        ];
+        assert_eq!(run_phase(&sub_slow), RunPhase::Slow);
+
+        // Execuções encerradas não têm fase de progresso.
+        let done = phase_run(
+            RunStatus::Success,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+            ],
+        );
+        assert_eq!(run_phase(&done), RunPhase::Starting);
+        assert_eq!(steps_completed_pct(&done), 100);
+    }
+
+    #[test]
+    fn spinner_kind_maps_family_by_workflow_type_and_phase() {
+        // CI: família pulse-* pela fase.
+        let ci_starting = phase_run(
+            RunStatus::Running,
+            vec![phase_step(StepStatus::Running), phase_step(StepStatus::Pending)],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&ci_starting, "CI Principal"),
+            SpinnerKind::PulseSoft
+        );
+
+        let ci_progress = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&ci_progress, "Node / pnpm CI"),
+            SpinnerKind::PulseMultiple
+        );
+
+        let ci_slow = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&ci_slow, "Auditoria & Smoke"),
+            SpinnerKind::PulseRings2
+        );
+
+        let ci_finishing = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&ci_finishing, "Rust Cargo CI"),
+            SpinnerKind::PulseRings3
+        );
+
+        // Deploy: família blocks-* pela fase.
+        let dep_starting = phase_run(
+            RunStatus::Running,
+            vec![phase_step(StepStatus::Running), phase_step(StepStatus::Pending)],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&dep_starting, "Deploy VPS"),
+            SpinnerKind::BlocksScale
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&dep_starting, "Docker Compose Redeploy"),
+            SpinnerKind::BlocksScale
+        );
+
+        let dep_progress = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&dep_progress, "Redeploy Produção"),
+            SpinnerKind::BlocksShuffle2
+        );
+
+        let dep_slow = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+                phase_step(StepStatus::Pending),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&dep_slow, "Deploy VPS"),
+            SpinnerKind::BlocksShuffle3
+        );
+
+        let dep_finishing = phase_run(
+            RunStatus::Running,
+            vec![
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Success),
+                phase_step(StepStatus::Running),
+            ],
+        );
+        assert_eq!(
+            run_phase_spinner_kind(&dep_finishing, "Deploy VPS"),
+            SpinnerKind::BlocksWave
+        );
+
+        // Receita genérica (nem CI nem deploy) segue a família pulse-*.
+        assert_eq!(
+            run_phase_spinner_kind(&dep_progress, "Build Mobile"),
+            SpinnerKind::PulseMultiple
+        );
+
+        // Classificação por palavra-chave.
+        assert!(is_deploy_workflow("docker compose up -d --remove-orphans"));
+        assert!(is_deploy_workflow("Redeploy VPS"));
+        assert!(!is_deploy_workflow("CI Principal"));
+        assert!(is_ci_workflow("Isolamento RLS de testes"));
+        assert!(!is_ci_workflow("Deploy VPS"));
+    }
+
     #[test]
     fn secrets_never_appear_in_serialized_settings_json() {
         let mut settings = Settings {
@@ -1506,6 +1918,7 @@ mod duration_tests {
             on_success: None,
             server_id: Some("vps-prod".into()),
             repo_id: Some("rb-1".into()),
+            source: None,
         };
         let json_b = serde_json::to_string(&binding).unwrap();
         let back_b: RepoBinding = serde_json::from_str(&json_b).unwrap();
@@ -1698,5 +2111,87 @@ mod duration_tests {
         assert_eq!(empty_pct, 0);
         assert_eq!(empty_avg, 0.0);
         assert!(empty_res.contains("Windows"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn sample_workflow(source: Option<WorkflowSource>) -> Workflow {
+        Workflow {
+            id: "wf-1".into(),
+            name: "CI Principal".into(),
+            trigger: Trigger::Push,
+            runner: RunnerKind::Local,
+            workdir: String::new(),
+            steps: vec![Step {
+                name: "Passo".into(),
+                run: "echo ok".into(),
+                approval: false,
+            }],
+            on_success: None,
+            server_id: None,
+            repo_id: None,
+            source,
+        }
+    }
+
+    #[test]
+    fn workflows_json_legado_sem_source_abre_sem_migrar() {
+        // Formato gravado antes da proveniência existir: sem campo `source`.
+        let legacy = r#"{
+            "id": "wf-legacy",
+            "name": "CI Antigo",
+            "trigger": "Push",
+            "runner": "Ssh",
+            "steps": [{"name": "Build", "run": "cargo build", "approval": false}]
+        }"#;
+        let wf: Workflow = serde_json::from_str(legacy).expect("workflows.json legado deve abrir");
+        assert_eq!(wf.id, "wf-legacy");
+        assert_eq!(wf.name, "CI Antigo");
+        assert_eq!(wf.trigger, Trigger::Push);
+        assert_eq!(wf.runner, RunnerKind::Ssh);
+        assert_eq!(wf.source, None);
+    }
+
+    #[test]
+    fn workflow_source_roundtrip_preserva_proveniencia() {
+        let source = WorkflowSource {
+            repo: "matheuswidder/w-workploy".into(),
+            path: ".workploy.yml".into(),
+            sha: Some("0123456789abcdef".into()),
+            imported_at: "18/11/2026 10:00:00".into(),
+        };
+        let wf = sample_workflow(Some(source.clone()));
+        let json = serde_json::to_string(&wf).unwrap();
+        let back: Workflow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source, Some(source));
+        assert_eq!(back.id, wf.id);
+        assert_eq!(back.name, wf.name);
+    }
+
+    #[test]
+    fn workflow_source_default_e_campos_ausentes() {
+        // `sha` (Option) pode faltar no JSON; `imported_at` é obrigatório.
+        let sem_sha: WorkflowSource = serde_json::from_str(
+            r#"{"repo":"a/b","path":"infra/workploy/ci.yml","imported_at":"18/11/2026 10:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(sem_sha.sha, None);
+        assert_eq!(sem_sha.imported_at, "18/11/2026 10:00");
+        assert!(
+            serde_json::from_str::<WorkflowSource>(r#"{"repo":"a/b","path":"x.yml"}"#).is_err(),
+            "sem imported_at a leitura deve falhar explícito"
+        );
+        assert_eq!(
+            WorkflowSource::default(),
+            WorkflowSource {
+                repo: String::new(),
+                path: String::new(),
+                sha: None,
+                imported_at: String::new()
+            }
+        );
     }
 }

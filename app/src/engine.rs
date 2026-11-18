@@ -1306,6 +1306,9 @@ pub fn spawn_github_poller(sh: SharedHandle) {
                     }
                 }
             }
+            // Anti-drift: 1 consulta por receita com proveniência de repo;
+            // registra aviso quando o yml no repo mudou desde a importação.
+            crate::github::check_workflow_source_drift(&sh);
         }
     });
 }
@@ -1424,6 +1427,7 @@ mod tests {
             on_success,
             server_id: None,
             repo_id: None,
+            source: None,
         }
     }
 
@@ -1697,6 +1701,7 @@ mod tests {
                 on_success: Some("wf-deploy".into()),
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-other-vps-push".into(),
@@ -1708,6 +1713,7 @@ mod tests {
                 on_success: None,
                 server_id: Some("vps-b".into()),
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-manual".into(),
@@ -1719,6 +1725,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
         ];
 
@@ -1889,6 +1896,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-win-slash".into(),
@@ -1900,6 +1908,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-win-release".into(),
@@ -1915,6 +1924,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-other-repo".into(),
@@ -1926,6 +1936,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: Some("rb-other".into()),
+                source: None,
             },
             Workflow {
                 id: "wf-claimed-by-binding".into(),
@@ -1937,6 +1948,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
             Workflow {
                 id: "wf-generic-linux".into(),
@@ -1952,6 +1964,7 @@ mod tests {
                 on_success: None,
                 server_id: None,
                 repo_id: None,
+                source: None,
             },
         ];
 

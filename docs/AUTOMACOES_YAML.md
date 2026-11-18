@@ -1,6 +1,6 @@
 # Guia de Automações `.yml` no Workploy
 
-Este guia explica como criar, estruturar, importar e diagnosticar automações `.yml` no Workploy v0.1.10.
+Este guia explica como criar, estruturar, importar e diagnosticar automações `.yml` no Workploy v0.1.12.
 
 ## 1. Conceito central: Receita vs. Vínculo
 
@@ -180,7 +180,91 @@ jobs:
 
 ---
 
-## 4. Exemplos prontos para copiar
+## 4. Importar do repositório (fonte da verdade)
+
+Além de colar o YAML no modal **Importar YAML** ou converter workflows de `.github/workflows/`, você pode versionar as receitas no próprio repositório. O arquivo commitado no repo vira a fonte da verdade: o Workploy importa dele, registra de onde cada receita veio e avisa quando o arquivo muda.
+
+### Onde o Workploy procura os ymls
+
+| Local no repo | Formato aceito | Quando usar |
+|---|---|---|
+| `.workploy.yml` (ou `.workploy.yaml`) na raiz | Uma receita única, com os campos da seção 2 direto na raiz do arquivo, ou uma lista `workflows:` com várias receitas no mesmo arquivo | Quando a automação descreve o próprio projeto e pode viver junto ao código. |
+| `infra/workploy/*.yml` | Uma receita por arquivo, com os mesmos campos da seção 2 | Convenção usada pelo `w-erp-central` para manter cada pipeline em um arquivo próprio, perto do restante de `infra/`. |
+
+Na lista `workflows:`, cada item usa os mesmos campos da seção 2 e aceita um `id` opcional, que serve de referência para o `on_success` de outra receita do mesmo arquivo. Workflows de `.github/workflows/*.yml` continuam pelo botão **Buscar fluxos no repo**, descrito na seção 3.
+
+### Passo a passo da importação
+
+1. **Commite o yml no repo:** escreva o `.workploy.yml` na raiz (ou um arquivo por receita em `infra/workploy/`) e commite na branch monitorada.
+2. **Vincule o repositório:** em **Configurações → GitHub**, clique em **Vincular** na linha do repositório e configure branch monitorada, destino e modo de disparo.
+3. **Clique em Importar do repositório:** o app lista os ymls encontrados na raiz e em `infra/workploy/`; em um arquivo com lista `workflows:`, cada item aparece como uma receita própria.
+4. **Revise o preview e confirme:** antes de importar, o app mostra um preview com os passos de cada receita. Confirme para criar os fluxos.
+
+### Proveniência e atualização
+
+Toda receita importada do repo registra a proveniência:
+
+- **Repo:** repositório de origem (`dono/nome`).
+- **Caminho:** local do arquivo no repo (ex.: `.workploy.yml` ou `infra/workploy/deploy-api.yml`).
+- **SHA:** commit lido no momento da importação.
+
+Com a proveniência registrada, o fluxo passa a oferecer **Atualizar do repo**: um clique relê o arquivo no repo e atualiza os passos do fluxo. Se o yml mudou no repo desde a importação, a tela da execução exibe o aviso **"A receita mudou no repo"**. Ao vê-lo, clique em **Atualizar do repo** para trazer a receita vigente antes de rodar de novo.
+
+> **Boa prática:** com o repo como fonte da verdade, mude as receitas no arquivo commitado e atualize pelo botão. Edições feitas só no app ficam fora do arquivo; use o repo como ponto único de mudança para não perder a sincronia.
+
+### Exemplo completo pronto para copiar
+
+CI com testes reais, deploy com portão de aprovação e encadeamento via `on_success`, em um único `.workploy.yml` na raiz:
+
+```yaml
+workflows:
+  - id: wf-ci-principal
+    name: CI Principal
+    trigger: push
+    on_success: wf-deploy-producao
+
+    steps:
+      - name: Instalar dependências
+        run: pnpm install --frozen-lockfile
+
+      - name: Checagem de tipos em todos os pacotes
+        run: pnpm -r typecheck
+
+      - name: Testes unitários e de integração
+        run: pnpm test:ci
+
+      - name: Varredura de segredos
+        run: gitleaks detect --source . --no-banner
+
+  - id: wf-deploy-producao
+    name: Deploy Produção
+    trigger: manual
+    workdir: /srv/erp-producao
+
+    steps:
+      - name: Atualizar código na VPS
+        run: git fetch origin && git pull --ff-only
+
+      - name: Subir nova versão em produção
+        run: docker compose --env-file /srv/erp/.env -p erp-api -f infra/api/docker-compose.yml up -d --build --remove-orphans
+        approval: true
+
+      - name: Conferir healthcheck da API
+        run: curl -fsS https://api.seudominio.com/healthz
+```
+
+Como o exemplo se comporta depois de importado:
+
+1. Cada push na branch monitorada dispara o **CI Principal**. O destino (Local ou VPS) vem do vínculo configurado em **Configurações → GitHub**.
+2. Se typecheck, testes e varredura passarem, o `on_success` inicia o **Deploy Produção**.
+3. O deploy para no passo `Subir nova versão em produção` (`approval: true`) com status **Aguardando aprovação** e envia o cartão para a aba **Aprovações**.
+4. Ao clicar em **Aprovar e continuar**, o Workploy sobe os containers e encerra com o healthcheck da API.
+
+Para usar uma receita única, remova a chave `workflows:` e os `id` e escreva os campos direto na raiz do arquivo, no formato da seção 2.
+
+---
+
+## 5. Exemplos prontos para copiar
 
 ### Exemplo 1: Node / Next.js + Docker Compose Redeploy na VPS
 
@@ -322,7 +406,7 @@ Para rodar o mesmo projeto ao editar arquivos na máquina Windows:
 
 ---
 
-## 5. Requisitos estimados por tipo de projeto e diagnóstico de subpastas
+## 6. Requisitos estimados por tipo de projeto e diagnóstico de subpastas
 
 O **Dashboard do Projeto** e a tela **Conexões & Diagnóstico** classificam suas VPSs pelas faixas definidas em `CapacityTier` (`app/src/model.rs`). Use a tabela abaixo para dimensionar cada projeto antes de vincular o deploy 24/7.
 
@@ -360,13 +444,14 @@ Monorepos costumam guardar arquivos Compose e Dockerfiles em subpastas como `inf
 
 ---
 
-## 6. Como importar e testar passo a passo na UI
+## 7. Como importar e testar passo a passo na UI
 
 ### Passo 1: Criar ou importar a receita
 
 1. **Geração automática pelo repo:** com o repositório vinculado, clique em **Gerar receita** no card do projeto em **Execuções**. O Workploy analisa `package.json`, `Cargo.toml` e `docker-compose.yml` para criar uma receita pronta de CI e deploy.
 2. **Importar `.github/workflows/*.yml` ou colar YAML:** clique em **Buscar fluxos no repo** no modal de vínculo para importar workflows existentes de `.github/workflows/`, ou clique em **Importar YAML** em **Execuções** para colar seu YAML.
 3. **Pelo editor visual:** clique em **+ Novo fluxo** na barra lateral (agrupada por projeto), escolha um preset (**Node / pnpm CI**, **Rust Cargo CI**, **Docker Compose Redeploy**, **Auditoria & Smoke**) ou monte os passos manualmente e clique em **Salvar fluxo**.
+4. **Importar do repositório (fonte da verdade):** com o repo vinculado, clique em **Importar do repositório** para ler o `.workploy.yml` da raiz ou os arquivos de `infra/workploy/*.yml`, revise o preview dos passos e importe (seção 4).
 
 ### Passo 2: Vincular o repositório e escolher o servidor
 

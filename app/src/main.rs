@@ -107,6 +107,7 @@ fn main() {
         min_size: Some((720.0, 560.0)),
         scenes: &[
             ("runs", demo::scene_runs),
+            ("wf-drift", demo::scene_wf_drift),
             ("onboarding", demo::scene_onboarding),
             ("summary", demo::scene_summary),
             ("logs", demo::scene_logs),
@@ -2375,7 +2376,7 @@ mod tests {
         rt.frame(0.0);
         rt.frame(1.0 / 60.0);
 
-        // 1. Sidebar PROJETOS section and sub-workflows exist (<= 4 projects expands all)
+        // 1. Sidebar PROJETOS section, headers and nested flows render (default expanded)
         assert!(rt.find("hdr-projs").is_some());
         assert!(rt.find("nav-proj-rb-erp").is_some());
         assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_some());
@@ -2383,10 +2384,51 @@ mod tests {
         assert!(rt.find("nav-proj-wf-rb-landing-wf-ci-principal").is_some());
         assert!(rt.find("nav-proj-wf-rb-landing-wf-deploy-vps").is_some());
 
-        // Click project rb-erp in sidebar -> opens Project Dashboard
+        // 1b. Project header toggles the nested flows (collapse + expand)
         let (px, py) = rt.find("nav-proj-rb-erp").expect("nav-proj-rb-erp exists");
         rt.pointer_down(px, py);
         rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(
+            rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_none(),
+            "collapsed project must hide nested flows"
+        );
+        rt.pointer_down(px, py);
+        rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_some());
+
+        // 1c. Active runs show phase spinners on project headers and nested flows
+        assert!(rt.find("proj-phase-rb-landing").is_some());
+        assert!(rt.find("proj-wf-phase-rb-landing-wf-ci-principal").is_some());
+        assert!(rt.find("proj-phase-rb-erp").is_some());
+        assert!(rt.find("proj-wf-phase-rb-erp-wf-deploy-vps").is_some());
+        // Collapsed project keeps its spinner visible on the header.
+        rt.pointer_down(px, py);
+        rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.collapsed_projects.contains("rb-erp"));
+        assert!(rt.find("proj-phase-rb-erp").is_some());
+        assert!(rt.find("nav-proj-wf-rb-erp-wf-deploy-vps").is_none());
+        rt.pointer_down(px, py);
+        rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.collapsed_projects.contains("rb-erp"));
+
+        // 2. Open the rb-erp Project Dashboard via "Abrir projeto" on the runs page
+        for _ in 0..12 {
+            let Some((_, by)) = rt.find("open-proj-rb-erp") else { break };
+            if by > 120.0 && by < 780.0 {
+                break;
+            }
+            rt.wheel(640.0, 400.0, -240.0);
+            rt.frame(1.0 / 60.0);
+        }
+        let (opx, opy) = rt.find("open-proj-rb-erp").expect("open-proj-rb-erp exists");
+        rt.pointer_down(opx, opy);
+        rt.pointer_up(opx, opy);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-erp"));
         assert_eq!(rt.state.selected_workflow_id, None);
@@ -2425,12 +2467,8 @@ mod tests {
         );
         assert!(rt.find("wf-pipeline-summary").is_some());
 
-        // Click project rb-landing in sidebar -> returns to rb-landing Project Dashboard
-        let (lx, ly) = rt
-            .find("nav-proj-rb-landing")
-            .expect("nav-proj-rb-landing exists");
-        rt.pointer_down(lx, ly);
-        rt.pointer_up(lx, ly);
+        // Clearing the workflow selection returns to the rb-landing Project Dashboard
+        rt.update(|s, _| s.selected_workflow_id = None);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.selected_project_id.as_deref(), Some("rb-landing"));
         assert_eq!(rt.state.selected_workflow_id, None);
@@ -2528,6 +2566,42 @@ mod tests {
             &ui::icons::WORKFLOW
         ));
 
+        // Solar set (themable, `currentColor`): every converted icon must
+        // rasterize with real coverage, and none may name its own colors.
+        let solar: &[(&'static rune::Icon, &str)] = &[
+            (&ui::icons::SERVER, "server"),
+            (&ui::icons::LAPTOP, "laptop"),
+            (&ui::icons::BUG, "bug"),
+            (&ui::icons::SIDEBAR_ICON, "sidebar"),
+            (&ui::icons::CHECKLIST, "checklist"),
+            (&ui::icons::FIRE, "fire"),
+            (&ui::icons::DOCUMENTS, "documents"),
+            (&ui::icons::NOTES, "notes"),
+            (&ui::icons::SETTINGS_GEAR, "settings"),
+            (&ui::icons::SHIELD, "shield"),
+            (&ui::icons::PASSWORD, "password"),
+            (&ui::icons::LOCK, "lock"),
+            (&ui::icons::UNLOCK, "unlock"),
+            (&ui::icons::KEY, "key"),
+            (&ui::icons::KEY_SQUARE, "key-square"),
+            (&ui::icons::LAYERS, "layers"),
+            (&ui::icons::BOX, "box"),
+            (&ui::icons::CLOUD_BOLT, "cloud-bolt"),
+            (&ui::icons::TRASH, "trash"),
+            (&ui::icons::CROWN, "crown"),
+        ];
+        for (icon, label) in solar {
+            let cov = rune::text::icon_coverage(icon, 24);
+            assert!(
+                cov.iter().filter(|&&c| c > 0).count() > 20,
+                "Solar {label} icon must rasterize non-empty pixels"
+            );
+            assert!(
+                !icon.body.contains("#") && !icon.body.contains("rgb("),
+                "Solar {label} must stay themable (currentColor only), no baked colors"
+            );
+        }
+
         // 1. With active RepoBinding(s), RECEITAS DE FLUXO is hidden while "+ Novo fluxo" remains
         let mut rt_active = Runtime::new(
             AppState::init_demo(),
@@ -2569,5 +2643,234 @@ mod tests {
         assert!(rt_inactive.find("wf-wf-ci-principal").is_some());
         assert!(rt_inactive.find("wf-wf-deploy-vps").is_some());
         assert!(rt_inactive.find("nav-new-wf").is_some());
+    }
+
+    #[test]
+    fn import_from_repo_modal_flow_works() {
+        use state::{ModalState, RepoYamlCandidates};
+
+        // 1. Dashboard do projeto: botão "Importar do repositório" ao lado de
+        // "Gerar receita" abre o modal com os caminhos (modo demo simula).
+        let mut state = AppState::init_demo();
+        state.selected_project_id = Some("rb-erp".into());
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.find("gen-wf-binding-rb-erp").is_some());
+        let (ix, iy) = rt.find("imp-repo-rb-erp").expect("imp-repo-rb-erp exists");
+        rt.pointer_down(ix, iy);
+        rt.pointer_up(ix, iy);
+        rt.frame(1.0 / 60.0);
+
+        let ModalState::ImportFromRepo {
+            loading,
+            paths,
+            selected,
+            ..
+        } = &rt.state.modal
+        else {
+            panic!("expected ImportFromRepo modal after clicking imp-repo");
+        };
+        assert!(!*loading);
+        assert_eq!(paths.len(), 2, "demo deve listar 2 caminhos de receita");
+        assert_eq!(selected.as_deref(), Some(".workploy.yml"));
+
+        // 2. Escolher o segundo caminho e importar: modal fecha + toast.
+        let (px, py) = rt.find("imp-path-1").expect("imp-path-1 exists");
+        rt.pointer_down(px, py);
+        rt.pointer_up(px, py);
+        rt.frame(1.0 / 60.0);
+        if let ModalState::ImportFromRepo { selected, .. } = &rt.state.modal {
+            assert_eq!(selected.as_deref(), Some("infra/workploy/deploy.yml"));
+        } else {
+            panic!("modal deve continuar aberto ao selecionar caminho");
+        }
+
+        let (cx, cy) = rt.find("imp-confirm").expect("imp-confirm exists");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.modal, ModalState::None));
+        let last = rt
+            .state
+            .toasts
+            .entries()
+            .last()
+            .expect("toast de importação emitido");
+        assert_eq!(last.options.kind, state::ToastKind::Success);
+        assert!(
+            last.options
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("infra/workploy/deploy.yml")),
+            "toast deve citar o caminho importado: {:?}",
+            last.options.description
+        );
+
+        // 3. Caminho ao vivo: o resultado da thread de rede chega pelo inbox e
+        // o `poll` move para dentro do modal aberto (loading → paths).
+        rt.update(|s, _| {
+            s.modal = ModalState::ImportFromRepo {
+                binding_id: "rb-erp".into(),
+                loading: true,
+                paths: Vec::new(),
+                status: "Buscando receitas em widder/erp-central...".into(),
+                selected: None,
+            };
+            *s.repo_yaml_inbox.lock().unwrap() = Some(RepoYamlCandidates {
+                binding_id: "rb-erp".into(),
+                paths: vec![".workploy.yml".into()],
+                status: "1 arquivo(s) de receita encontrado(s).".into(),
+            });
+        });
+        let mut tx = Tx::default();
+        assert!(poll_app(&mut rt.state, 0.2, &mut tx));
+        rt.frame(0.2);
+        if let ModalState::ImportFromRepo {
+            loading,
+            paths,
+            status,
+            selected,
+            ..
+        } = &rt.state.modal
+        {
+            assert!(!*loading, "poll deve desligar o loading");
+            assert_eq!(paths.len(), 1);
+            assert_eq!(selected.as_deref(), Some(".workploy.yml"));
+            assert!(status.contains("1 arquivo"));
+        } else {
+            panic!("modal deve seguir aberto recebendo os caminhos");
+        }
+
+        // Resultado tardio de vínculo diferente é descartado, sem tocar no modal.
+        rt.update(|s, _| {
+            *s.repo_yaml_inbox.lock().unwrap() = Some(RepoYamlCandidates {
+                binding_id: "rb-outro".into(),
+                paths: vec![".workploy.yml".into()],
+                status: "outro".into(),
+            });
+        });
+        let mut tx2 = Tx::default();
+        let _ = poll_app(&mut rt.state, 0.3, &mut tx2);
+        rt.frame(0.3);
+        if let ModalState::ImportFromRepo { binding_id, paths, .. } = &rt.state.modal {
+            assert_eq!(binding_id, "rb-erp");
+            assert_eq!(paths.len(), 1, "candidatos de outro vínculo descartados");
+        } else {
+            panic!("modal deve seguir aberto");
+        }
+    }
+
+    #[test]
+    fn update_from_repo_provenance_and_drift_banner_work() {
+        use state::ModalState;
+
+        // 1. Visão do fluxo importado (wf-ci-principal tem source + drift no demo):
+        // banner amarelo, linha de proveniência e botão "Atualizar do repo".
+        let mut state = AppState::init_demo();
+        state.selected_project_id = Some("rb-landing".into());
+        state.selected_workflow_id = Some("wf-ci-principal".into());
+        let mut rt = Runtime::new(state, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.find("wf-drift-banner").is_some(), "banner de drift visível");
+        assert!(rt.find("wf-source-row-wf-ci-principal").is_some());
+        let els = rt.elements();
+        let prov_txt = els
+            .iter()
+            .find(|e| {
+                e.text
+                    .as_deref()
+                    .is_some_and(|txt| txt.contains("widder/landing") && txt.contains(".workploy.yml"))
+            })
+            .expect("linha de proveniência deve citar repo e caminho");
+        let _ = prov_txt;
+        assert!(rt.find("upd-repo-wf-ci-principal").is_some());
+
+        // 2. "Atualizar do repo" pelo banner: modo demo limpa o drift e avisa.
+        let (bx, by) = rt
+            .find("wf-drift-upd-repo-wf-ci-principal")
+            .expect("botão de atualização no banner");
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.snapshot.workflow_drift.is_empty(),
+            "drift limpo após atualizar"
+        );
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.find("wf-drift-banner").is_none(),
+            "banner some depois de atualizar"
+        );
+        let last = rt
+            .state
+            .toasts
+            .entries()
+            .last()
+            .expect("toast de atualização emitido");
+        assert_eq!(last.options.kind, state::ToastKind::Success);
+        assert!(
+            last.options
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("atualizada a partir de widder/landing")),
+            "toast deve citar a origem: {:?}",
+            last.options.description
+        );
+
+        // 3. Editor do fluxo importado: banner de drift, proveniência,
+        // "Atualizar do repo" e "Importar do repositório" no rodapé.
+        // (O passo 2 limpou o aviso; simula o repo mudando de novo.)
+        rt.update(|s, _| {
+            s.snapshot.workflow_drift.push((
+                "wf-ci-principal".into(),
+                "CI Principal".into(),
+                "A receita mudou no repo — use Atualizar do repo.".into(),
+            ));
+        });
+        rt.update(|s, _| s.open_edit_workflow_modal("wf-ci-principal"));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("ed-drift-banner").is_some());
+        assert!(rt.find("ed-source-row").is_some());
+        assert!(rt.find("ed-upd-repo-wf-ci-principal").is_some());
+        assert!(rt.find("bind-imp-repo").is_some(), "importar disponível no editor");
+
+        let (ex, ey) = rt
+            .find("ed-upd-repo-wf-ci-principal")
+            .expect("ed-upd-repo-wf-ci-principal existe");
+        rt.pointer_down(ex, ey);
+        rt.pointer_up(ex, ey);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            matches!(rt.state.modal, ModalState::None),
+            "editor fecha ao atualizar do repo (rascunho fica obsoleto)"
+        );
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.description.as_deref().is_some_and(|d| d.contains("atualizada"))),
+            "toast de atualização presente"
+        );
+
+        // 4. Receita sem origem: aviso claro em vez de importação silenciosa.
+        rt.update(|s, _| {
+            let mut tx = Tx::default();
+            let _ = &mut tx;
+            s.update_workflow_from_repo("wf-rls-isolamento", &mut tx);
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state
+                .toasts
+                .entries()
+                .iter()
+                .any(|t| t.options.description.as_deref().is_some_and(|d| d.contains("não foi importada"))),
+            "receita sem source deve avisar que não há de onde atualizar"
+        );
     }
 }

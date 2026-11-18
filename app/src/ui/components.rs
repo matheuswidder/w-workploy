@@ -2,9 +2,13 @@ use rune::color::Color;
 use rune::tok::motion;
 use rune::{Cursor, El, Icon, TextStyle, Transition, Tx, col, effect, el, icon, row, text};
 use rune_kit::{Kit, Toast, ToastEvent, ToastRegion};
-use workploy::model::{RunStatus, StepStatus};
+use workploy::model::{RunStatus, SpinnerKind, StepStatus};
 
-use crate::gfx::{MARK_PULSE_BREATHE, MARK_PULSE_RADAR};
+use crate::gfx::{
+    MARK_PULSE_BREATHE, MARK_PULSE_RADAR, MARK_SPINNER_BLOCKS_SCALE, MARK_SPINNER_BLOCKS_SHUFFLE_2,
+    MARK_SPINNER_BLOCKS_SHUFFLE_3, MARK_SPINNER_BLOCKS_WAVE, MARK_SPINNER_PULSE_MULTIPLE,
+    MARK_SPINNER_PULSE_RINGS_2, MARK_SPINNER_PULSE_RINGS_3, MARK_SPINNER_PULSE_SOFT,
+};
 use crate::state::{AppState, ConnectionsHealth, ToastKind};
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -416,6 +420,118 @@ pub fn health_pulse_dot(t: UiTheme, health: ConnectionsHealth) -> El {
                 .effect_data([color_idx, reach, period, intensity]),
         )
         .child(el().size(8.0, 8.0).radius(4.0).fill(dot_color))
+}
+
+/// Spinner de execução ativa: recria os svg-spinners com efeitos nativos
+/// (`pulse-*` para fluxos de CI, `blocks-*` para deploy). O conteúdo visível
+/// (ponto ou grade de blocos) é fixo; a animação vem do marcador `MARK_SPINNER_*`.
+pub fn phase_spinner(t: UiTheme, kind: SpinnerKind, size: f32, key: impl Into<String>) -> El {
+    let key = key.into();
+    // O próprio `kind` carrega família + fase: serve de rótulo acessível estável.
+    let a11y = match kind {
+        SpinnerKind::PulseSoft => "CI iniciando",
+        SpinnerKind::PulseMultiple => "CI em progresso",
+        SpinnerKind::PulseRings2 => "CI avançado",
+        SpinnerKind::PulseRings3 => "CI finalizando",
+        SpinnerKind::BlocksScale => "Deploy iniciando",
+        SpinnerKind::BlocksShuffle2 => "Deploy em progresso",
+        SpinnerKind::BlocksShuffle3 => "Deploy avançado",
+        SpinnerKind::BlocksWave => "Deploy finalizando",
+    };
+    match kind {
+        SpinnerKind::PulseSoft
+        | SpinnerKind::PulseMultiple
+        | SpinnerKind::PulseRings2
+        | SpinnerKind::PulseRings3 => {
+            // Família pulse-*: um ponto central de onde os pulsos emanam.
+            let (mark, reach, period, intensity) = match kind {
+                SpinnerKind::PulseSoft => (MARK_SPINNER_PULSE_SOFT, 6.5, 1.2, 0.60),
+                SpinnerKind::PulseMultiple => (MARK_SPINNER_PULSE_MULTIPLE, 8.0, 1.5, 0.66),
+                SpinnerKind::PulseRings2 => (MARK_SPINNER_PULSE_RINGS_2, 10.5, 1.8, 0.72),
+                SpinnerKind::PulseRings3 => (MARK_SPINNER_PULSE_RINGS_3, 11.5, 1.2, 0.78),
+                _ => unreachable!("família pulse coberta acima"),
+            };
+            let dot = (size * 0.40).max(5.0);
+            el()
+                .key(key)
+                .size(size, size)
+                .center()
+                .label(a11y)
+                .child(
+                    el()
+                        .size(dot, dot)
+                        .center()
+                        .child(
+                            effect(mark)
+                                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                                .radius(dot * 0.5)
+                                .effect_bleed(reach + 2.0)
+                                .effect_data([4.0, reach, period, intensity]),
+                        )
+                        .child(el().size(dot, dot).radius(dot * 0.5).fill(t.info)),
+                )
+        }
+        SpinnerKind::BlocksScale
+        | SpinnerKind::BlocksShuffle2
+        | SpinnerKind::BlocksShuffle3
+        | SpinnerKind::BlocksWave => {
+            // Família blocks-*: grade de blocos que acendem em sequência.
+            // A geometria espelha o compositor (blocos em 10% e 60% do lado).
+            let period = match kind {
+                SpinnerKind::BlocksScale => 0.75,
+                SpinnerKind::BlocksShuffle2 => 0.8,
+                _ => 0.9,
+            };
+            let bs = size * 0.30;
+            let gap = size * 0.20;
+            let block = || {
+                el()
+                    .size(bs, bs)
+                    .radius(bs * 0.28)
+                    .fill(t.info.alpha(0.55))
+            };
+            let mark = match kind {
+                SpinnerKind::BlocksScale => MARK_SPINNER_BLOCKS_SCALE,
+                SpinnerKind::BlocksShuffle2 => MARK_SPINNER_BLOCKS_SHUFFLE_2,
+                SpinnerKind::BlocksShuffle3 => MARK_SPINNER_BLOCKS_SHUFFLE_3,
+                SpinnerKind::BlocksWave => MARK_SPINNER_BLOCKS_WAVE,
+                _ => unreachable!("família blocks coberta pelo match externo"),
+            };
+            // Layout estático espelhando os cantos animados no compositor
+            // (blocos nas frações 0.10 e 0.60 do lado, grade total 0.80).
+            let row_w = size * 0.80;
+            let spacer = || el().size(bs, bs);
+            let (top, bottom): (El, El) = match kind {
+                SpinnerKind::BlocksScale | SpinnerKind::BlocksWave => {
+                    let full = || row().w(row_w).gap(gap).child(block()).child(block());
+                    (full(), full())
+                }
+                // shuffle-2: diagonais (topo-esquerda e baixo-direita) alternam.
+                SpinnerKind::BlocksShuffle2 => (
+                    row().w(row_w).gap(gap).child(block()).child(spacer()),
+                    row().w(row_w).gap(gap).child(spacer()).child(block()),
+                ),
+                // shuffle-3: topo-esquerda, baixo-esquerda e baixo-direita.
+                _ => (
+                    row().w(row_w).gap(gap).child(block()).child(spacer()),
+                    row().w(row_w).gap(gap).child(block()).child(block()),
+                ),
+            };
+            let grid = col().gap(gap).child(top).child(bottom);
+            el()
+                .key(key)
+                .size(size, size)
+                .center()
+                .label(a11y)
+                .child(
+                    effect(mark)
+                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .effect_bleed(bs)
+                        .effect_data([4.0, 0.0, period, 0.9]),
+                )
+                .child(grid)
+        }
+    }
 }
 
 pub fn copyable_sha(t: UiTheme, key: impl Into<String>, full_sha: &str) -> El {

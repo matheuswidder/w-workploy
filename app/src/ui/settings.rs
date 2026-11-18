@@ -597,7 +597,7 @@ fn github_and_bindings_card(s: &AppState, t: UiTheme, k: &Kit, narrow: bool) -> 
                             t,
                             format!("btn-copy-wh-url-{}", b.id),
                             "Copiar URL Webhook",
-                            Some(&icons::COPY),
+                            Some(&icons::CLOUD_BOLT),
                             28.0,
                             move |s: &mut AppState, tx: &mut Tx| {
                                 s.copy_binding_webhook_url(&sid_url, tx);
@@ -995,7 +995,7 @@ fn servers_card(s: &AppState, t: UiTheme) -> El {
                 .min_w(180.0)
                 .gap(10.0)
                 .center_y()
-                .child(runner_connected_dot(t, true))
+                .child(icon(&icons::LAPTOP, 16.0).color(t.success))
                 .child(
                     col()
                         .grow(1.0)
@@ -1226,7 +1226,7 @@ fn vps_server_item(s: &AppState, t: UiTheme, srv: &VpsServer) -> El {
                 } else {
                     "Provisionar Motor"
                 },
-                Some(&icons::BOLT),
+                Some(&icons::LAYERS),
                 30.0,
                 move |s: &mut AppState, _| s.open_provision_modal(&id_prov),
             )
@@ -1922,7 +1922,7 @@ fn about_card(s: &AppState, t: UiTheme) -> El {
                         t,
                         "btn-update-install",
                         format!("Baixar e instalar v{} agora", rel.version),
-                        Some(&icons::BOLT),
+                        Some(&icons::BOX),
                         30.0,
                         |s: &mut AppState, tx: &mut Tx| s.install_latest_update(tx),
                     )

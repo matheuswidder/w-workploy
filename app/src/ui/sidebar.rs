@@ -3,7 +3,7 @@ use rune::tok::motion;
 use rune::{Cursor, El, Icon, TextStyle, col, el, icon, row, text};
 
 use crate::state::{AppState, NavTarget};
-use crate::ui::components::health_pulse_dot;
+use crate::ui::components::{health_pulse_dot, phase_spinner};
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
 
@@ -34,7 +34,10 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                         .repo_bindings
                         .iter()
                         .find(|b| &b.id == pid)
-                        .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == wf_id))
+                        .is_some_and(|b| {
+                            !s.collapsed_projects.contains(&b.id)
+                                && s.project_workflows(b).iter().any(|w| &w.id == wf_id)
+                        })
                 {
                     return format!("nav-proj-wf-{pid}-{wf_id}");
                 }
@@ -50,7 +53,10 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                             .settings
                             .repo_bindings
                             .iter()
-                            .find(|b| s.project_workflows(b).iter().any(|w| &w.id == wf_id))
+                            .find(|b| {
+                                !s.collapsed_projects.contains(&b.id)
+                                    && s.project_workflows(b).iter().any(|w| &w.id == wf_id)
+                            })
                     {
                         return format!("nav-proj-wf-{}-{wf_id}", b.id);
                     }
@@ -73,7 +79,10 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                     .repo_bindings
                     .iter()
                     .find(|b| &b.id == pid)
-                    .is_some_and(|b| s.project_workflows(b).iter().any(|w| &w.id == id))
+                    .is_some_and(|b| {
+                        !s.collapsed_projects.contains(&b.id)
+                            && s.project_workflows(b).iter().any(|w| &w.id == id)
+                    })
             {
                 format!("nav-proj-wf-{pid}-{id}")
             } else if has_active_binding {
@@ -88,7 +97,10 @@ fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) ->
                         .settings
                         .repo_bindings
                         .iter()
-                        .find(|b| s.project_workflows(b).iter().any(|w| &w.id == id))
+                        .find(|b| {
+                            !s.collapsed_projects.contains(&b.id)
+                                && s.project_workflows(b).iter().any(|w| &w.id == id)
+                        })
                 {
                     return format!("nav-proj-wf-{}-{id}", b.id);
                 }
@@ -178,7 +190,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     .px(18.0)
                     .center_y()
                     .justify_between()
-                    .help("Projetos vinculados ao GitHub. Clique em um projeto para ver seus KPIs, fluxos e histórico.")
+                    .help("Projetos vinculados ao GitHub. Clique no cabeçalho para expandir ou recolher as receitas de cada projeto.")
                     .child(
                         text("PROJETOS")
                             .font(ty::EYEBROW)
@@ -188,7 +200,6 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             y += SECTION_H + 2.0;
         }
 
-        let total_projects = s.snapshot.settings.repo_bindings.len();
         for b in &s.snapshot.settings.repo_bindings {
             let proj_key = format!("nav-proj-{}", b.id);
             let is_proj_sel = selected_id == proj_key;
@@ -198,57 +209,93 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             }
             let bid = b.id.clone();
             let repo_trim = b.full_name.trim();
-            let has_running = s.snapshot.runs.iter().any(|r| {
-                (r.repo_name
+            let run_in_project = |r: &workploy::model::Run| {
+                r.repo_name
                     .as_deref()
                     .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
-                    || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim)))
+                    || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+            };
+            // Execução ativa mais recente do projeto define o spinner de fase.
+            let active_run = s.snapshot.runs.iter().find(|r| {
+                run_in_project(r)
                     && matches!(
                         r.status,
                         workploy::model::RunStatus::Queued | workploy::model::RunStatus::Running
                     )
             });
-            let has_approval = !has_running
+            let has_approval = active_run.is_none()
                 && s.snapshot.runs.iter().any(|r| {
-                    (r.repo_name
-                        .as_deref()
-                        .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
-                        || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim)))
+                    run_in_project(r)
                         && r.status == workploy::model::RunStatus::AwaitingApproval
                 });
-            let dot_col = if has_running {
-                t.info
-            } else if has_approval {
-                t.warning
-            } else if b.enabled {
-                t.success
-            } else {
-                t.text_muted
-            };
-            let proj_badge = (!collapsed).then(|| el().size(6.0, 6.0).radius(3.0).fill(dot_col));
+            let expanded = !s.collapsed_projects.contains(&b.id);
 
-            items.push(nav_row(
-                t,
-                proj_key,
-                b.full_name.clone(),
-                &icons::BRANCH,
-                proj_badge,
-                is_proj_sel,
-                collapsed,
-                PILL_INSET,
-                y,
-                pill_w,
-                move |s: &mut AppState| {
-                    s.selected_project_id = Some(bid.clone());
-                    s.selected_workflow_id = None;
-                    s.navigate_to(NavTarget::Runs);
-                },
-            ));
+            // Espaço à direita: spinner de fase (execução ativa), ponto de
+            // aprovação pendente ou simplesmente o estado do vínculo.
+            let trailing: Option<El> = if let Some(run) = active_run {
+                let kind =
+                    workploy::model::run_phase_spinner_kind(run, &run.workflow_name);
+                Some(phase_spinner(
+                    t,
+                    kind,
+                    15.0,
+                    format!("proj-phase-{}", b.id),
+                ))
+            } else if !collapsed {
+                let dot_col = if has_approval {
+                    t.warning
+                } else if b.enabled {
+                    t.success
+                } else {
+                    t.text_muted
+                };
+                Some(el().size(6.0, 6.0).radius(3.0).fill(dot_col))
+            } else {
+                None
+            };
+
+            if collapsed {
+                // No modo trilho (sidebar recolhida) o cabeçalho continua
+                // levando à página do projeto: não há espaço para receitas.
+                let bid_nav = bid.clone();
+                items.push(nav_row(
+                    t,
+                    proj_key,
+                    b.full_name.clone(),
+                    &icons::BRANCH,
+                    None,
+                    is_proj_sel,
+                    collapsed,
+                    PILL_INSET,
+                    y,
+                    pill_w,
+                    move |s: &mut AppState| {
+                        s.selected_project_id = Some(bid_nav.clone());
+                        s.selected_workflow_id = None;
+                        s.navigate_to(NavTarget::Runs);
+                    },
+                ));
+            } else {
+                items.push(project_header_row(
+                    t,
+                    proj_key,
+                    b.full_name.clone(),
+                    expanded,
+                    is_proj_sel,
+                    trailing,
+                    PILL_INSET,
+                    y,
+                    pill_w,
+                    move |s: &mut AppState| {
+                        if !s.collapsed_projects.remove(&bid) {
+                            s.collapsed_projects.insert(bid.clone());
+                        }
+                    },
+                ));
+            }
             y += ROW_PITCH;
 
-            let show_sub_wfs = !collapsed
-                && (s.selected_project_id.as_deref() == Some(b.id.as_str())
-                    || total_projects <= 4);
+            let show_sub_wfs = !collapsed && expanded;
             if show_sub_wfs {
                 for wf in s.project_workflows(b) {
                     let sub_key = format!("nav-proj-wf-{}-{}", b.id, wf.id);
@@ -266,49 +313,72 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     } else {
                         t.text_secondary
                     };
-                    items.push(
-                        row()
-                            .key(sub_key)
-                            .role("tab")
-                            .label(format!("{} · {}", b.full_name, wf_name))
-                            .checked(is_sub_sel)
-                            .absolute(PILL_INSET, y)
-                            .size(pill_w, SUB_ROW_H)
-                            .pl(14.0)
-                            .pr(10.0)
-                            .gap(7.0)
-                            .center_y()
-                            .radius(6.0)
-                            .cursor(Cursor::Pointer)
-                            .focusable(true)
-                            .focus_ring(2.0, 2.0, t.accent)
-                            .hover(if is_sub_sel {
-                                Color::TRANSPARENT
-                            } else {
-                                t.hover
-                            })
-                            .press(t.press)
-                            .press_scale(0.98)
-                            .on_press(move |s: &mut AppState| {
-                                s.selected_project_id = Some(bid_sub.clone());
-                                s.selected_workflow_id = Some(wfid_sub.clone());
-                                s.navigate_to(NavTarget::Runs);
-                            })
-                            .child(
-                                icon(icons::workflow_icon(&wf_name), 12.5)
-                                    .color(ic_col)
-                                    .a11y_hidden(),
+                    // Spinner de fase quando uma execução deste fluxo está ativa
+                    // dentro deste projeto (mesma correspondência por repositório).
+                    let wf_active = s.snapshot.runs.iter().find(|r| {
+                        run_in_project(r)
+                            && r.workflow_id == wf.id
+                            && matches!(
+                                r.status,
+                                workploy::model::RunStatus::Queued
+                                    | workploy::model::RunStatus::Running
                             )
-                            .child(
-                                text(wf_name)
-                                    .font(if is_sub_sel { ty::SMALL_MED } else { ty::SMALL })
-                                    .color(fg_col)
-                                    .grow(1.0)
-                                    .shrink()
-                                    .truncate()
-                                    .a11y_hidden(),
-                            ),
-                    );
+                    });
+                    let sub_trailing = wf_active.map(|run| {
+                        let kind =
+                            workploy::model::run_phase_spinner_kind(run, &run.workflow_name);
+                        phase_spinner(
+                            t,
+                            kind,
+                            14.0,
+                            format!("proj-wf-phase-{}-{}", b.id, wf.id),
+                        )
+                    });
+                    let mut sub_row = row()
+                        .key(sub_key)
+                        .role("tab")
+                        .label(format!("{} · {}", b.full_name, wf_name))
+                        .checked(is_sub_sel)
+                        .absolute(PILL_INSET, y)
+                        .size(pill_w, SUB_ROW_H)
+                        .pl(14.0)
+                        .pr(10.0)
+                        .gap(7.0)
+                        .center_y()
+                        .radius(6.0)
+                        .cursor(Cursor::Pointer)
+                        .focusable(true)
+                        .focus_ring(2.0, 2.0, t.accent)
+                        .hover(if is_sub_sel {
+                            Color::TRANSPARENT
+                        } else {
+                            t.hover
+                        })
+                        .press(t.press)
+                        .press_scale(0.98)
+                        .on_press(move |s: &mut AppState| {
+                            s.selected_project_id = Some(bid_sub.clone());
+                            s.selected_workflow_id = Some(wfid_sub.clone());
+                            s.navigate_to(NavTarget::Runs);
+                        })
+                        .child(
+                            icon(icons::workflow_icon(&wf_name), 12.5)
+                                .color(ic_col)
+                                .a11y_hidden(),
+                        )
+                        .child(
+                            text(wf_name)
+                                .font(if is_sub_sel { ty::SMALL_MED } else { ty::SMALL })
+                                .color(fg_col)
+                                .grow(1.0)
+                                .shrink()
+                                .truncate()
+                                .a11y_hidden(),
+                        );
+                    if let Some(spinner) = sub_trailing {
+                        sub_row = sub_row.child(spinner);
+                    }
+                    items.push(sub_row);
                     y += SUB_ROW_PITCH;
                 }
             }
@@ -488,7 +558,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         t,
         "nav-approvals",
         "Aprovações",
-        &icons::SHIELD,
+        &icons::CHECKLIST,
         appr_badge,
         is_appr,
         collapsed,
@@ -530,7 +600,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         t,
         "nav-settings",
         "Configurações",
-        &icons::SLIDERS,
+        &icons::SETTINGS_GEAR,
         None,
         is_settings,
         collapsed,
@@ -579,7 +649,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     .press(t.press)
                     .press_scale(0.95)
                     .on_press(|s: &mut AppState| s.sidebar_collapsed = false)
-                    .child(icon(&icons::SIDEBAR_TOGGLE, 15.0).color(t.text_secondary).a11y_hidden()),
+                    .child(icon(&icons::SIDEBAR_ICON, 15.0).color(t.text_secondary).a11y_hidden()),
             )
     } else {
         row()
@@ -630,7 +700,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                     .press_scale(0.95)
                     .on_press(|s: &mut AppState| s.sidebar_collapsed = true)
                     .child(
-                        icon(&icons::SIDEBAR_TOGGLE, 14.0)
+                        icon(&icons::SIDEBAR_ICON, 14.0)
                             .color(t.text_muted)
                             .a11y_hidden(),
                     ),
@@ -687,7 +757,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                         row()
                             .gap(6.0)
                             .center_y()
-                            .child(icon(&icons::SHIELD, 13.0).color(t.success))
+                            .child(icon(&icons::CROWN, 13.0).color(t.warning))
                             .child(
                                 text("Self-hosted · Ilimitado")
                                     .font(TextStyle::new(12.0, 600.0).lh(16.0))
@@ -810,6 +880,79 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                 .child(footer),
         )
         .child(el().key("sidebar-border").w(t.hair).h_full().fill(t.border_subtle))
+}
+
+/// Cabeçalho de projeto da sidebar: alterna a expansão das receitas aninhadas.
+/// A seta à esquerda gira (vira para baixo) quando o grupo está expandido; à
+/// direita ficam o spinner de fase (execução ativa) ou o ponto de status.
+#[allow(clippy::too_many_arguments)]
+fn project_header_row(
+    t: UiTheme,
+    key: impl Into<String>,
+    name: impl Into<String>,
+    expanded: bool,
+    selected: bool,
+    trailing: Option<El>,
+    x: f32,
+    y: f32,
+    w: f32,
+    on_press: impl Fn(&mut AppState) + 'static,
+) -> El {
+    let name = name.into();
+    let chev = if expanded {
+        &icons::CHEVRON_DOWN
+    } else {
+        &icons::CHEVRON_RIGHT
+    };
+    let fg_col = if selected {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
+    let mut r = row()
+        .key(key)
+        .role("button")
+        .label(if expanded {
+            format!("Recolher fluxos de {name}")
+        } else {
+            format!("Expandir fluxos de {name}")
+        })
+        .help("Expande ou recolhe as receitas deste projeto na barra lateral.")
+        .absolute(x, y)
+        .size(w, ROW_H)
+        .px(10.0)
+        .gap(7.0)
+        .center_y()
+        .radius(6.0)
+        .cursor(Cursor::Pointer)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, t.accent)
+        .hover(t.hover)
+        .press(t.press)
+        .press_scale(0.98)
+        .on_press(on_press)
+        .child(
+            icon(chev, 13.0)
+                .color(if expanded {
+                    t.text_muted
+                } else {
+                    t.accent
+                })
+                .a11y_hidden(),
+        )
+        .child(
+            text(name)
+                .font(if selected { ty::BODY_MED } else { ty::BODY })
+                .color(fg_col)
+                .grow(1.0)
+                .shrink()
+                .truncate()
+                .a11y_hidden(),
+        );
+    if let Some(tr) = trailing {
+        r = r.child(tr);
+    }
+    r
 }
 
 #[allow(clippy::too_many_arguments)]

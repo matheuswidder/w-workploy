@@ -55,6 +55,14 @@ pub fn populate_demo(s: &mut Shared) {
             on_success: Some(wf_deploy.clone()),
             server_id: None,
             repo_id: None,
+            // Importada do repo (fonte da verdade) — e o yml no repo mudou
+            // desde então, então o aviso anti-drift acende no resumo do fluxo.
+            source: Some(workploy::model::WorkflowSource {
+                repo: "widder/landing".into(),
+                path: ".workploy.yml".into(),
+                sha: Some("c06c3c17a8c44d".into()),
+                imported_at: "2026-11-18 09:12:00".into(),
+            }),
         },
         Workflow {
             id: wf_deploy.clone(),
@@ -82,6 +90,7 @@ pub fn populate_demo(s: &mut Shared) {
             on_success: None,
             server_id: None,
             repo_id: None,
+            source: None,
         },
         Workflow {
             id: wf_rls.clone(),
@@ -104,6 +113,7 @@ pub fn populate_demo(s: &mut Shared) {
             on_success: None,
             server_id: None,
             repo_id: None,
+            source: None,
         },
         Workflow {
             id: wf_mobile.clone(),
@@ -121,6 +131,7 @@ pub fn populate_demo(s: &mut Shared) {
             on_success: None,
             server_id: None,
             repo_id: None,
+            source: None,
         },
     ];
 
@@ -379,7 +390,7 @@ pub fn populate_demo(s: &mut Shared) {
         }],
     };
 
-    // 2. Running — CI Principal #692 (ao vivo)
+    // 2. Running — CI Principal #692 (ao vivo, no projeto widder/landing)
     let run_running = Run {
         id: "run-demo-running".into(),
         workflow_id: wf_ci.clone(),
@@ -419,8 +430,51 @@ pub fn populate_demo(s: &mut Shared) {
         cancel_requested: false,
         secs: 0.0,
         actor: "ana.silva".into(),
-        repo_name: Some("matheuswidder/w-workploy".into()),
+        repo_name: Some("widder/landing".into()),
         branch: "feat/pix-recibo".into(),
+        summary: String::new(),
+        annotations: Vec::new(),
+    };
+
+    // 2b. Running — Deploy VPS #39 (última etapa, no projeto widder/erp-central)
+    let run_deploy_finishing = Run {
+        id: "run-demo-deploy-39".into(),
+        workflow_id: wf_deploy.clone(),
+        workflow_name: "Deploy VPS".into(),
+        status: RunStatus::Running,
+        trigger_label: "workflow_run".into(),
+        title: "Deploy de produção após CI #692 (release v2.15.0)".into(),
+        number: 39,
+        commit: Some("c4b81f3a2d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a".into()),
+        started_at: model::stamp_list(now - 12),
+        started_ts: Some(now - 12),
+        finished_at: None,
+        steps: vec![
+            sr(
+                "Preparar ambiente remoto",
+                5.0,
+                "Conectando via SSH em widder-vps...\nRepositório atualizado (c4b81f3).",
+            ),
+            sr(
+                "Reconstruir containers",
+                42.0,
+                "docker compose up -d --build api web worker\nImagens reconstruídas e containers reiniciados.",
+            ),
+            StepRun {
+                name: "Validar saúde dos serviços".into(),
+                status: StepStatus::Running,
+                log: "Aguardando healthchecks...\napi: 200 OK\nweb: aguardando resposta...".into(),
+                secs: 12.0,
+                substeps: Vec::new(),
+                started_ts: Some(now - 12),
+            },
+        ],
+        approved: true,
+        cancel_requested: false,
+        secs: 0.0,
+        actor: "matheuswidder".into(),
+        repo_name: Some("widder/erp-central".into()),
+        branch: "main".into(),
         summary: String::new(),
         annotations: Vec::new(),
     };
@@ -688,16 +742,35 @@ Containers saudáveis: 31/31 (api 200 · web 200 · worker ok)
     s.runs = vec![
         run_approval_1,
         run_running,
+        run_deploy_finishing,
         run_approval_2,
         run_failed,
         run_featured,
         run_deploy_37,
         run_mobile_24,
     ];
+
+    // A receita "CI Principal" foi importada do repo e o yml mudou lá:
+    // o aviso anti-drift acende no resumo do fluxo e no editor.
+    s.workflow_drift = vec![(
+        "wf-ci-principal".into(),
+        "CI Principal".into(),
+        "A receita mudou no repo — use Atualizar do repo.".into(),
+    )];
 }
 
 pub fn scene_runs(s: &mut AppState) {
     *s = AppState::init_demo();
+    s.navigate_to(NavTarget::Runs);
+}
+
+/// Visão de um fluxo importado do repo com aviso de drift: mostra o banner
+/// amarelo, a linha de proveniência com "Atualizar do repo" e os botões de
+/// importação do dashboard.
+pub fn scene_wf_drift(s: &mut AppState) {
+    *s = AppState::init_demo();
+    s.selected_project_id = Some("rb-landing".into());
+    s.selected_workflow_id = Some("wf-ci-principal".into());
     s.navigate_to(NavTarget::Runs);
 }
 

@@ -9,7 +9,7 @@ use crate::state::{
     platform_compat_warning,
 };
 use crate::ui::components::{
-    btn_danger, btn_icon, btn_neutral, chip, chip_with_icon, pill_badge, primary_button,
+    btn_danger, btn_ghost, btn_icon, btn_neutral, chip, chip_with_icon, pill_badge, primary_button,
 };
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -370,33 +370,169 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 form = form.child(error_banner(t, err));
             }
 
+            // Receita com origem no repo: banner de drift + linha compacta de
+            // proveniência (repo · caminho · SHA curto) com "Atualizar do repo".
+            if let Some(wf_id) = draft.id.as_deref()
+                && let Some(wf) = s.snapshot.workflows.iter().find(|w| w.id == wf_id)
+            {
+                if let Some((_, _, drift_msg)) = s
+                    .snapshot
+                    .workflow_drift
+                    .iter()
+                    .find(|(id, _, _)| id == wf_id)
+                {
+                    let wid_up = wf_id.to_string();
+                    let drift_msg = drift_msg.clone();
+                    form = form.child(
+                        row()
+                            .key("ed-drift-banner")
+                            .w_full()
+                            .px(12.0)
+                            .py(8.0)
+                            .gap(9.0)
+                            .center_y()
+                            .flex_wrap()
+                            .radius(8.0)
+                            .fill(t.warning_bg)
+                            .border(1.0, t.warning.alpha(0.4))
+                            .child(
+                                icon(&icons::REFRESH, 14.0)
+                                    .color(t.warning)
+                                    .a11y_hidden(),
+                            )
+                            .child(
+                                text(drift_msg)
+                                    .font(ty::SMALL)
+                                    .color(t.warning)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .wrap(),
+                            )
+                            .child(
+                                btn_neutral(
+                                    t,
+                                    format!("ed-drift-upd-repo-{wf_id}"),
+                                    "Atualizar do repo",
+                                    Some(&icons::REFRESH),
+                                    28.0,
+                                    move |s: &mut AppState, tx: &mut Tx| {
+                                        // A receita mudou no repo: descarta o
+                                        // rascunho e busca a versão da fonte.
+                                        s.modal = ModalState::None;
+                                        s.update_workflow_from_repo(&wid_up, tx);
+                                    },
+                                )
+                                .help("Reimporta a versão atual do arquivo no repositório, preservando id e encadeamento."),
+                            ),
+                    );
+                }
+                if let Some(src) = &wf.source {
+                    let sha_short = src
+                        .sha
+                        .as_deref()
+                        .map(|s| s.chars().take(7).collect::<String>())
+                        .unwrap_or_else(|| "sem SHA".into());
+                    let prov = format!(
+                        "{} · {} · {sha_short}",
+                        src.repo.trim(),
+                        src.path.trim()
+                    );
+                    let wid_up = wf_id.to_string();
+                    form = form.child(
+                        row()
+                            .key("ed-source-row")
+                            .w_full()
+                            .px(12.0)
+                            .py(8.0)
+                            .gap(9.0)
+                            .center_y()
+                            .flex_wrap()
+                            .radius(8.0)
+                            .fill(t.surface_2)
+                            .border(1.0, t.border_subtle)
+                            .child(
+                                icon(&icons::DOCUMENTS, 13.5)
+                                    .color(t.text_muted)
+                                    .a11y_hidden(),
+                            )
+                            .child(
+                                text(prov)
+                                    .font(ty::MONO_SM)
+                                    .color(t.text_secondary)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .truncate()
+                                    .a11y_hidden(),
+                            )
+                            .child(
+                                btn_ghost(
+                                    t,
+                                    format!("ed-upd-repo-{wf_id}"),
+                                    "Atualizar do repo",
+                                    Some(&icons::REFRESH),
+                                    28.0,
+                                    move |s: &mut AppState, tx: &mut Tx| {
+                                        s.modal = ModalState::None;
+                                        s.update_workflow_from_repo(&wid_up, tx);
+                                    },
+                                )
+                                .help("Traz de novo a versão do arquivo no repositório para esta receita."),
+                            ),
+                    );
+                }
+            }
+
+            // Rodapé: "Importar do repositório" quando a receita editada tem
+            // vínculo; à direita seguem Cancelar e Salvar.
+            let mut footer_left = el();
+            if let Some(wf_id) = draft.id.as_deref()
+                && let Some(wf) = s.snapshot.workflows.iter().find(|w| w.id == wf_id)
+                && let Some(bid_imp) = s.binding_id_for_workflow(wf)
+            {
+                footer_left = btn_neutral(
+                    t,
+                    "bind-imp-repo",
+                    "Importar do repositório",
+                    Some(&icons::DOCUMENTS),
+                    34.0,
+                    move |s: &mut AppState, tx: &mut Tx| {
+                        s.open_import_from_repo_modal(&bid_imp, tx);
+                    },
+                )
+                .help("Busca o yml direto no repositório vinculado (.workploy.yml ou infra/workploy) — o repo vira a fonte da verdade.");
+            }
             let footer = row()
                 .w_full()
-                .justify_end()
+                .justify_between()
                 .gap(10.0)
+                .child(footer_left)
                 .child(
-                    btn_neutral(
-                        t,
-                        "ed-cancel",
-                        "Cancelar",
-                        None,
-                        34.0,
-                        |s: &mut AppState, _| {
-                            s.modal = ModalState::None;
-                        },
-                    )
-                    .help("Descarta as alterações e fecha o editor."),
-                )
-                .child(
-                    primary_button(
-                        t,
-                        "ed-save",
-                        "Salvar fluxo",
-                        Some(&icons::CHECK_CIRCLE),
-                        34.0,
-                        |s: &mut AppState, tx: &mut Tx| s.save_workflow_draft(tx),
-                    )
-                    .help("Salva a definição do fluxo e atualiza os gatilhos configurados."),
+                    row()
+                        .gap(10.0)
+                        .child(
+                            btn_neutral(
+                                t,
+                                "ed-cancel",
+                                "Cancelar",
+                                None,
+                                34.0,
+                                |s: &mut AppState, _| {
+                                    s.modal = ModalState::None;
+                                },
+                            )
+                            .help("Descarta as alterações e fecha o editor."),
+                        )
+                        .child(
+                            primary_button(
+                                t,
+                                "ed-save",
+                                "Salvar fluxo",
+                                Some(&icons::CHECK_CIRCLE),
+                                34.0,
+                                |s: &mut AppState, tx: &mut Tx| s.save_workflow_draft(tx),
+                            )
+                            .help("Salva a definição do fluxo e atualiza os gatilhos configurados."),
+                        ),
                 );
 
             mount_shell_dialog(t, "editor", title, 720.0, form, footer, layer);
@@ -593,10 +729,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
             let auth_chips = row()
                 .gap(6.0)
                 .flex_wrap()
-                .child(chip(
+                .child(chip_with_icon(
                     t,
                     "srv-auth-alias",
                     "Alias ~/.ssh/config",
+                    Some(&icons::CODE),
                     draft.auth_choice == ServerAuthChoice::SshConfigAlias,
                     |s: &mut AppState, _| {
                         if let ModalState::ServerEditor(d) = &mut s.modal {
@@ -604,10 +741,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                         }
                     },
                 ))
-                .child(chip(
+                .child(chip_with_icon(
                     t,
                     "srv-auth-key",
                     "Chave privada SSH",
+                    Some(&icons::KEY),
                     draft.auth_choice == ServerAuthChoice::PrivateKey,
                     |s: &mut AppState, _| {
                         if let ModalState::ServerEditor(d) = &mut s.modal {
@@ -615,10 +753,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                         }
                     },
                 ))
-                .child(chip(
+                .child(chip_with_icon(
                     t,
                     "srv-auth-pass",
                     "Senha no Cofre do Windows",
+                    Some(&icons::PASSWORD),
                     draft.auth_choice == ServerAuthChoice::PasswordInVault,
                     |s: &mut AppState, _| {
                         if let ModalState::ServerEditor(d) = &mut s.modal {
@@ -696,7 +835,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                         t,
                                         "srv-gen-key",
                                         "Gerar chave Ed25519",
-                                        Some(&icons::SHIELD),
+                                        Some(&icons::KEY),
                                         30.0,
                                         |s: &mut AppState, tx: &mut Tx| s.generate_server_keypair(tx),
                                     ))
@@ -1028,10 +1167,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
             }
 
             let mut target_chips = row().gap(6.0).flex_wrap().child(
-                chip(
+                chip_with_icon(
                     t,
                     "bind-srv-local",
                     "Local (Esta máquina)",
+                    Some(&icons::LAPTOP),
                     draft.target_server_id.is_none(),
                     |s: &mut AppState, _| {
                         if let ModalState::BindingEditor(d) = &mut s.modal {
@@ -1052,10 +1192,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     srv.name, srv.host, srv.port
                 );
                 target_chips = target_chips.child(
-                    chip(
+                    chip_with_icon(
                         t,
                         format!("bind-srv-{}", srv.id),
                         srv.name.clone(),
+                        Some(&icons::SERVER),
                         active,
                         move |s: &mut AppState, _| {
                             if let ModalState::BindingEditor(d) = &mut s.modal {
@@ -1133,10 +1274,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .gap(6.0)
                 .flex_wrap()
                 .child(
-                    chip(
+                    chip_with_icon(
                         t,
                         "bind-mode-webhook",
                         "Webhook 24/7 na VPS",
+                        Some(&icons::CLOUD_BOLT),
                         draft.trigger_mode == TriggerMode::WebhookOnVps,
                         |s: &mut AppState, _| {
                             if let ModalState::BindingEditor(d) = &mut s.modal {
@@ -1147,10 +1289,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     .help("Recebe eventos de push do GitHub em tempo real direto na VPS, funcionando 24/7 mesmo com este PC desligado."),
                 )
                 .child(
-                    chip(
+                    chip_with_icon(
                         t,
                         "bind-mode-pollvps",
                         "Sondagem 24/7 na VPS",
+                        Some(&icons::REFRESH),
                         draft.trigger_mode == TriggerMode::PollOnVps,
                         |s: &mut AppState, _| {
                             if let ModalState::BindingEditor(d) = &mut s.modal {
@@ -1161,10 +1304,11 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                     .help("O agente workploy-runner na VPS consulta o GitHub periodicamente 24/7, sem precisar expor porta pública para webhook."),
                 )
                 .child(
-                    chip(
+                    chip_with_icon(
                         t,
                         "bind-mode-polldesktop",
                         "Sondagem no Desktop",
+                        Some(&icons::LAPTOP),
                         draft.trigger_mode == TriggerMode::PollOnDesktop,
                         |s: &mut AppState, _| {
                             if let ModalState::BindingEditor(d) = &mut s.modal {
@@ -1390,6 +1534,213 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 ));
 
             mount_shell_dialog(t, "binding", title, 640.0, form, footer, layer);
+        }
+        ModalState::ImportFromRepo {
+            binding_id,
+            loading,
+            paths,
+            status,
+            selected,
+        } => {
+            let repo_label = s
+                .snapshot
+                .settings
+                .repo_bindings
+                .iter()
+                .find(|b| b.id == *binding_id)
+                .map(|b| b.full_name.trim().to_string())
+                .unwrap_or_default();
+            let title = format!("Importar do repositório — {repo_label}");
+
+            let mut form = col()
+                .w_full()
+                .gap(12.0)
+                .child(
+                    text("O repositório vira a fonte da verdade: o Workploy procura .workploy.yml na raiz (ou receitas em infra/workploy/*.yml) e importa ou atualiza preservando id, encadeamento e vínculos.")
+                        .font(ty::SMALL)
+                        .color(t.text_muted)
+                        .wrap(),
+                );
+
+            if *loading {
+                let pulse_dot = el()
+                    .size(8.0, 8.0)
+                    .center()
+                    .child(
+                        effect(crate::gfx::MARK_PULSE_RADAR)
+                            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                            .radius(4.0)
+                            .effect_bleed(7.0)
+                            .effect_data([4.0, 7.0, 1.4, 0.7]),
+                    )
+                    .child(el().size(8.0, 8.0).radius(4.0).fill(t.info));
+                form = form.child(
+                    row()
+                        .key("imp-loading")
+                        .w_full()
+                        .px(14.0)
+                        .py(16.0)
+                        .gap(10.0)
+                        .center_y()
+                        .radius(8.0)
+                        .fill(t.surface_2)
+                        .border(1.0, t.border_subtle)
+                        .child(pulse_dot)
+                        .child(
+                            text("Buscando receitas no repositório...")
+                                .font(ty::SMALL)
+                                .color(t.text_secondary),
+                        ),
+                );
+            } else if paths.is_empty() {
+                form = form.child(
+                    row()
+                        .key("imp-empty")
+                        .w_full()
+                        .px(14.0)
+                        .py(14.0)
+                        .gap(9.0)
+                        .center_y()
+                        .radius(8.0)
+                        .fill(t.warning_bg)
+                        .border(1.0, t.warning.alpha(0.35))
+                        .child(icon(&icons::INFO, 14.0).color(t.warning).a11y_hidden())
+                        .child(
+                            text("Nenhum .workploy.yml ou infra/workploy/*.yml encontrado — commit o arquivo e tente de novo.")
+                                .font(ty::SMALL)
+                                .color(t.warning)
+                                .grow(1.0)
+                                .shrink()
+                                .wrap(),
+                        ),
+                );
+            } else {
+                let mut list = col().w_full().gap(6.0);
+                for (i, path) in paths.iter().enumerate() {
+                    let is_sel = selected.as_deref() == Some(path.as_str());
+                    let path_owned = path.clone();
+                    list = list.child(
+                        row()
+                            .key(format!("imp-path-{i}"))
+                            .role("button")
+                            .label(format!("Escolher receita {path}"))
+                            .checked(is_sel)
+                            .w_full()
+                            .min_h(34.0)
+                            .px(10.0)
+                            .py(6.0)
+                            .gap(9.0)
+                            .center_y()
+                            .radius(7.0)
+                            .fill(if is_sel {
+                                t.accent_soft
+                            } else {
+                                t.surface_2
+                            })
+                            .border(
+                                1.0,
+                                if is_sel {
+                                    t.accent.alpha(0.45)
+                                } else {
+                                    t.border_subtle
+                                },
+                            )
+                            .cursor(Cursor::Pointer)
+                            .focusable(true)
+                            .focus_ring(2.0, 2.0, t.accent)
+                            .hover(t.hover)
+                            .press(t.press)
+                            .on_press(move |s: &mut AppState| {
+                                if let ModalState::ImportFromRepo { selected, .. } =
+                                    &mut s.modal
+                                {
+                                    *selected = Some(path_owned.clone());
+                                }
+                            })
+                            .child(
+                                el()
+                                    .size(14.0, 14.0)
+                                    .center()
+                                    .radius(7.0)
+                                    .border(1.4, if is_sel { t.accent } else { t.border_strong })
+                                    .child(if is_sel {
+                                        el().size(6.0, 6.0).radius(3.0).fill(t.accent)
+                                    } else {
+                                        el()
+                                    }),
+                            )
+                            .child(
+                                icon(&icons::DOCUMENTS, 13.5)
+                                    .color(if is_sel { t.accent } else { t.text_muted })
+                                    .a11y_hidden(),
+                            )
+                            .child(
+                                text(path.clone())
+                                    .font(ty::MONO_SM)
+                                    .color(if is_sel {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    })
+                                    .grow(1.0)
+                                    .shrink()
+                                    .truncate()
+                                    .a11y_hidden(),
+                            ),
+                    );
+                }
+                form = form.child(list);
+            }
+
+            form = form.child(
+                text(status.clone())
+                    .font(ty::CAPTION)
+                    .color(t.text_muted)
+                    .wrap(),
+            );
+
+            let can_import = !*loading && !paths.is_empty() && selected.is_some();
+            let footer = row()
+                .w_full()
+                .justify_between()
+                .gap(10.0)
+                .child(
+                    btn_neutral(
+                        t,
+                        "imp-cancel",
+                        "Cancelar",
+                        None,
+                        34.0,
+                        |s: &mut AppState, _| {
+                            s.modal = ModalState::None;
+                        },
+                    )
+                    .help("Fecha sem importar nada deste repositório."),
+                )
+                .child(
+                    primary_button(
+                        t,
+                        "imp-confirm",
+                        if *loading { "Buscando..." } else { "Importar receita" },
+                        Some(&icons::DOCUMENTS),
+                        34.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            if let ModalState::ImportFromRepo {
+                                binding_id, selected, ..
+                            } = &s.modal
+                                && let Some(path) = selected.clone()
+                            {
+                                let bid = binding_id.clone();
+                                s.import_recipe_from_repo(&bid, &path, tx);
+                            }
+                        },
+                    )
+                    .disabled(!can_import)
+                    .opacity(if can_import { 1.0 } else { 0.65 })
+                    .help("Reimporta o arquivo escolhido: atualiza a receita existente (preservando id e encadeamento) ou cria uma nova."),
+                );
+
+            mount_shell_dialog(t, "import-repo", &title, 560.0, form, footer, layer);
         }
         ModalState::RepoCommits {
             binding_id,

@@ -5,7 +5,7 @@ use workploy::model::{self, AnnKind, Run, RunStatus, StepRun, StepStatus};
 
 use crate::state::{AppState, DetailTab, JobFilter, ToastKind};
 use crate::ui::components::{
-    btn_danger, btn_ghost, btn_neutral, chip, copyable_sha, gate_card, header_card,
+    btn_danger, btn_ghost, btn_neutral, chip, copyable_sha, gate_card, header_card, phase_spinner,
     primary_button, run_status_icon, status_pill, step_status_icon, surface_card,
 };
 use crate::ui::icons;
@@ -85,6 +85,22 @@ pub fn view(
     let rid_cancel = run.id.clone();
     let wf_id_rerun = run.workflow_id.clone();
 
+    // Spinner de fase junto do status enquanto a execução está ativa
+    // (família pulse-* para CI, blocks-* para deploy), com o percentual
+    // de passos concluídos.
+    let active_phase_widgets: Vec<El> =
+        if matches!(run.status, RunStatus::Running | RunStatus::Queued) {
+            let kind = model::run_phase_spinner_kind(run, &run.workflow_name);
+            vec![
+                phase_spinner(t, kind, 18.0, format!("detail-phase-{}", run.id)),
+                text(format!("{}%", model::steps_completed_pct(run)))
+                    .font(ty::MONO_SM)
+                    .color(t.info),
+            ]
+        } else {
+            Vec::new()
+        };
+
     match run.status {
         RunStatus::AwaitingApproval => {
             header_actions = header_actions
@@ -162,7 +178,8 @@ pub fn view(
                                 .font(ty::MONO_SM)
                                 .color(t.accent),
                         )
-                        .child(status_pill(t, run.status)),
+                        .child(status_pill(t, run.status))
+                        .children(active_phase_widgets),
                 )
                 .child(
                     text(format!(
@@ -293,7 +310,7 @@ fn detail_sub_menu(
                 .press(t.press)
                 .on_press(move |s: &mut AppState| s.open_run_summary(&rid_sum))
                 .child(
-                    icon(&icons::LIST, 14.0)
+                    icon(&icons::DOCUMENTS, 14.0)
                         .color(if is_summary { t.text_primary } else { t.text_muted })
                         .a11y_hidden(),
                 )
@@ -337,7 +354,7 @@ fn detail_sub_menu(
             .press(t.press)
             .on_press(move |s: &mut AppState| s.open_run_logs(&rid_first_log, active_job))
             .child(
-                icon(&icons::CODE, 14.0)
+                icon(&icons::NOTES, 14.0)
                     .color(if !is_summary { t.text_primary } else { t.text_muted })
                     .a11y_hidden(),
             )
@@ -408,6 +425,19 @@ fn detail_sub_menu(
         visible_jobs += 1;
         let selected = matches!(tab, DetailTab::Logs { job_idx } if job_idx == idx);
         let rid = run.id.clone();
+        // Passo em execução: o spinner carrega a fase e a família do fluxo
+        // (pulse-* para CI, blocks-* para deploy) em vez do ponto genérico.
+        let job_status_icon_el = if step.status == StepStatus::Running {
+            let kind = model::run_phase_spinner_kind(run, &run.workflow_name);
+            phase_spinner(
+                t,
+                kind,
+                14.0,
+                format!("detail-job-phase-{}-{idx}", run.id),
+            )
+        } else {
+            step_status_icon(t, step.status, 14.0)
+        };
         jobs_list = jobs_list.child(
             row()
                 .key(format!("sub-job-{idx}"))
@@ -435,7 +465,7 @@ fn detail_sub_menu(
                 .hover(t.hover)
                 .press(t.press)
                 .on_press(move |s: &mut AppState| s.open_run_logs(&rid, idx))
-                .child(step_status_icon(t, step.status, 14.0))
+                .child(job_status_icon_el)
                 .child(
                     text(step.name.clone())
                         .font(if selected { ty::SMALL_MED } else { ty::SMALL })
@@ -901,6 +931,13 @@ fn summary_view(s: &AppState, t: UiTheme, run: &Run) -> El {
                 AnnKind::Warning => (t.warning_bg, t.warning, "Aviso"),
                 AnnKind::Notice => (t.info_bg, t.info, "Nota"),
             };
+            let mut badge_row = row().h(20.0).px(7.0).center().radius(5.0).fill(bg);
+            if ann.kind == AnnKind::Error {
+                badge_row = badge_row
+                    .gap(4.0)
+                    .child(icon(&icons::BUG, 11.5).color(fg).a11y_hidden());
+            }
+            badge_row = badge_row.child(text(label).font(ty::CAPTION).color(fg));
             ann_list = ann_list.child(
                 row()
                     .key(format!("ann-{i}"))
@@ -912,15 +949,7 @@ fn summary_view(s: &AppState, t: UiTheme, run: &Run) -> El {
                     .radius(8.0)
                     .fill(t.surface_2)
                     .border(1.0, t.border_subtle)
-                    .child(
-                        row()
-                            .h(20.0)
-                            .px(7.0)
-                            .center()
-                            .radius(5.0)
-                            .fill(bg)
-                            .child(text(label).font(ty::CAPTION).color(fg)),
-                    )
+                    .child(badge_row)
                     .child(
                         col()
                             .grow(1.0)

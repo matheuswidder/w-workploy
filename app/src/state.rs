@@ -561,6 +561,15 @@ pub enum ModalState {
     ServerEditor(Box<ServerDraft>),
     DeleteServerConfirm { server_id: String, server_name: String },
     BindingEditor(Box<BindingDraft>),
+    /// Importação de receita direto do repositório vinculado: o repo vira a
+    /// fonte da verdade. `selected` guarda o caminho escolhido na lista.
+    ImportFromRepo {
+        binding_id: String,
+        loading: bool,
+        paths: Vec<String>,
+        status: String,
+        selected: Option<String>,
+    },
     RepoCommits {
         binding_id: String,
         full_name: String,
@@ -607,6 +616,16 @@ pub enum ConnectionsHealth {
     Healthy,
     Warning,
     Danger,
+}
+
+/// Caminhos de receita encontrados no repositório por `fetch_repo_yaml_candidates`
+/// (rodando fora da thread de UI) e esperando o `poll` levar para o modal
+/// `ImportFromRepo` aberto.
+#[derive(Clone, Debug)]
+pub struct RepoYamlCandidates {
+    pub binding_id: String,
+    pub paths: Vec<String>,
+    pub status: String,
 }
 
 pub fn vps_ram_used_pct(probe: &VpsProbeResult) -> u8 {
@@ -714,12 +733,17 @@ pub struct AppState {
     pub log_line_numbers: bool,
     pub log_wrap_lines: bool,
     pub collapsed_steps: HashSet<String>,
+    /// Projetos (RepoBinding.id) com fluxos aninhados recolhidos na sidebar.
+    pub collapsed_projects: HashSet<String>,
 
     pub settings_draft: SettingsDraft,
     pub modal: ModalState,
     pub next_uid: u64,
     pub toasts: ToastStack<ToastMsg>,
     pub probe_queue: Vec<String>,
+    /// Resultado (rede) da busca de receitas no repo esperando o `poll`
+    /// drenar para dentro do modal `ImportFromRepo` aberto.
+    pub repo_yaml_inbox: Arc<Mutex<Option<RepoYamlCandidates>>>,
 
     // Motion & rune-fx timing state
     pub clock_t: f64,
@@ -804,11 +828,13 @@ impl AppState {
             log_line_numbers: true,
             log_wrap_lines: true,
             collapsed_steps: HashSet::new(),
+            collapsed_projects: HashSet::new(),
             settings_draft,
             modal: ModalState::None,
             next_uid: 100,
             toasts: ToastStack::default(),
             probe_queue: Vec::new(),
+            repo_yaml_inbox: Arc::new(Mutex::new(None)),
             clock_t: 0.0,
             fx_phase: Phase::new(1.0),
             reduce_motion: false,
@@ -2195,6 +2221,206 @@ impl AppState {
         );
     }
 
+    /// Resolve o vínculo dono de uma receita: o `repo_id` gravado, o repo da
+    /// proveniência (`source.repo`) ou o vínculo que aponta direto para ela.
+    pub fn binding_id_for_workflow(&self, wf: &workploy::model::Workflow) -> Option<String> {
+        if let Some(rid) = wf.repo_id.as_deref().filter(|r| !r.is_empty())
+            && self
+                .snapshot
+                .settings
+                .repo_bindings
+                .iter()
+                .any(|b| b.id == rid)
+        {
+            return Some(rid.to_string());
+        }
+        if let Some(src) = &wf.source {
+            let repo = src.repo.trim();
+            if !repo.is_empty()
+                && let Some(b) = self
+                    .snapshot
+                    .settings
+                    .repo_bindings
+                    .iter()
+                    .find(|b| b.full_name.eq_ignore_ascii_case(repo))
+            {
+                return Some(b.id.clone());
+            }
+        }
+        self.snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.workflow_id.as_deref() == Some(wf.id.as_str()))
+            .map(|b| b.id.clone())
+    }
+
+    /// Abre o modal "Importar do repositório" e dispara em background a busca
+    /// dos caminhos de receita no repo vinculado (`.workploy.yml` na raiz ou
+    /// `infra/workploy/*.yml`). O resultado chega pelo `repo_yaml_inbox` e o
+    /// `poll` move para dentro do modal aberto.
+    pub fn open_import_from_repo_modal(&mut self, binding_id: &str, tx: &mut Tx) {
+        self.open_select = None;
+        let Some(binding) = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .cloned()
+        else {
+            return;
+        };
+        let repo_label = binding.full_name.trim().to_string();
+        if self.demo_mode {
+            // Mesmos caminhos que o backend prioriza, sem tocar na rede.
+            self.modal = ModalState::ImportFromRepo {
+                binding_id: binding.id.clone(),
+                loading: false,
+                paths: vec![".workploy.yml".into(), "infra/workploy/deploy.yml".into()],
+                status: format!(
+                    "2 arquivos de receita encontrados em {repo_label} (modo demonstração)."
+                ),
+                selected: Some(".workploy.yml".into()),
+            };
+            return;
+        }
+        self.modal = ModalState::ImportFromRepo {
+            binding_id: binding.id.clone(),
+            loading: true,
+            paths: Vec::new(),
+            status: format!("Buscando receitas em {repo_label}..."),
+            selected: None,
+        };
+        let sh = self.shared.clone();
+        let inbox = self.repo_yaml_inbox.clone();
+        let bid = binding.id;
+        std::thread::spawn(move || {
+            let paths = github::fetch_repo_yaml_candidates(&sh, &repo_label);
+            let status = if paths.is_empty() {
+                "Nenhum .workploy.yml ou infra/workploy/*.yml encontrado — commit o arquivo e tente de novo.".to_string()
+            } else {
+                format!("{n} arquivo(s) de receita encontrado(s) em {repo_label}.", n = paths.len())
+            };
+            *inbox.lock().unwrap() = Some(RepoYamlCandidates {
+                binding_id: bid,
+                paths,
+                status,
+            });
+            // Acorda o loop de frames (o mesmo efeito de `engine::notify`).
+            let wake = sh.lock().unwrap().wake.clone();
+            if let Some(wake) = wake {
+                wake();
+            }
+        });
+        tx.wake_after(std::time::Duration::from_millis(400));
+    }
+
+    /// Importa (ou atualiza) a receita a partir do caminho escolhido no modal.
+    /// O backend devolve a mensagem pt-BR e também a publica em
+    /// `sync_last_event` — o `poll` transforma no toast padrão da sincronização.
+    pub fn import_recipe_from_repo(&mut self, binding_id: &str, path: &str, tx: &mut Tx) {
+        let Some(binding) = self
+            .snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| b.id == binding_id)
+            .cloned()
+        else {
+            return;
+        };
+        let clean_path = path.trim().to_string();
+        self.modal = ModalState::None;
+        if self.demo_mode {
+            let repo_label = binding.full_name.trim();
+            let msg = format!(
+                "Receita importada de {repo_label}:{clean_path} (modo demonstração — nada foi gravado)."
+            );
+            self.push_toast(
+                format!("imp-repo-{binding_id}"),
+                "Receita importada do repositório",
+                Some(msg),
+                ToastKind::Success,
+                tx,
+            );
+            return;
+        }
+        let sh = self.shared.clone();
+        let bid = binding_id.to_string();
+        std::thread::spawn(move || {
+            // A mensagem retornada também vai para `runner_sync_status` e
+            // `sync_last_event`; o toast nasce do evento de sincronização.
+            let _ = github::import_workflow_from_repo(&sh, &bid, &clean_path);
+        });
+        tx.wake_after(std::time::Duration::from_millis(150));
+    }
+
+    /// "Atualizar do repo": reimporta a receita do caminho registrado em
+    /// `source`, preservando id, encadeamento e vínculos (o backend decide
+    /// entre atualizar ou recriar) e limpando o aviso de drift quando dá certo.
+    pub fn update_workflow_from_repo(&mut self, wf_id: &str, tx: &mut Tx) {
+        let Some(wf) = self
+            .snapshot
+            .workflows
+            .iter()
+            .find(|w| w.id == wf_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(source) = wf.source.clone() else {
+            self.push_toast(
+                format!("upd-repo-missing-{wf_id}"),
+                "Receita sem origem no repo",
+                Some(
+                    "Esta receita não foi importada do repositório — não há de onde atualizar."
+                        .into(),
+                ),
+                ToastKind::Warning,
+                tx,
+            );
+            return;
+        };
+        let Some(binding_id) = self.binding_id_for_workflow(&wf) else {
+            self.push_toast(
+                format!("upd-repo-nobinding-{wf_id}"),
+                "Vínculo não encontrado",
+                Some(format!(
+                    "Nenhum vínculo aponta para o repositório '{}'.",
+                    source.repo.trim()
+                )),
+                ToastKind::Warning,
+                tx,
+            );
+            return;
+        };
+        if self.demo_mode {
+            let repo_label = source.repo.trim();
+            let msg = format!(
+                "Receita '{}' atualizada a partir de {repo_label}:{} (modo demonstração).",
+                wf.name,
+                source.path.trim()
+            );
+            self.snapshot.workflow_drift.retain(|(id, _, _)| id != wf_id);
+            self.push_toast(
+                format!("upd-repo-{wf_id}"),
+                "Receita atualizada do repo",
+                Some(msg),
+                ToastKind::Success,
+                tx,
+            );
+            return;
+        }
+        let sh = self.shared.clone();
+        let bid = binding_id;
+        let path = source.path.trim().to_string();
+        std::thread::spawn(move || {
+            let _ = github::import_workflow_from_repo(&sh, &bid, &path);
+        });
+        tx.wake_after(std::time::Duration::from_millis(150));
+    }
+
     pub fn clear_finished_runs_history(&mut self, tx: &mut Tx) {
         let removed = if self.demo_mode {
             let before = self.snapshot.runs.len();
@@ -3053,6 +3279,13 @@ impl AppState {
             on_success: draft.on_success.clone(),
             server_id: None,
             repo_id: None,
+            // Editar uma receita não pode apagar a proveniência de importação
+            // do repositório (mantida quando a receita já existia).
+            source: draft
+                .id
+                .as_deref()
+                .and_then(|id| self.snapshot.workflows.iter().find(|w| w.id == id))
+                .and_then(|w| w.source.clone()),
         };
         let wf_id = wf.id.clone();
         if self.demo_mode {
@@ -3367,6 +3600,31 @@ pub fn poll_app(s: &mut AppState, t: f64, tx: &mut Tx) -> bool {
             ("Falha ao sincronizar na VPS", ToastKind::Danger)
         };
         s.push_toast(format!("sync-event-{seq}"), title, Some(msg), kind, tx);
+        changed = true;
+    }
+
+    // Busca de receitas no repo: drena o resultado da thread de rede para o
+    // modal `ImportFromRepo` aberto (resultados tardios de modal já fechado
+    // ou de outro vínculo são descartados).
+    if let Some(cand) = s.repo_yaml_inbox.lock().unwrap().take()
+        && let ModalState::ImportFromRepo {
+            binding_id,
+            loading,
+            paths,
+            status,
+            selected,
+            ..
+        } = &mut s.modal
+        && cand.binding_id == *binding_id
+    {
+        *loading = false;
+        if cand.paths.is_empty() {
+            *selected = None;
+        } else if selected.is_none() {
+            *selected = Some(cand.paths[0].clone());
+        }
+        *paths = cand.paths;
+        *status = cand.status;
         changed = true;
     }
 
