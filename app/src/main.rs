@@ -18,6 +18,9 @@ fn load_tray_icon() -> Option<TrayIcon> {
 
 fn on_close(s: &mut AppState, tx: &mut Tx) {
     if !s.snapshot.settings.minimize_to_tray {
+        // Persistência final no encerramento: a gravação de runs é assíncrona;
+        // o flush garante que o último estado chegue ao disco antes de sair.
+        workploy::model::flush_runs_to_disk();
         tx.quit();
     }
 }

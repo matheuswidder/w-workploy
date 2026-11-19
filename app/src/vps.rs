@@ -125,8 +125,17 @@ pub(crate) fn build_ssh_command(
 
     let mut cmd = Command::new("ssh");
     engine::apply_no_window(&mut cmd);
+    // Keepalive explícito: sem isso, uma conexão que cai silenciosamente
+    // (NAT, reboot da VPS, troca de rede) deixa o cliente ssh pendurado
+    // "em andamento" para sempre — nem linha nova, nem término. Com
+    // ServerAlive 15s x 4, o próprio ssh detecta a conexão morta em ~1 min
+    // e sai (exit 255), inclusive nos caminhos de captura (`cmd.output()`).
     cmd.arg("-o")
         .arg("ConnectTimeout=12")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new");
 
@@ -205,6 +214,80 @@ pub fn ssh_run_capture(server: &VpsServer, remote_cmd: &str) -> Result<(bool, St
     ))
 }
 
+/// Tempo máximo de inatividade numa sessão SSH de um passo: nenhuma linha de
+/// log e nenhum término do comando remoto. Uma conexão que perde a rota no
+/// meio de um build longo fica exatamente nesse estado; sem esse limite o
+/// passo permanece 'em andamento' para sempre, sem linha nova de log.
+/// Padrão: 20 min. `WORKPLOY_SSH_IDLE_TIMEOUT_SECS` sobrescreve (60 s a 24 h).
+pub fn ssh_idle_timeout() -> Duration {
+    const DEFAULT_SECS: u64 = 20 * 60;
+    let secs = std::env::var("WORKPLOY_SSH_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS)
+        .clamp(60, 24 * 60 * 60);
+    Duration::from_secs(secs)
+}
+
+/// Resultado do bombeamento de uma sessão de streaming.
+#[derive(Debug)]
+pub(crate) enum StreamOutcome {
+    /// O processo terminou normalmente.
+    Exited(std::process::ExitStatus),
+    /// Cancelamento pedido — o cliente ssh foi morto localmente.
+    Cancelled,
+    /// Inatividade: sem linha nova e sem término por `idle_timeout`.
+    /// O cliente ssh foi morto localmente para destravar o passo.
+    TimedOut(Duration),
+    /// O watch do processo falhou (caso degenerado de pid inválido).
+    WatchFailed,
+}
+
+/// Bombeia as linhas do canal enquanto aguarda o término do processo, com
+/// três saídas além do término natural: cancelamento, falha de watch e — o
+/// corte de segurança contra sessões mudas — o timeout de inatividade.
+/// Linha recebida reinicia o cronômetro; build longo que emite log de tempos
+/// em tempos nunca é cortado.
+fn stream_until_exit<F>(
+    child: &mut std::process::Child,
+    rx: &std::sync::mpsc::Receiver<String>,
+    cancel: Option<&AtomicBool>,
+    idle_timeout: Duration,
+    mut on_line: F,
+) -> StreamOutcome
+where
+    F: FnMut(&str),
+{
+    let mut last_activity = Instant::now();
+    loop {
+        let mut got_line = false;
+        while let Ok(line) = rx.try_recv() {
+            on_line(&line);
+            got_line = true;
+        }
+        if got_line {
+            last_activity = Instant::now();
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => return StreamOutcome::Exited(st),
+            Ok(None) => {}
+            Err(_) => return StreamOutcome::WatchFailed,
+        }
+        if last_activity.elapsed() >= idle_timeout {
+            let silent_for = last_activity.elapsed();
+            let _ = child.kill();
+            let _ = child.wait();
+            return StreamOutcome::TimedOut(silent_for);
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return StreamOutcome::Cancelled;
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
 pub fn ssh_run_with_stdin(
     server: &VpsServer,
     remote_cmd: &str,
@@ -236,6 +319,7 @@ pub fn ssh_run_streaming<F>(
     server: &VpsServer,
     remote_cmd: &str,
     cancel: Option<&Arc<AtomicBool>>,
+    idle_timeout: Duration,
     mut on_line: F,
 ) -> Result<bool, String>
 where
@@ -270,27 +354,14 @@ where
     drop(tx);
 
     // Polling temporal independente de linhas: o cancelamento é checado a
-    // cada ~80 ms mesmo que o comando remoto fique minutos sem emitir nada.
-    // Ao cancelar, o cliente ssh local é morto na hora — a sessão remota
-    // recebe SIGHUP quando a conexão cai e o run não continua até o fim.
-    let mut cancelled = false;
-    let status = loop {
-        while let Ok(line) = rx.try_recv() {
-            on_line(&line);
-        }
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {}
-            Err(_) => break None,
-        }
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            cancelled = true;
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(80));
-    };
+    // cada ~80 ms mesmo que o comando remoto fique minutos sem emitir nada,
+    // e o timeout de inatividade corta sessões mudas (rede caída no meio de
+    // um build longo — sem isso o passo fica 'em andamento' para sempre).
+    // Ao cancelar ou esgotar, o cliente ssh local é morto na hora — a sessão
+    // remota recebe SIGHUP quando a conexão cai.
+    let outcome = stream_until_exit(&mut child, &rx, cancel.map(|c| c.as_ref()), idle_timeout, |line| {
+        on_line(line);
+    });
 
     for h in readers {
         let _ = h.join();
@@ -299,10 +370,15 @@ where
         on_line(&line);
     }
 
-    if cancelled {
-        return Ok(false);
+    match outcome {
+        StreamOutcome::Exited(status) => Ok(status.success()),
+        StreamOutcome::Cancelled => Ok(false),
+        StreamOutcome::WatchFailed => Ok(false),
+        StreamOutcome::TimedOut(silent_for) => Err(format!(
+            "[tempo esgotado] a conexão com a VPS ficou muda por {} (nenhuma linha de log e nenhum término) — o passo foi interrompido para não travar o fluxo. Verifique a rede/a VPS e rode o passo novamente.",
+            fmt_dur(silent_for.as_secs_f64())
+        )),
     }
-    Ok(status.is_some_and(|s| s.success()))
 }
 
 pub fn compute_capacity_tier(
@@ -1553,9 +1629,15 @@ pub fn provision_vps(sh: &SharedHandle, server_id: &str, opts: ProvisionOptions)
 
         let script = build_provision_script(&opts, &runner_token, &webhook_secret);
         let sh_log = sh2.clone();
-        let ok = match ssh_run_with_stdin_streaming(&server, "sh -s", script.as_bytes(), |line| {
-            append_provision_log(&sh_log, line);
-        }) {
+        let ok = match ssh_run_with_stdin_streaming(
+            &server,
+            "sh -s",
+            script.as_bytes(),
+            ssh_idle_timeout(),
+            |line| {
+                append_provision_log(&sh_log, line);
+            },
+        ) {
             Ok(success) => success,
             Err(e) => {
                 append_provision_log(&sh2, &format!("[erro] {e}"));
@@ -1592,6 +1674,7 @@ fn ssh_run_with_stdin_streaming<F>(
     server: &VpsServer,
     remote_cmd: &str,
     stdin_bytes: &[u8],
+    idle_timeout: Duration,
     mut on_line: F,
 ) -> Result<bool, String>
 where
@@ -1631,16 +1714,10 @@ where
     }
     drop(tx);
 
-    let status = loop {
-        while let Ok(line) = rx.try_recv() {
-            on_line(&line);
-        }
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => std::thread::sleep(Duration::from_millis(80)),
-            Err(_) => break None,
-        }
-    };
+    let outcome = stream_until_exit(&mut child, &rx, None, idle_timeout, |line| {
+        on_line(line);
+    });
+
     for h in readers {
         let _ = h.join();
     }
@@ -1648,7 +1725,15 @@ where
         on_line(&line);
     }
 
-    Ok(status.is_some_and(|s| s.success()))
+    match outcome {
+        StreamOutcome::Exited(status) => Ok(status.success()),
+        StreamOutcome::Cancelled => Ok(false),
+        StreamOutcome::WatchFailed => Ok(false),
+        StreamOutcome::TimedOut(silent_for) => Err(format!(
+            "[tempo esgotado] o provisionamento ficou mudo por {} (nenhuma linha de log e nenhum término) — a sessão SSH foi encerrada. Verifique a rede/a VPS e tente novamente.",
+            fmt_dur(silent_for.as_secs_f64())
+        )),
+    }
 }
 
 pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_id: &str) {
@@ -1658,6 +1743,7 @@ pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_i
         // O JSON do runner não traz esses campos — `#[serde(default)]` os
         // entrega como `None` e eles são preenchidos aqui.
         let remote_cancel = r.cancel_requested;
+        let remote_approved = r.approved;
         let mut incoming = r;
         incoming.vps_run_id = Some(incoming.id.clone());
         incoming.vps_server_id = Some(vps_server_id.to_string());
@@ -1666,9 +1752,15 @@ pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_i
             // registrado em qualquer um dos lados permanece até o runner
             // confirmar na sincronização seguinte. Sem isso, uma sincronização
             // apagaria o pedido feito no desktop antes do runner processar.
+            // Aprovação segue a mesma regra: o desktop marcou `approved` ao
+            // enviar o POST ao runner; até o runner consolidar e devolver o
+            // estado, a sincronização não pode apagar o flag local — senão o
+            // espelho volta a parecer "aguardando aprovação" eternamente.
             let local_cancel = slot.cancel_requested;
+            let local_approved = slot.approved;
             *slot = incoming;
             slot.cancel_requested = local_cancel || remote_cancel;
+            slot.approved = local_approved || remote_approved;
         } else {
             existing.push(incoming);
         }
@@ -2249,6 +2341,219 @@ RUNNER_ACTIVE=1\r\n";
         assert_eq!(mirror.status, RunStatus::Cancelled);
         assert_eq!(mirror.vps_run_id.as_deref(), Some("run-vps-2"));
         assert_eq!(mirror.vps_server_id.as_deref(), Some("vps-a"));
+    }
+
+    #[test]
+    fn merge_remote_runs_keeps_local_approval_until_remote_confirms() {
+        // Desktop aprovou (POST /approve enviado ao runner); o runner ainda
+        // não consolidou o estado no runs.json dele. A sincronização periódica
+        // não pode apagar o flag local — senão o espelho volta a parecer
+        // "aguardando aprovação" enquanto o pedido já viajou.
+        let mut local = vec![run_for_merge("run-vps-1", RunStatus::AwaitingApproval, false)];
+        local[0].approved = true;
+        let mut remote = run_for_merge("run-vps-1", RunStatus::AwaitingApproval, false);
+        remote.approved = false;
+        merge_remote_runs(&mut local, vec![remote], "vps-a");
+        assert!(
+            local[0].approved,
+            "aprovação local não pode ser apagada pela sincronização"
+        );
+
+        // Caminho inverso: runner consolidou a aprovação — chega ao espelho
+        // recém-sincronizado.
+        let mut fresh: Vec<Run> = Vec::new();
+        let mut remote_approved = run_for_merge("run-vps-2", RunStatus::Running, false);
+        remote_approved.approved = true;
+        merge_remote_runs(&mut fresh, vec![remote_approved], "vps-a");
+        assert!(fresh[0].approved, "aprovação consolidada no runner chega ao espelho");
+    }
+
+    #[test]
+    fn build_ssh_command_adds_keepalives_for_all_auth_modes() {
+        // Sem ServerAlive explícito, uma conexão que cai silenciosamente
+        // (NAT/reboot/troca de rede) deixa o ssh pendurado para sempre.
+        let key_path =
+            std::env::temp_dir().join(format!("workploy-ssh-key-{}", crate::model::new_id("k")));
+        std::fs::write(&key_path, b"chave-de-teste").unwrap();
+
+        let alias_srv = VpsServer {
+            host: "concef-vps".into(),
+            auth: AuthMethod::SshConfigAlias,
+            ..Default::default()
+        };
+
+        let key_srv = VpsServer {
+            host: "203.0.113.5".into(),
+            auth: AuthMethod::PrivateKey {
+                path: key_path.to_string_lossy().into(),
+            },
+            ..Default::default()
+        };
+
+        for srv in [&alias_srv, &key_srv] {
+            let (cmd, _guard) = build_ssh_command(srv, "echo ok").unwrap();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let joined = args.join(" ");
+            assert!(
+                joined.contains("ServerAliveInterval=15"),
+                "keepalive ausente para {:?}: {joined}",
+                srv.auth
+            );
+            assert!(
+                joined.contains("ServerAliveCountMax=4"),
+                "keepalive count ausente para {:?}: {joined}",
+                srv.auth
+            );
+        }
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    fn silent_child() -> std::process::Child {
+        // Processo que não emite NADA e viveria minutos: o mesmo estado de
+        // um ssh cuja conexão morreu no meio do passo.
+        let mut c = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.arg("-n").arg("30").arg("127.0.0.1");
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        engine::apply_no_window(&mut c);
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.spawn().expect("child mudo deve subir")
+    }
+
+    fn chatty_then_silent_child() -> std::process::Child {
+        // Emite duas linhas com pausa curtas entre elas e depois silencia
+        // para sempre: linha nova reinicia o cronômetro de inatividade.
+        let mut c = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C")
+                .arg("echo linha-um& ping -n 3 127.0.0.1 > nul & echo linha-dois& ping -n 30 127.0.0.1 > nul");
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("echo linha-um; sleep 2; echo linha-dois; sleep 30");
+            c
+        };
+        engine::apply_no_window(&mut c);
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.spawn().expect("child falante deve subir")
+    }
+
+    fn echo_child() -> std::process::Child {
+        let mut c = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg("echo linha-ok");
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("echo linha-ok");
+            c
+        };
+        engine::apply_no_window(&mut c);
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.spawn().expect("child de echo deve subir")
+    }
+
+    fn forward_stdout_to_channel(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            });
+        }
+        rx
+    }
+
+    #[test]
+    fn stream_until_exit_kills_silent_hang_after_idle_timeout() {
+        // Antes do timeout de inatividade, um ssh mudo (rede caída no meio do
+        // passo) deixava o loop de streaming rodando para sempre — passo 'em
+        // andamento' eterno, sem linha nova de log. O timeout o mata.
+        let mut child = silent_child();
+        // Canal vazio = conexão morta: nada chega, processo nunca termina.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drop(tx);
+        let started = Instant::now();
+        let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = lines.clone();
+        let outcome = stream_until_exit(
+            &mut child,
+            &rx,
+            None,
+            Duration::from_millis(400),
+            move |_l| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert!(
+            matches!(outcome, StreamOutcome::TimedOut(_)),
+            "child mudo deve ser abortado por inatividade, veio {outcome:?}"
+        );
+        assert_eq!(
+            lines.load(Ordering::Relaxed),
+            0,
+            "nenhuma linha deveria ter chegado"
+        );
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "o child precisa estar morto após o timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "o abort não pode esperar o child inteiro (30 s)"
+        );
+    }
+
+    #[test]
+    fn stream_until_exit_survives_lines_flow_and_exits_normally() {
+        // Linha nova reinicia o cronômetro: pausas curtas entre linhas não
+        // matam a sessão; silêncio longo depois da última linha, sim.
+        let mut child = chatty_then_silent_child();
+        let rx = forward_stdout_to_channel(&mut child);
+        let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = lines.clone();
+        let started = Instant::now();
+        let outcome = stream_until_exit(
+            &mut child,
+            &rx,
+            None,
+            Duration::from_millis(5000),
+            move |_l| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(
+            lines.load(Ordering::Relaxed),
+            2,
+            "as duas linhas devem fluir antes do corte"
+        );
+        assert!(matches!(outcome, StreamOutcome::TimedOut(_)));
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "deve sobreviver à pausa de ~2 s entre linhas e só expirar após o silêncio de 5 s"
+        );
+
+        // Término natural continua funcionando: nada de timeout em exit limpo.
+        let mut child = echo_child();
+        let rx = forward_stdout_to_channel(&mut child);
+        let mut got = Vec::new();
+        let outcome = stream_until_exit(&mut child, &rx, None, Duration::from_secs(60), |l| {
+            got.push(l.to_string());
+        });
+        match outcome {
+            StreamOutcome::Exited(status) => assert!(status.success()),
+            other => panic!("echo deve terminar normalmente, veio {other:?}"),
+        }
+        assert!(got.iter().any(|l| l.contains("linha-ok")));
     }
 
     #[test]

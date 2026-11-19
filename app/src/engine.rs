@@ -566,7 +566,7 @@ fn run_vps_sync_step(
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        let res = vps::ssh_run_streaming(srv, sync_cmd, Some(&cancel_flag), |line| {
+        let res = vps::ssh_run_streaming(srv, sync_cmd, Some(&cancel_flag), vps::ssh_idle_timeout(), |line| {
             let masked = mask_secrets_in_log(line, &[known_token]);
             append_log(sh, run_id, 0, &format!("{masked}\n"));
         });
@@ -591,6 +591,30 @@ fn run_vps_sync_step(
 }
 
 fn execute_run(
+    sh: SharedHandle,
+    run_id: String,
+    wf: Workflow,
+    target_server_override: Option<String>,
+    repo_name: Option<String>,
+    branch: Option<String>,
+    commit_sha: Option<String>,
+) {
+    execute_run_inner(
+        sh,
+        run_id,
+        wf,
+        target_server_override,
+        repo_name,
+        branch,
+        commit_sha,
+    );
+    // Persistência final garantida: o último estado do run (sucesso, falha
+    // ou cancelamento) chega ao disco antes desta thread encerrar — a
+    // gravação de rotina é assíncrona, mas o fim de run espera o flush.
+    crate::model::flush_runs_to_disk();
+}
+
+fn execute_run_inner(
     sh: SharedHandle,
     run_id: String,
     wf: Workflow,
@@ -841,7 +865,7 @@ fn exec_step(
                     std::thread::sleep(Duration::from_millis(100));
                 }
             });
-            let res = vps::ssh_run_streaming(srv, &remote_cmd, Some(&cancel_flag), |line| {
+            let res = vps::ssh_run_streaming(srv, &remote_cmd, Some(&cancel_flag), vps::ssh_idle_timeout(), |line| {
                 let masked = mask_secrets_in_log(line, &[known_token]);
                 append_log(sh, run_id, idx, &format!("{masked}\n"));
             });
@@ -870,10 +894,17 @@ fn exec_step(
         RunnerKind::Ssh => {
             let mut c = Command::new("ssh");
             apply_no_window(&mut c);
+            // Keepalive explícito (mesma razão do build_ssh_command): conexão
+            // que cai silenciosamente no meio do passo não pode deixar o ssh
+            // pendurado para sempre.
             c.arg("-o")
                 .arg("BatchMode=yes")
                 .arg("-o")
                 .arg("ConnectTimeout=15")
+                .arg("-o")
+                .arg("ServerAliveInterval=15")
+                .arg("-o")
+                .arg("ServerAliveCountMax=4")
                 .arg(ssh_host)
                 .arg(cmd);
             c

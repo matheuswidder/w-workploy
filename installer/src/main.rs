@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -579,6 +579,11 @@ fn copy_self_as_uninstaller(dest: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+const WRITABLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GRACEFUL_CLOSE_WAIT: Duration = Duration::from_secs(4);
+const FORCE_CLOSE_WAIT: Duration = Duration::from_secs(3);
+const TRANSIENT_LOCK_WAIT: Duration = Duration::from_millis(1500);
+
 fn ensure_target_unlocked(target_exe: &Path) -> Result<(), String> {
     if !target_exe.exists() {
         return Ok(());
@@ -587,23 +592,163 @@ fn ensure_target_unlocked(target_exe: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    // O executável está em uso; encerra o processo em execução sem janela de console.
-    let _ = Command::new("taskkill")
-        .args(["/IM", EXE_NAME, "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+    // O executável está em uso. Enumera processos com a mesma imagem e mantém
+    // APENAS aqueles cujo caminho é exatamente o alvo — nunca `taskkill /IM`,
+    // que derrubaria por nome todas as instâncias do sistema.
+    let target_pids = select_target_pids(&list_processes_by_image(EXE_NAME), target_exe);
 
-    for _ in 0..10 {
-        thread::sleep(Duration::from_millis(300));
-        if OpenOptions::new().write(true).open(target_exe).is_ok() {
-            return Ok(());
-        }
+    if target_pids.is_empty() {
+        // Nenhum processo do alvo em execução: pode ser um lock transitório
+        // (antivírus, backup). Aguarda brevemente antes de falhar.
+        return if wait_until_writable(target_exe, TRANSIENT_LOCK_WAIT) {
+            Ok(())
+        } else {
+            Err(target_locked_error(target_exe))
+        };
     }
 
-    Err(format!(
+    // 1) Fechamento gracioso por PID (WM_CLOSE, sem /F) e espera com re-checagem:
+    //    o aplicativo pode encerrar sozinho dentro da janela de tolerância.
+    for pid in &target_pids {
+        request_graceful_close(*pid);
+    }
+    if wait_until_writable(target_exe, GRACEFUL_CLOSE_WAIT) {
+        return Ok(());
+    }
+
+    // 2) Força apenas o que ainda roda a partir do caminho alvo; re-enumera
+    //    para não atingir um PID reutilizado por outro processo.
+    for pid in select_target_pids(&list_processes_by_image(EXE_NAME), target_exe) {
+        force_kill_pid(pid);
+    }
+    if wait_until_writable(target_exe, FORCE_CLOSE_WAIT) {
+        return Ok(());
+    }
+
+    Err(target_locked_error(target_exe))
+}
+
+fn wait_until_writable(target_exe: &Path, max_wait: Duration) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if OpenOptions::new().write(true).open(target_exe).is_ok() {
+            return true;
+        }
+        if waited >= max_wait {
+            return false;
+        }
+        let step = WRITABLE_POLL_INTERVAL.min(max_wait - waited);
+        thread::sleep(step);
+        waited += step;
+    }
+}
+
+fn target_locked_error(target_exe: &Path) -> String {
+    format!(
         "O arquivo '{}' está em uso e não pôde ser substituído. Feche o Workploy e tente novamente.",
         target_exe.display()
-    ))
+    )
+}
+
+/// Processo em execução com a imagem `workploy.exe`; o caminho fica `None`
+/// quando o WMI não o expõe — nesses casos o PID nunca é encerrado.
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessEntry {
+    pid: u32,
+    exe_path: Option<PathBuf>,
+}
+
+/// Script estático: nenhum caminho de destino entra na linha de comando do
+/// PowerShell (a filtragem por caminho acontece em Rust, após o parse).
+/// Aspas simples PS com `''` escapado mantêm o nome sempre como texto.
+fn build_process_query_script(exe_name: &str) -> String {
+    // Dobra aspas simples: dentro de string PS com aspas simples, `''` é um
+    // `'` literal — qualquer nome entra como texto, nunca como código.
+    let safe_name = exe_name.replace('\'', "''");
+    format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}; \
+         Get-CimInstance Win32_Process -Filter 'Name=''{safe_name}''' | \
+         ForEach-Object {{ '{{0}}|{{1}}' -f $_.ProcessId, $_.ExecutablePath }}"
+    )
+}
+
+/// Saída esperada: uma linha por processo no formato `PID|CaminhoDoExe`
+/// (caminho vazio quando o WMI não o expõe). Caminhos Windows não contêm
+/// `|`, então o corte no primeiro delimitador é seguro.
+fn parse_process_entries(output: &str) -> Vec<ProcessEntry> {
+    let cleaned = output.strip_prefix('\u{feff}').unwrap_or(output);
+    cleaned
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (pid_raw, path_raw) = line.split_once('|')?;
+            let pid = pid_raw.trim().parse::<u32>().ok()?;
+            let path = path_raw.trim();
+            let exe_path = if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            };
+            Some(ProcessEntry { pid, exe_path })
+        })
+        .collect()
+}
+
+/// Enumera processos pela imagem com `Get-CimInstance`. Qualquer falha
+/// devolve lista vazia — falha fechada: sem caminho confirmado, nada é
+/// encerrado e o chamador reporta o arquivo em uso.
+fn list_processes_by_image(exe_name: &str) -> Vec<ProcessEntry> {
+    let Ok(output) = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(build_process_query_script(exe_name))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return Vec::new();
+    };
+    parse_process_entries(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn select_target_pids(entries: &[ProcessEntry], target_exe: &Path) -> Vec<u32> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .exe_path
+                .as_deref()
+                .is_some_and(|p| paths_equal(p, target_exe))
+        })
+        .map(|entry| entry.pid)
+        .collect()
+}
+
+fn taskkill_pid(pid: u32, force: bool) {
+    let pid_arg = pid.to_string();
+    let mut cmd = Command::new("taskkill");
+    cmd.arg("/PID").arg(&pid_arg);
+    if force {
+        cmd.arg("/F");
+    }
+    let _ = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// `taskkill /PID <pid>` sem `/F` pede fechamento gracioso (WM_CLOSE).
+fn request_graceful_close(pid: u32) {
+    taskkill_pid(pid, false);
+}
+
+/// `taskkill /PID <pid> /F` encerra forçosamente apenas o PID alvo.
+fn force_kill_pid(pid: u32) {
+    taskkill_pid(pid, true);
 }
 
 fn build_self_delete_raw_arg(uninstall_exe: &Path, install_dir: &Path) -> String {
@@ -1688,7 +1833,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDir {
         path: PathBuf,
@@ -1899,5 +2044,199 @@ mod tests {
             r#"/C "ping 127.0.0.1 -n 3 > NUL & del /F /Q "C:\Users\Maria Silva\AppData\Local\Programs\Workploy\uninstall.exe" > NUL 2>&1 & rmdir "C:\Users\Maria Silva\AppData\Local\Programs\Workploy" > NUL 2>&1""#
         );
         assert!(!raw.contains(r#"\""#));
+    }
+
+    #[test]
+    fn process_query_script_is_static_and_single_quoted() {
+        let script = build_process_query_script(EXE_NAME);
+        assert!(script.contains("Get-CimInstance Win32_Process"));
+        assert!(script.contains(r"-Filter 'Name=''workploy.exe'''"));
+        assert!(script.contains("ForEach-Object"));
+        // Sem aspas duplas: nenhuma camada extra de escaping na linha de comando.
+        assert!(!script.contains('"'));
+
+        // Nome hostil continua sendo só texto (aspas simples PS duplicadas),
+        // nunca código executável — e nenhum caminho de destino entra no script.
+        let hostile = build_process_query_script("x'; Remove-Item C:\\ -Recurse;'.exe");
+        assert!(hostile.contains(r"-Filter 'Name=''x''; Remove-Item C:\ -Recurse;''.exe'''"));
+    }
+
+    #[test]
+    fn parse_process_entries_handles_crlf_null_paths_and_garbage() {
+        let stdout = "\u{feff}4242|C:\\Apps Workploy\\workploy.exe\r\n\
+                      7|C:\\Outra pasta\\workploy.exe\r\n\
+                      99|\r\n\
+                      \r\n\
+                      lixo-sem-delimitador\r\n\
+                      abc|C:\\pid-invalido\r\n";
+        assert_eq!(
+            parse_process_entries(stdout),
+            vec![
+                ProcessEntry {
+                    pid: 4242,
+                    exe_path: Some(PathBuf::from(r"C:\Apps Workploy\workploy.exe")),
+                },
+                ProcessEntry {
+                    pid: 7,
+                    exe_path: Some(PathBuf::from(r"C:\Outra pasta\workploy.exe")),
+                },
+                ProcessEntry { pid: 99, exe_path: None },
+            ]
+        );
+
+        assert!(parse_process_entries("").is_empty());
+        assert!(parse_process_entries("\r\n   \r\n").is_empty());
+    }
+
+    #[test]
+    fn select_target_pids_keeps_only_exact_target_path() {
+        let target = PathBuf::from(r"C:\Apps Workploy\workploy.exe");
+        let entries = vec![
+            ProcessEntry {
+                pid: 100,
+                // Mesmo caminho com caixa diferente (Windows ignora maiúsculas).
+                exe_path: Some(PathBuf::from(r"c:\apps workploy\WORKPLOY.EXE")),
+            },
+            ProcessEntry {
+                pid: 200,
+                exe_path: Some(PathBuf::from(r"C:\Sandbox\workploy.exe")),
+            },
+            // Caminho inacessível: nunca selecionado.
+            ProcessEntry { pid: 300, exe_path: None },
+        ];
+
+        assert_eq!(select_target_pids(&entries, &target), vec![100]);
+        assert_eq!(
+            select_target_pids(&entries, &PathBuf::from(r"C:\Sandbox\workploy.exe")),
+            vec![200]
+        );
+        assert!(
+            select_target_pids(&entries, &PathBuf::from(r"D:\Nao Instalado\workploy.exe"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ensure_target_unlocked_is_silent_and_idempotent_when_idle() {
+        let tmp = TempDir::new("unlock");
+        let target = tmp.path.join(EXE_NAME);
+
+        // Alvo inexistente: sucesso silencioso e idempotente.
+        ensure_target_unlocked(&target).expect("alvo inexistente não é erro");
+        ensure_target_unlocked(&target).expect("chamada idempotente");
+
+        // Alvo existente e livre: sucesso imediato, idempotente.
+        fs::write(&target, b"dummy").expect("gravar dummy");
+        ensure_target_unlocked(&target).expect("arquivo livre não é erro");
+        ensure_target_unlocked(&target).expect("chamada idempotente");
+    }
+
+    #[test]
+    fn sleeper_process_mode() {
+        // Modo auxiliar acionado pelo teste de integração do kill direcionado:
+        // o binário copiado como workploy.exe roda apenas este teste (--exact)
+        // e permanece vivo até o encerramento ou até o arquivo de parada surgir.
+        let Some(stopfile) = env::var_os("WORKPLOY_SETUP_TEST_STOPFILE") else {
+            return;
+        };
+        let stop = PathBuf::from(stopfile);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !stop.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    struct SleeperChild {
+        child: std::process::Child,
+        stopfile: PathBuf,
+    }
+
+    impl Drop for SleeperChild {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.stopfile, b"stop");
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_sleeper(exe: &Path, stopfile: &Path) -> SleeperChild {
+        let mut last_err = None;
+        for _ in 0..5 {
+            match Command::new(exe)
+                .arg("--exact")
+                .arg("tests::sleeper_process_mode")
+                .env("WORKPLOY_SETUP_TEST_STOPFILE", stopfile)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    return SleeperChild {
+                        child,
+                        stopfile: stopfile.to_path_buf(),
+                    };
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+        panic!(
+            "não foi possível iniciar o processo fake '{}': {:?}",
+            exe.display(),
+            last_err
+        );
+    }
+
+    #[test]
+    fn targeted_kill_spares_instances_from_other_paths() {
+        let tmp_a = TempDir::new("kill-a");
+        let tmp_b = TempDir::new("kill-b");
+        let stopfile = tmp_a.path.join("stop.flag");
+        let exe_a = tmp_a.path.join(EXE_NAME);
+        let exe_b = tmp_b.path.join(EXE_NAME);
+        let self_exe = env::current_exe().expect("exe atual");
+
+        fs::copy(&self_exe, &exe_a).expect("copiar workploy.exe A");
+        fs::copy(&self_exe, &exe_b).expect("copiar workploy.exe B");
+
+        let mut guard_a = spawn_sleeper(&exe_a, &stopfile);
+        let mut guard_b = spawn_sleeper(&exe_b, &stopfile);
+
+        // Confirma que as duas instâncias estão mesmo em execução.
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            guard_a.child.try_wait().expect("try_wait A").is_none(),
+            "instância A deveria estar em execução"
+        );
+        assert!(
+            guard_b.child.try_wait().expect("try_wait B").is_none(),
+            "instância B deveria estar em execução"
+        );
+
+        // O alvo do unlock é APENAS o executável da pasta A.
+        ensure_target_unlocked(&exe_a).expect("unlock do alvo A");
+
+        // A instância do caminho alvo foi encerrada...
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut a_exited = guard_a.child.try_wait().expect("try_wait A").is_some();
+        while !a_exited && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            a_exited = guard_a.child.try_wait().expect("try_wait A").is_some();
+        }
+        assert!(
+            a_exited,
+            "a instância do caminho alvo deveria ter sido encerrada"
+        );
+
+        // ...e a instância de outro caminho permanece intacta (defeito v0.1.13).
+        assert!(
+            guard_b.child.try_wait().expect("try_wait B").is_none(),
+            "instância de outro caminho não deveria ser afetada"
+        );
+
+        // O executável alvo voltou a ser substituível.
+        assert!(OpenOptions::new().write(true).open(&exe_a).is_ok());
     }
 }

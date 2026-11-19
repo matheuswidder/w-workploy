@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as RelaxedOrd};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
@@ -967,8 +969,140 @@ pub fn save_workflows(s: &Shared) {
     write_json(data_dir().join("workflows.json"), &s.workflows);
 }
 
+// ---------------------------------------------------------------------------
+// Persistência de runs: serialização sob lock (CPU pura, sem syscall) e
+// gravação em disco numa thread dedicada, FORA do lock global. Antes, cada
+// `save_runs` regravava runs.json inteiro (logs acumulados incluídos) em
+// `std::fs::write` síncrono enquanto o caller segurava o lock que a UI usa
+// para snapshot de render — com runs.json de uso real, cada transição de
+// passo bloqueava a UI por dezenas/centenas de ms.
+//
+// Contrato da camada:
+// - escritor único (a thread dedicada) → sem corrupção por concorrência;
+// - gravação atômica (.tmp + rename) → crash no meio não deixa runs.json
+//   truncado (o caminho antigo deixava);
+// - coalescing por destino: rajadas de saves viram 1 gravação,
+//   última-versão-ganha; a versão mais recente NUNCA é descartada;
+// - `flush_runs_to_disk()` garante o estado final em disco no fim de cada
+//   run e no encerramento do app;
+// - runs.json lido no mesmo formato (`read_json`), sem mudança de schema.
+// ---------------------------------------------------------------------------
+
+struct RunsSnapshot {
+    dir: PathBuf,
+    text: String,
+    seq: u64,
+}
+
+struct RunsPersist {
+    tx: Sender<RunsSnapshot>,
+    written: Arc<(StdMutex<u64>, Condvar)>,
+}
+
+static RUNS_PERSIST: OnceLock<RunsPersist> = OnceLock::new();
+static RUNS_PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static RUNS_PERSIST_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static RUNS_PERSIST_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn runs_persist() -> &'static RunsPersist {
+    RUNS_PERSIST.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<RunsSnapshot>();
+        let written = Arc::new((StdMutex::new(0u64), Condvar::new()));
+        let w2 = written.clone();
+        std::thread::Builder::new()
+            .name("workploy-runs-persist".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    // Coalescing: acumula tudo que chegou enquanto a última
+                    // gravação corria, por destino — última versão ganha.
+                    let mut batch = std::collections::HashMap::new();
+                    batch.insert(first.dir.clone(), first);
+                    while let Ok(next) = rx.try_recv() {
+                        batch.insert(next.dir.clone(), next);
+                    }
+                    #[cfg(test)]
+                    let delay =
+                        RUNS_PERSIST_TEST_DELAY_MS.load(RelaxedOrd::Relaxed);
+                    #[cfg(test)]
+                    if delay > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
+                    let mut max_seq = 0u64;
+                    for snap in batch.into_values() {
+                        write_runs_atomic(&snap.dir, &snap.text);
+                        max_seq = max_seq.max(snap.seq);
+                    }
+                    #[cfg(test)]
+                    {
+                        RUNS_PERSIST_WRITES.fetch_add(1, RelaxedOrd::Relaxed);
+                    }
+                    if let Ok(mut g) = w2.0.lock() {
+                        if max_seq > *g {
+                            *g = max_seq;
+                        }
+                        w2.1.notify_all();
+                    }
+                }
+            })
+            .expect("thread de persistência de runs");
+        RunsPersist { tx, written }
+    })
+}
+
+/// Gravação atômica: escreve em `.tmp` e renomeia por cima do alvo. Se o
+/// rename falhar (alvo aberto por antivírus/editor no Windows), cai para
+/// gravação direta — continua saindo de um único escritor, então não há
+/// corrupção por concorrência; perde-se apenas a atomicidade da rodada.
+fn write_runs_atomic(dir: &Path, text: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let target = dir.join("runs.json");
+    let tmp = dir.join("runs.json.tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &target).is_ok() {
+        return;
+    }
+    let _ = std::fs::write(&target, text);
+    let _ = std::fs::remove_file(&tmp);
+}
+
 pub fn save_runs(s: &Shared) {
-    write_json(data_dir().join("runs.json"), &s.runs);
+    save_runs_to_dir(&data_dir(), s);
+}
+
+pub(crate) fn save_runs_to_dir(dir: &Path, s: &Shared) {
+    // Sob lock (o caller ainda o segura): apenas serialização (CPU, mesma
+    // ordem de custo do clone de snapshot que a UI já faz). A gravação em
+    // disco acontece na thread de persistência, sem tocar o lock global.
+    if let Ok(text) = serde_json::to_string_pretty(&s.runs) {
+        let snap = RunsSnapshot {
+            dir: dir.to_path_buf(),
+            text,
+            seq: RUNS_PERSIST_SEQ.fetch_add(1, RelaxedOrd::Relaxed) + 1,
+        };
+        let _ = runs_persist().tx.send(snap);
+    }
+}
+
+/// Bloqueia até o último snapshot enfileirado estar gravado em disco (com
+/// teto de espera defensivo). Chame FORA do lock global — no fim de cada run
+/// e no encerramento do app.
+pub fn flush_runs_to_disk() {
+    let p = runs_persist();
+    let target = RUNS_PERSIST_SEQ.load(RelaxedOrd::Acquire);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut g = p.written.0.lock().unwrap();
+    while *g < target {
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        let (ng, _) = p
+            .written
+            .1
+            .wait_timeout(g, std::time::Duration::from_millis(100))
+            .unwrap();
+        g = ng;
+    }
 }
 
 pub fn save_settings_to_dir(dir: &std::path::Path, s: &Shared) {
@@ -2245,5 +2379,119 @@ mod provenance_tests {
                 imported_at: String::new()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    fn fixture_run(idx: usize, log_kb: usize) -> Run {
+        let line = "x".repeat(80);
+        let log = format!("{line}\n").repeat(log_kb * 1024 / 81 + 1);
+        Run {
+            id: format!("run-fx-{idx}"),
+            workflow_id: "wf-fx".into(),
+            workflow_name: "CI Fixture".into(),
+            status: RunStatus::Success,
+            trigger_label: "manual".into(),
+            title: format!("fixture-{idx}"),
+            number: idx as u64,
+            commit: None,
+            started_at: "18/11/2026 10:00".into(),
+            started_ts: Some(1),
+            finished_at: None,
+            steps: vec![StepRun {
+                name: "Build".into(),
+                status: StepStatus::Success,
+                log,
+                secs: 540.0,
+                substeps: vec![],
+                started_ts: Some(1),
+            }],
+            approved: false,
+            cancel_requested: false,
+            secs: 540.0,
+            actor: "maestro".into(),
+            repo_name: Some("widder/erp".into()),
+            branch: "main".into(),
+            summary: String::new(),
+            annotations: vec![],
+            vps_run_id: None,
+            vps_server_id: None,
+        }
+    }
+
+    struct ResetPersistDelay;
+    impl Drop for ResetPersistDelay {
+        fn drop(&mut self) {
+            RUNS_PERSIST_TEST_DELAY_MS.store(0, RelaxedOrd::Relaxed);
+        }
+    }
+
+    /// Com runs.json de uso real (20 runs × ~200 KB de log cada), `save_runs`
+    /// chamado sob lock não segura o lock durante o I/O de disco: a gravação
+    /// roda na thread dedicada de persistência, coalesce rajadas de saves em
+    /// poucas gravações (última versão ganha) e escreve de forma atômica; o
+    /// flush garante o estado final em disco e o formato continua legível.
+    #[test]
+    fn save_runs_writes_off_lock_atomic_coalesced_and_flushable() {
+        let _reset = ResetPersistDelay;
+        let tmp = std::env::temp_dir().join(format!("workploy-persist-{}", new_id("dir")));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let sh = Arc::new(StdMutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            for i in 0..20 {
+                s.runs.push(fixture_run(i, 200));
+            }
+        }
+
+        // 1) I/O fora do caminho do lock: worker pausado, save sob lock,
+        //    lock re-adquirível na hora e arquivo AINDA não gravado.
+        RUNS_PERSIST_TEST_DELAY_MS.store(600, RelaxedOrd::Relaxed);
+        {
+            let s = sh.lock().unwrap();
+            save_runs_to_dir(&tmp, &s);
+        }
+        assert!(
+            sh.try_lock().is_ok(),
+            "lock deve estar livre logo após save_runs (I/O de disco fora do lock)"
+        );
+        assert!(
+            !tmp.join("runs.json").exists(),
+            "a gravação deve acontecer na thread de persistência, não no caller"
+        );
+
+        // 2) Coalescing: rajada de saves vira poucas gravações e o arquivo
+        //    final carrega a ÚLTIMA versão.
+        let writes_before = RUNS_PERSIST_WRITES.load(RelaxedOrd::Relaxed);
+        for k in 0..12 {
+            let mut s = sh.lock().unwrap();
+            s.runs[0].title = format!("versao-{k}");
+            save_runs_to_dir(&tmp, &s);
+        }
+        RUNS_PERSIST_TEST_DELAY_MS.store(0, RelaxedOrd::Relaxed);
+        flush_runs_to_disk();
+
+        assert!(tmp.join("runs.json").exists());
+        let writes_delta = RUNS_PERSIST_WRITES.load(RelaxedOrd::Relaxed) - writes_before;
+        assert!(writes_delta > 0, "pelo menos uma gravação deve ocorrer");
+        assert!(
+            writes_delta < 12,
+            "rajada de 12 saves deve coalescer em menos gravações (delta={writes_delta})"
+        );
+
+        // 3) Atômico e legível no formato legado: sem .tmp sobrando e o JSON
+        //    reabre como Vec<Run> com a última versão gravada.
+        assert!(!tmp.join("runs.json.tmp").exists());
+        let back = read_json::<Vec<Run>>(tmp.join("runs.json"))
+            .expect("runs.json gravado deve reabrir no formato legado");
+        assert_eq!(back.len(), 20);
+        assert_eq!(back[0].title, "versao-11");
+        assert!(back[0].steps[0].log.len() >= 200 * 1024);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
