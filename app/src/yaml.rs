@@ -588,4 +588,41 @@ workflows:
         let err = import_yaml_multi("workflows: []\n").unwrap_err();
         assert!(err.contains("'workflows'"), "erro deve citar a lista: {err}");
     }
+
+    #[test]
+    fn oktopus_central_recipe_imports_with_parser_real() {
+        // Valida o `.workploy.yml` do monorepo Oktopus com o parser real
+        // quando o repositório irmão está disponível no disco.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("w-erp-central")
+            .join(".workploy.yml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return; // repositório irmão ausente — nada a validar
+        };
+        let list = import_yaml_multi(&text).expect("receita do Oktopus deve importar");
+        assert_eq!(list.len(), 3, "CI, Deploy e Smoke");
+        let ci = list.iter().find(|w| w.name == "CI Oktopus").unwrap();
+        assert_eq!(ci.trigger, Trigger::Push);
+        assert_eq!(ci.runner, RunnerKind::Ssh);
+        assert_eq!(ci.steps.len(), 4);
+        let deploy = list
+            .iter()
+            .find(|w| w.name == "Deploy Oktopus VPS")
+            .unwrap();
+        assert_eq!(deploy.trigger, Trigger::Manual);
+        assert_eq!(deploy.steps.len(), 3);
+        assert!(
+            deploy.steps.iter().any(|s| s.approval),
+            "rebuild de produção exige portão de aprovação"
+        );
+        // Encadeamento resolvido para o id real da receita de deploy.
+        let deploy_id = list
+            .iter()
+            .find(|w| w.name == "Deploy Oktopus VPS")
+            .map(|w| w.id.clone())
+            .unwrap();
+        assert_eq!(ci.on_success.as_deref(), Some(deploy_id.as_str()));
+    }
 }

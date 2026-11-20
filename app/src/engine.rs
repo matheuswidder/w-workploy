@@ -1012,9 +1012,12 @@ fn exec_step(
             let escaped = workdir.trim().replace('\'', "'\"'\"'");
             format!("cd '{escaped}' && {cmd}")
         };
+        let workdir_q = shell_single_quote(workdir.trim());
         let wrapped = format!(
-            "export PATH=\"$HOME/.local/share/pnpm:/usr/local/share/pnpm:$HOME/.cargo/bin:/usr/local/cargo/bin:/usr/local/bin:$PATH\"; \
+            "export HOME=\"${{HOME:-/root}}\"; \
+             export PATH=\"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/share/pnpm:/usr/local/share/pnpm:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\"; \
              if [ -d \"$HOME/.nvm/versions/node\" ]; then NVM_BIN=$(ls -d \"$HOME/.nvm/versions/node\"/*/bin 2>/dev/null | tail -n 1); [ -n \"$NVM_BIN\" ] && export PATH=\"$NVM_BIN:$PATH\"; fi; \
+             export WORKPLOY_WORKDIR='{workdir_q}'; \
              {body}"
         );
         let remote_cmd = format!(

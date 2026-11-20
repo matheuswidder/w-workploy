@@ -1014,26 +1014,39 @@ def append_step_log(run_id, step_idx, text):
             save_runs_locked()
 
 
-def _build_step_env():
+def _build_step_env(workdir="", repo="", branch=""):
     env = os.environ.copy()
-    home = env.get("HOME", "/root")
-    extra = [
+    # HOME pode não vir no ambiente do serviço (systemd) — sem ele, `~` e
+    # `$HOME/.cargo/env` quebram e o PATH perde os diretórios do usuário.
+    home = env.get("HOME") or "/root"
+    env["HOME"] = home
+    # PATH com os diretórios do sistema primeiro: `free`, `df`, `git`, `dnf` e
+    # `apt-get` vivem em /usr/bin e /bin (que pode ser symlink de /usr/bin).
+    system = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    user = [
         os.path.join(home, ".local/share/pnpm"),
         "/usr/local/share/pnpm",
         os.path.join(home, ".cargo/bin"),
         "/usr/local/cargo/bin",
-        "/usr/local/bin",
     ]
     nvm_dir = os.path.join(home, ".nvm/versions/node")
     if os.path.isdir(nvm_dir):
         try:
             vers = sorted(os.listdir(nvm_dir))
             if vers:
-                extra.insert(0, os.path.join(nvm_dir, vers[-1], "bin"))
+                user.insert(0, os.path.join(nvm_dir, vers[-1], "bin"))
         except OSError:
             pass
     cur = env.get("PATH", "")
-    env["PATH"] = ":".join([p for p in extra if p] + ([cur] if cur else []))
+    env["PATH"] = ":".join([p for p in (system + user) if p] + ([cur] if cur else []))
+    # Contexto do repositório para as receitas: a raiz real do workspace e o
+    # repo/branch disparados.
+    if workdir:
+        env["WORKPLOY_WORKDIR"] = workdir
+    if repo:
+        env["WORKPLOY_REPO"] = repo
+    if branch:
+        env["WORKPLOY_BRANCH"] = branch
     return env
 
 
@@ -1064,7 +1077,7 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
             return
 
         steps = wf.get("steps", [])
-        step_env = _build_step_env()
+        step_env = _build_step_env(workdir, repo_full_name, branch)
         for idx, step in enumerate(steps):
             with STATE_LOCK:
                 r = find_run_locked(run_id)
