@@ -300,6 +300,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                             .w_full()
                             .justify_between()
                             .center_y()
+                            .gap(12.0)
                             .child(
                                 Switch::new(st.approval)
                                     .label("Pedir aprovação antes deste passo")
@@ -313,10 +314,120 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                     .build(k)
                                     .cursor(Cursor::Pointer)
                                     .help("Pausa a execução antes deste passo e aguarda aprovação manual na aba Aprovações."),
+                            )
+                            .child(
+                                Switch::new(st.skip)
+                                    .label("Pular este passo")
+                                    .on_toggle(move |s: &mut AppState| {
+                                        if let ModalState::WorkflowEditor(d) = &mut s.modal
+                                            && let Some(st) = d.steps.get_mut(idx)
+                                        {
+                                            st.skip = !st.skip;
+                                        }
+                                    })
+                                    .build(k)
+                                    .cursor(Cursor::Pointer)
+                                    .help("Ignora este passo na execução (o fluxo continua sem ele). Útil para depurar ou rodar só parte do gate."),
                             ),
                     );
 
                 steps_col = steps_col.child(step_card);
+            }
+
+            let cpu_limit_in = TextInput::new(&draft.cpu_limit)
+                .label("Limite de vCPU (vazio = sem limite)")
+                .placeholder("2")
+                .width(Some(150.0))
+                .on_edit(|s: &mut AppState| match &mut s.modal {
+                    ModalState::WorkflowEditor(d) => &mut d.cpu_limit,
+                    _ => unreachable!(),
+                })
+                .build(k)
+                .cursor(Cursor::Text)
+                .help("Prende o passo em N núcleos (taskset) na VPS, deixando os demais livres para a produção.");
+
+            let mem_limit_in = TextInput::new(&draft.mem_limit_mb)
+                .label("Limite de RAM em MB (vazio = sem limite)")
+                .placeholder("4096")
+                .width(Some(190.0))
+                .on_edit(|s: &mut AppState| match &mut s.modal {
+                    ModalState::WorkflowEditor(d) => &mut d.mem_limit_mb,
+                    _ => unreachable!(),
+                })
+                .build(k)
+                .cursor(Cursor::Text)
+                .help("Cria um cgroup com teto de memória (systemd-run --scope). Ao estourar, o passo é encerrado com OOM claro em vez de derrubar a VPS.");
+
+            let suggestion = s.limit_suggestion_for_draft(draft);
+            let mut resources_section = col()
+                .w_full()
+                .min_w(0.0)
+                .gap(10.0)
+                .child(
+                    row()
+                        .w_full()
+                        .min_w(0.0)
+                        .gap(12.0)
+                        .flex_wrap()
+                        .child(cpu_limit_in)
+                        .child(mem_limit_in),
+                );
+            if let Some(sug) = suggestion.as_ref() {
+                let sug_cpu = sug.cpu_limit.map(|c| c.to_string()).unwrap_or_default();
+                let sug_mem = sug.mem_limit_mb.map(|m| m.to_string()).unwrap_or_default();
+                let reason = sug.reason.clone();
+                resources_section = resources_section.child(
+                    row()
+                        .key("wf-limits-suggestion")
+                        .w_full()
+                        .min_w(0.0)
+                        .px(12.0)
+                        .py(10.0)
+                        .gap(10.0)
+                        .center_y()
+                        .flex_wrap()
+                        .radius(8.0)
+                        .fill(t.accent_soft)
+                        .border(1.0, t.accent.alpha(0.38))
+                        .child(icon(&icons::INFO, 14.0).color(t.accent).a11y_hidden())
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .gap(2.0)
+                                .child(
+                                    text(format!(
+                                        "Sugestão: {} vCPU · {} MB de RAM",
+                                        sug_cpu, sug_mem
+                                    ))
+                                    .font(ty::SMALL_MED)
+                                    .color(t.text_primary),
+                                )
+                                .child(
+                                    text(reason)
+                                        .font(ty::CAPTION)
+                                        .color(t.text_secondary)
+                                        .wrap(),
+                                ),
+                        )
+                        .child(
+                            btn_neutral(
+                                t,
+                                "wf-limits-use-suggestion",
+                                "Usar sugestão",
+                                Some(&icons::CHECK_CIRCLE),
+                                28.0,
+                                move |s: &mut AppState, _| {
+                                    if let ModalState::WorkflowEditor(d) = &mut s.modal {
+                                        d.cpu_limit.replace_text(sug_cpu.clone());
+                                        d.mem_limit_mb.replace_text(sug_mem.clone());
+                                    }
+                                },
+                            )
+                            .help("Aplica a sugestão de vCPU e RAM calculada para esta VPS."),
+                        ),
+                );
             }
 
             let mut form = col()
@@ -327,6 +438,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .child(labeled(t, "Gatilho", triggers))
                 .child(binding_hint)
                 .child(labeled(t, "Pasta de trabalho (opcional)", workdir_input))
+                .child(labeled(t, "Recursos na VPS (opcional)", resources_section))
                 .child(labeled(t, "Encadear ao concluir com sucesso", chain_row))
                 .child(
                     row()
@@ -357,6 +469,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                                             )),
                                             run: rune::TextEdit::new("echo ok"),
                                             approval: false,
+                                            skip: false,
                                         });
                                     }
                                 },

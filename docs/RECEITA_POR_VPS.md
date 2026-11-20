@@ -205,7 +205,24 @@ nice -n 10 node scripts/run-package-checks.mjs --concurrency=1
 
 ---
 
-## 5. Anti-padrões (o que já quebrou em produção)
+## 5. Limites de recursos: não entupir a VPS
+
+Se a VPS também hospeda produção (o caso da `CONCEF`), a receita deve **limitar** o
+consumo de CPU e memória. A receita aceita:
+
+```yaml
+x-cpu: 2        # máximo de vCPUs por passo (taskset)
+x-mem: 4096     # teto de RAM por passo (cgroup systemd)
+```
+
+Ou ajuste pela interface: **Editar fluxo → Recursos na VPS**, com o botão
+**"Usar sugestão"** — a sugestão nasce do peso dos passos, da capacidade real da VPS
+(medida pelo diagnóstico) e do consumo medido nas execuções anteriores.
+
+Depois de rodar, o painel da execução mostra o **Consumo medido** (pico de RAM, CPU
+acumulada e aviso de OOM). Esses números realimentam a sugestão seguinte.
+
+## 6. Anti-padrões (o que já quebrou em produção)
 
 | Anti-padrão | O que aconteceu | Correção |
 |---|---|---|
@@ -220,7 +237,7 @@ nice -n 10 node scripts/run-package-checks.mjs --concurrency=1
 
 ---
 
-## 6. Onde a VPS executa cada coisa
+## 7. Onde a VPS executa cada coisa
 
 | Caminho | Significado |
 |---|---|
@@ -233,7 +250,7 @@ nice -n 10 node scripts/run-package-checks.mjs --concurrency=1
 
 ---
 
-## 7. Receitas por tipo de VPS
+## 8. Receitas por tipo de VPS
 
 | Perfil da VPS | Foco |
 |---|---|
@@ -243,7 +260,7 @@ nice -n 10 node scripts/run-package-checks.mjs --concurrency=1
 
 ---
 
-## 8. Referência rápida
+## 9. Referência rápida
 
 ```bash
 # Diagnóstico completo

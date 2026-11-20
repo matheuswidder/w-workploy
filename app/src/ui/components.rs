@@ -527,7 +527,7 @@ pub fn phase_spinner(t: UiTheme, kind: SpinnerKind, size: f32, key: impl Into<St
                             effect(mark)
                                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                                 .radius(dot * 0.5)
-                                .effect_bleed(reach + 1.0)
+                                .effect_bleed((reach + 1.0_f32).min(6.0))
                                 .effect_data([4.0, reach, period, intensity]),
                         )
                         .child(

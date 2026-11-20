@@ -602,8 +602,16 @@ fn detail_sub_menu(
                 .px(6.0)
                 .py(4.0)
                 .justify_between()
-                .child(text("Uso de cota").font(ty::CAPTION).color(t.text_muted))
-                .child(text("Ilimitado (local)").font(ty::CAPTION).color(t.success)),
+                .child(text("Branch").font(ty::CAPTION).color(t.text_muted))
+                .child(
+                    text(if run.branch.is_empty() {
+                        "main".to_string()
+                    } else {
+                        run.branch.clone()
+                    })
+                    .font(ty::CAPTION)
+                    .color(t.text_secondary),
+                ),
         );
 
     if let Some(sid) = remote_srv_id {
@@ -796,7 +804,73 @@ fn summary_view(s: &AppState, t: UiTheme, run: &Run) -> El {
             .child(meta_grid),
     ));
 
-    // 3. Interactive Job Graph
+    // 3. Consumo medido (runner da VPS): pico de RAM, CPU e OOM.
+    if let Some(m) = s.snapshot.run_metrics.get(&run.id) {
+        let mut rows = col().w_full().gap(6.0);
+        rows = rows.child(
+            row()
+                .w_full()
+                .justify_between()
+                .child(text("Pico de RAM").font(ty::CAPTION).color(t.text_muted))
+                .child(
+                    text(format!("{:.1} GB", m.peak_rss_mb as f64 / 1024.0))
+                        .font(ty::BODY_MED)
+                        .color(t.text_primary),
+                ),
+        );
+        rows = rows.child(
+            row()
+                .w_full()
+                .justify_between()
+                .child(text("CPU acumulada").font(ty::CAPTION).color(t.text_muted))
+                .child(
+                    text(model::fmt_dur(m.cpu_secs))
+                        .font(ty::BODY_MED)
+                        .color(t.text_primary),
+                ),
+        );
+        if let Some(step) = &m.oom_step {
+            rows = rows.child(
+                row()
+                    .w_full()
+                    .justify_between()
+                    .gap(8.0)
+                    .child(
+                        row()
+                            .gap(6.0)
+                            .child(icon(&icons::BUG, 12.0).color(t.danger).a11y_hidden())
+                            .child(
+                                text(format!("Limite de memória estourado em '{step}'"))
+                                    .font(ty::CAPTION)
+                                    .color(t.danger),
+                            ),
+                    ),
+            );
+        }
+        body = body.child(surface_card(
+            t,
+            "summary-metrics-card",
+            12.0,
+            col()
+                .px(18.0)
+                .py(14.0)
+                .gap(10.0)
+                .child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(icon(&icons::ACTIVITY, 14.0).color(t.accent).a11y_hidden())
+                        .child(
+                            text("Consumo medido na VPS")
+                                .font(ty::H3)
+                                .color(t.text_primary),
+                        ),
+                )
+                .child(rows),
+        ));
+    }
+
+    // 4. Grafo de jobs
     let mut graph_row = row().w_full().gap(10.0).center_y().flex_wrap();
     for (idx, step) in run.steps.iter().enumerate() {
         if idx > 0 {

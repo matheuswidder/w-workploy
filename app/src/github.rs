@@ -14,6 +14,10 @@ struct RunnerConfigPayload {
     bindings: Vec<RepoBinding>,
     workflows: Vec<Workflow>,
     purge_rule: PurgeRule,
+    /// Extras por receita (limites de CPU/RAM e passos pulados) — consumidos
+    /// pelo runner da VPS para não estourar a máquina.
+    #[serde(default)]
+    extras: std::collections::HashMap<String, WorkflowExtras>,
 }
 
 pub fn branch_matches(pattern: &str, branch: &str) -> bool {
@@ -801,6 +805,20 @@ fn finish_github_error(sh: &SharedHandle, msg: String) {
 }
 
 pub fn build_runner_config_json(settings: &Settings, workflows: &[Workflow], server_id: &str) -> Result<String, String> {
+    build_runner_config_json_with_extras(
+        settings,
+        workflows,
+        &std::collections::HashMap::new(),
+        server_id,
+    )
+}
+
+pub fn build_runner_config_json_with_extras(
+    settings: &Settings,
+    workflows: &[Workflow],
+    extras: &std::collections::HashMap<String, WorkflowExtras>,
+    server_id: &str,
+) -> Result<String, String> {
     let bindings: Vec<RepoBinding> = settings
         .repo_bindings
         .iter()
@@ -848,11 +866,23 @@ pub fn build_runner_config_json(settings: &Settings, workflows: &[Workflow], ser
         .cloned()
         .collect();
 
+    // Só os extras das receitas que realmente vão para esta VPS.
+    let selected_extras: std::collections::HashMap<String, WorkflowExtras> = selected_wfs
+        .iter()
+        .filter_map(|w| {
+            extras
+                .get(&w.id)
+                .filter(|e| !e.is_empty())
+                .map(|e| (w.id.clone(), e.clone()))
+        })
+        .collect();
+
     let payload = RunnerConfigPayload {
         poll_secs: settings.poll_secs.max(15),
         bindings,
         workflows: selected_wfs,
         purge_rule: settings.purge_rule.clone(),
+        extras: selected_extras,
     };
 
     serde_json::to_string_pretty(&payload)
@@ -876,7 +906,12 @@ pub fn sync_repo_bindings_to_vps(sh: &SharedHandle, server_id: &str) {
         let Some(srv) = s.settings.servers.iter().find(|v| v.id == server_id).cloned() else {
             return;
         };
-        let cfg = match build_runner_config_json(&s.settings, &s.workflows, server_id) {
+        let cfg = match build_runner_config_json_with_extras(
+            &s.settings,
+            &s.workflows,
+            &s.workflow_extras,
+            server_id,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 drop(s);
@@ -2724,7 +2759,7 @@ pub fn import_workflow_from_repo(sh: &SharedHandle, binding_id: &str, path: &str
         Ok(v) => v,
         Err(err) => return Some(finish_import_error(sh, binding_id, err)),
     };
-    let recipes = match crate::yaml::import_yaml_multi(&yaml_text) {
+    let recipes = match crate::yaml::import_yaml_multi_extras(&yaml_text) {
         Ok(v) => v,
         Err(err) => {
             let msg = format!(
@@ -2750,20 +2785,27 @@ pub fn import_workflow_from_repo(sh: &SharedHandle, binding_id: &str, path: &str
         let mut id_remap: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut touched_ids: Vec<String> = Vec::new();
-        for wf in recipes {
+        for wf in recipes.workflows {
             let parsed_id = wf.id.clone();
             let parsed_name_key = wf.name.to_ascii_lowercase();
+            let extras = recipes.extras.get(&parsed_id).cloned();
             match merge_repo_workflow(&mut s, &binding, wf, &source) {
                 MergeKind::Created { id, name } => {
                     id_remap.insert(parsed_id, id.clone());
                     id_remap.insert(parsed_name_key, id.clone());
                     touched_ids.push(id.clone());
+                    if let Some(e) = extras {
+                        s.workflow_extras.insert(id.clone(), e);
+                    }
                     created.push((id, name));
                 }
                 MergeKind::Updated { id, name } => {
                     id_remap.insert(parsed_id, id.clone());
                     id_remap.insert(parsed_name_key, id.clone());
                     touched_ids.push(id.clone());
+                    if let Some(e) = extras {
+                        s.workflow_extras.insert(id.clone(), e);
+                    }
                     updated.push((id, name));
                 }
                 MergeKind::Skipped { name } => skipped.push(name),

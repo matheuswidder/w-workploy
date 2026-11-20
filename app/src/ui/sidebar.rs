@@ -307,6 +307,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             y += ROW_PITCH;
 
             let show_sub_wfs = !collapsed && expanded;
+            let mut flow_ys: Vec<f32> = Vec::new();
             if show_sub_wfs {
                 for wf in s.project_workflows(b) {
                     let sub_key = format!("nav-proj-wf-{}-{}", b.id, wf.id);
@@ -341,7 +342,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                         phase_spinner(
                             t,
                             kind,
-                            14.0,
+                            13.0,
                             format!("proj-wf-phase-{}-{}", b.id, wf.id),
                         )
                     });
@@ -352,7 +353,7 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                         .checked(is_sub_sel)
                         .absolute(PILL_INSET, y)
                         .size(pill_w, SUB_ROW_H)
-                        .pl(14.0)
+                        .pl(26.0)
                         .pr(10.0)
                         .gap(7.0)
                         .center_y()
@@ -373,13 +374,13 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                             s.navigate_to(NavTarget::Runs);
                         })
                         .child(
-                            icon(icons::workflow_icon(&wf_name), 12.5)
+                            icon(icons::workflow_icon(&wf_name), 12.0)
                                 .color(ic_col)
                                 .a11y_hidden(),
                         )
                         .child(
                             text(wf_name)
-                                .font(if is_sub_sel { ty::SMALL_MED } else { ty::SMALL })
+                                .font(ty::SMALL)
                                 .color(fg_col)
                                 .grow(1.0)
                                 .shrink()
@@ -390,7 +391,32 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
                         sub_row = sub_row.child(spinner);
                     }
                     items.push(sub_row);
+                    flow_ys.push(y);
                     y += SUB_ROW_PITCH;
+                }
+            }
+
+            // Árvore do projeto: linha vertical ligando o projeto às receitas
+            // e um traço horizontal para cada receita (estilo GitHub).
+            if !flow_ys.is_empty() {
+                let line_x = PILL_INSET + 14.0;
+                let top = (y - ROW_PITCH) + ROW_H - 3.0;
+                let bottom = *flow_ys.last().unwrap_or(&top) + SUB_ROW_H * 0.5;
+                items.push(
+                    el()
+                        .key(format!("proj-tree-line-{}", b.id))
+                        .absolute(line_x, top)
+                        .size(1.0, (bottom - top).max(1.0))
+                        .fill(t.border_strong),
+                );
+                for (i, fy) in flow_ys.iter().enumerate() {
+                    items.push(
+                        el()
+                            .key(format!("proj-tree-stub-{}-{i}", b.id))
+                            .absolute(line_x, fy + SUB_ROW_H * 0.5 - 0.5)
+                            .size(11.0, 1.0)
+                            .fill(t.border_strong),
+                    );
                 }
             }
         }
@@ -626,6 +652,9 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
         .key("sidebar-nav-list")
         .w_full()
         .h(y + 4.0)
+        // O clip corta o halo dos pulsos na borda do painel: sem ele, o
+        // efeito vaza para fora da barra lateral.
+        .clip_fade(0.0, 0.0, 5.0, 0.0)
         .child(
             el().key("sidebar-selection")
                 .absolute(PILL_INSET, sel_y)
@@ -754,33 +783,6 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
             .px(12.0)
             .pb(14.0)
             .gap(10.0)
-            .child(
-                col()
-                    .key("self-hosted-badge")
-                    .w_full()
-                    .px(11.0)
-                    .py(9.0)
-                    .gap(2.0)
-                    .radius(8.0)
-                    .fill(t.surface_1)
-                    .border(1.0, t.border_subtle)
-                    .child(
-                        row()
-                            .gap(6.0)
-                            .center_y()
-                            .child(icon(&icons::CROWN, 13.0).color(t.warning))
-                            .child(
-                                text("Self-hosted · Ilimitado")
-                                    .font(TextStyle::new(12.0, 600.0).lh(16.0))
-                                    .color(t.text_primary),
-                            ),
-                    )
-                    .child(
-                        text("Minutos ilimitados · Sem fila externa")
-                            .font(TextStyle::new(10.5, 500.0).lh(14.0))
-                            .color(t.text_muted),
-                    ),
-            )
             .child(
                 row()
                     .w_full()
@@ -919,11 +921,6 @@ fn project_header_row(
     } else {
         &icons::CHEVRON_RIGHT
     };
-    let fg_col = if selected {
-        t.text_primary
-    } else {
-        t.text_secondary
-    };
     // Rótulo da seta calculado antes de mover `name` para o título.
     let chev_label = if expanded {
         format!("Recolher fluxos de {name}")
@@ -954,8 +951,9 @@ fn project_header_row(
         .on_press(on_title)
         .child(
             text(name)
-                .font(if selected { ty::BODY_MED } else { ty::BODY })
-                .color(fg_col)
+                // Projeto = título de primeiro nível: mais forte que as receitas.
+                .font(TextStyle::new(13.5, 600.0).lh(18.0))
+                .color(t.text_primary)
                 .grow(1.0)
                 .shrink()
                 .truncate()

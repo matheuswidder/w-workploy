@@ -58,6 +58,49 @@ pub struct WorkflowSource {
     pub imported_at: String,
 }
 
+/// Configuração extra de uma receita, persistida **fora** do `Workflow` para
+/// não alterar o schema já gravado em `workflows.json` (e no
+/// `/etc/workploy/config.json` da VPS): limites de CPU/RAM aplicados aos passos
+/// e nomes dos passos que devem ser pulados.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+pub struct WorkflowExtras {
+    /// Limite de vCPU (núcleos) por passo. `None` = sem limite.
+    #[serde(default)]
+    pub cpu_limit: Option<u32>,
+    /// Limite de RAM em MB por passo. `None` = sem limite.
+    #[serde(default)]
+    pub mem_limit_mb: Option<u32>,
+    /// Nomes dos passos ignorados nesta receita.
+    #[serde(default)]
+    pub skipped_steps: Vec<String>,
+}
+
+impl WorkflowExtras {
+    pub fn is_empty(&self) -> bool {
+        self.cpu_limit.is_none() && self.mem_limit_mb.is_none() && self.skipped_steps.is_empty()
+    }
+
+    pub fn skips(&self, step_name: &str) -> bool {
+        self.skipped_steps
+            .iter()
+            .any(|n| n.trim() == step_name.trim())
+    }
+}
+
+/// Consumo real de recursos medido pelo runner da VPS durante uma execução.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+pub struct RunMetrics {
+    /// CPU acumulada (segundos de CPU de todos os filhos).
+    #[serde(default)]
+    pub cpu_secs: f64,
+    /// Pico de memória residente observado (MB).
+    #[serde(default)]
+    pub peak_rss_mb: u32,
+    /// Passo encerrado pelo limite de memória (cgroup OOM).
+    #[serde(default)]
+    pub oom_step: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct Workflow {
     pub id: String,
@@ -771,6 +814,13 @@ pub struct Shared {
     pub workflows: Vec<Workflow>,
     pub runs: Vec<Run>,
     pub settings: Settings,
+    /// Extras por receita (limites de CPU/RAM e passos pulados). Vive ao lado
+    /// de `workflows` no `workflows.json` para não quebrar o schema legado.
+    #[serde(default)]
+    pub workflow_extras: std::collections::HashMap<String, WorkflowExtras>,
+    /// Métricas de consumo por execução (medidas pelo runner da VPS).
+    #[serde(default)]
+    pub run_metrics: std::collections::HashMap<String, RunMetrics>,
     #[serde(skip)]
     pub github_status: String,
     #[serde(skip)]
@@ -966,7 +1016,40 @@ fn write_json<T: Serialize>(path: PathBuf, value: &T) {
 }
 
 pub fn save_workflows(s: &Shared) {
-    write_json(data_dir().join("workflows.json"), &s.workflows);
+    write_json(data_dir().join("workflows.json"), &WorkflowsFile::from(s));
+}
+
+/// Arquivo `workflows.json`: recipes + extras. O formato legado (array puro de
+/// `Workflow`) continua abrindo — é migrado na primeira gravação.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowsFile {
+    #[serde(default)]
+    pub workflows: Vec<Workflow>,
+    #[serde(default)]
+    pub extras: std::collections::HashMap<String, WorkflowExtras>,
+}
+
+impl From<&Shared> for WorkflowsFile {
+    fn from(s: &Shared) -> Self {
+        Self {
+            workflows: s.workflows.clone(),
+            extras: s.workflow_extras.clone(),
+        }
+    }
+}
+
+/// Lê `workflows.json` aceitando o formato novo (objeto) e o legado (array).
+pub fn read_workflows_file(path: &std::path::Path) -> (Vec<Workflow>, std::collections::HashMap<String, WorkflowExtras>) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (Vec::new(), Default::default());
+    };
+    if let Ok(file) = serde_json::from_str::<WorkflowsFile>(&raw) {
+        return (file.workflows, file.extras);
+    }
+    match serde_json::from_str::<Vec<Workflow>>(&raw) {
+        Ok(list) => (list, Default::default()),
+        Err(_) => (Vec::new(), Default::default()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,11 +1213,14 @@ pub fn load_shared_from_dir(dir: &std::path::Path) -> Shared {
         .unwrap_or_default();
 
     let mut s = Shared {
-        workflows: read_json(dir.join("workflows.json")).unwrap_or_default(),
+        workflows: Vec::new(),
         runs: read_json(dir.join("runs.json")).unwrap_or_default(),
         settings: loaded_settings,
         ..Default::default()
     };
+    let (wfs, extras) = read_workflows_file(&dir.join("workflows.json"));
+    s.workflows = wfs;
+    s.workflow_extras = extras;
 
     // Migração segura: se um settings.json antigo tiver `github_token` em texto puro,
     // move o token para o Cofre do Windows e regrava o JSON sem o segredo.
@@ -1176,7 +1262,7 @@ pub fn load_shared_from_dir(dir: &std::path::Path) -> Shared {
     }
     if s.workflows.is_empty() {
         seed(&mut s);
-        write_json(dir.join("workflows.json"), &s.workflows);
+        write_json(dir.join("workflows.json"), &WorkflowsFile::from(&s));
     }
     s
 }
@@ -1629,6 +1715,139 @@ impl StepRun {
         } else {
             self.secs
         }
+    }
+}
+
+/// Peso estimado de um passo na hora de sugerir limites de recursos.
+/// Builds de container e suítes pesadas pesam mais que lint/smoke.
+pub fn step_resource_weight(run: &str) -> u32 {
+    let r = run.to_ascii_lowercase();
+    let name = r.as_str();
+    let heavy = [
+        "docker compose up",
+        "docker build",
+        "docker-compose up",
+        "build --",
+        "pnpm build",
+        "next build",
+        "cargo build",
+        "cargo test",
+    ];
+    let medium = [
+        "test",
+        "typecheck",
+        "vitest",
+        "jest",
+        "playwright",
+        "pnpm -r",
+        "run-package-checks",
+        "tsc",
+    ];
+    let light = ["install", "lint", "audit", "smoke", "curl", "git ", "echo"];
+    if heavy.iter().any(|h| name.contains(h)) {
+        3
+    } else if medium.iter().any(|m| name.contains(m)) {
+        2
+    } else if light.iter().any(|l| name.contains(l)) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Sugestão de limites de recursos para uma receita, calculada a partir do
+/// peso dos passos, da capacidade da VPS de destino e do histórico medido.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LimitSuggestion {
+    pub cpu_limit: Option<u32>,
+    pub mem_limit_mb: Option<u32>,
+    pub reason: String,
+}
+
+/// Calcula a sugestão de vCPU/RAM para uma receita.
+///
+/// Regras:
+/// - **CPU:** metade dos "núcleos-equivalentes" dos passos, arredondado para
+///   cima, com pelo menos 1 e sempre deixando **1 vCPU livre** para a VPS
+///   (produção e serviços que convivem na mesma máquina).
+/// - **RAM:** quando existe medição real (`peak_rss_mb`), usa 1,4× o pico
+///   observado (margem para picos); sem medição, estima 512 MB por
+///   núcleo-equivalente. O teto é 60% da RAM da VPS.
+pub fn suggest_workflow_limits(
+    wf: &Workflow,
+    vps: Option<&VpsProbeResult>,
+    history: &[&Run],
+    metrics: Option<&RunMetrics>,
+) -> LimitSuggestion {
+    let weight: u32 = wf.steps.iter().map(|s| step_resource_weight(&s.run)).sum();
+    let cores_equiv = weight.max(1);
+
+    let vcpu_total = vps.map(|p| p.vcpus.max(1)).unwrap_or(4);
+    let ram_total_mb = vps.map(|p| p.ram_total_mb).unwrap_or(4096);
+
+    let cpu_cap = vcpu_total.saturating_sub(1).max(1);
+    let cpu = cores_equiv.div_ceil(2).clamp(1, cpu_cap);
+
+    let mem_cap = ((ram_total_mb as f64) * 0.6) as u64;
+    let mem = match metrics {
+        Some(m) if m.peak_rss_mb > 0 => {
+            ((m.peak_rss_mb as f64) * 1.4).ceil() as u64
+        }
+        _ => (cores_equiv as u64) * 512,
+    };
+    let mem = mem.clamp(1024, mem_cap.max(1024));
+
+    let finished: Vec<&&Run> = history
+        .iter()
+        .filter(|r| !r.status.active())
+        .collect();
+    let avg_secs = if finished.is_empty() {
+        0.0
+    } else {
+        finished.iter().map(|r| r.secs.max(0.0)).sum::<f64>() / finished.len() as f64
+    };
+    let ok_pct = if finished.is_empty() {
+        0
+    } else {
+        let ok = finished
+            .iter()
+            .filter(|r| r.status == RunStatus::Success)
+            .count();
+        (ok as f64 / finished.len() as f64 * 100.0).round() as usize
+    };
+
+    let mut reason = format!(
+        "{} passo(s) com peso {} núcleo(s)-equivalente.",
+        wf.steps.len(),
+        cores_equiv
+    );
+    if let Some(m) = metrics
+        && m.peak_rss_mb > 0
+    {
+        reason.push_str(&format!(
+            " Últimas medições: pico de {:.1} GB de RAM e {:.0} s de CPU.",
+            m.peak_rss_mb as f64 / 1024.0,
+            m.cpu_secs
+        ));
+    }
+    if !finished.is_empty() {
+        reason.push_str(&format!(
+            " Histórico: {} execuções, média {} e {}% de sucesso.",
+            finished.len(),
+            fmt_dur(avg_secs),
+            ok_pct
+        ));
+    }
+    reason.push_str(&format!(
+        " A VPS tem {} vCPU e {:.1} GB de RAM — a sugestão deixa 1 vCPU e 40% de RAM livres para o resto da máquina.",
+        vcpu_total,
+        ram_total_mb as f64 / 1024.0
+    ));
+
+    LimitSuggestion {
+        cpu_limit: Some(cpu),
+        mem_limit_mb: Some(mem as u32),
+        reason,
     }
 }
 
@@ -2493,5 +2712,78 @@ mod persist_tests {
         assert!(back[0].steps[0].log.len() >= 200 * 1024);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod limit_suggestion_tests {
+    use super::*;
+
+    fn wf_with(steps: &[(&str, &str)]) -> Workflow {
+        Workflow {
+            id: "wf-sug".into(),
+            name: "CI".into(),
+            trigger: Trigger::Push,
+            runner: RunnerKind::Ssh,
+            workdir: String::new(),
+            steps: steps
+                .iter()
+                .map(|(n, r)| Step {
+                    name: (*n).into(),
+                    run: (*r).into(),
+                    approval: false,
+                })
+                .collect(),
+            on_success: None,
+            server_id: None,
+            repo_id: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn sugestao_respeita_capacidade_da_vps_e_deixa_um_vcpu_livre() {
+        let wf = wf_with(&[
+            ("Instalar", "pnpm install --frozen-lockfile"),
+            ("Testes", "node scripts/run-package-checks.mjs --concurrency=1"),
+            ("Build", "docker compose up -d --build"),
+        ]);
+        let probe = VpsProbeResult {
+            ok: true,
+            vcpus: 4,
+            ram_total_mb: 8192,
+            ..Default::default()
+        };
+        let sug = suggest_workflow_limits(&wf, Some(&probe), &[], None);
+        let cpu = sug.cpu_limit.expect("sugere cpu");
+        let mem = sug.mem_limit_mb.expect("sugere memoria");
+        assert!(cpu >= 1 && cpu <= 3, "cpu {cpu} deve deixar 1 vCPU livre");
+        assert!(mem >= 1024, "memoria mínima de 1 GB");
+        assert!(
+            mem as u64 <= (8192_f64 * 0.6) as u64,
+            "memoria {mem} não pode passar de 60% da VPS"
+        );
+        assert!(sug.reason.contains("vCPU"), "razão: {}", sug.reason);
+    }
+
+    #[test]
+    fn sugestao_usa_pico_medido_quando_existe() {
+        let wf = wf_with(&[("Testes", "pnpm test")]);
+        let probe = VpsProbeResult {
+            ok: true,
+            vcpus: 8,
+            ram_total_mb: 16384,
+            ..Default::default()
+        };
+        let metrics = RunMetrics {
+            cpu_secs: 120.0,
+            peak_rss_mb: 2048,
+            oom_step: None,
+        };
+        let sug = suggest_workflow_limits(&wf, Some(&probe), &[], Some(&metrics));
+        // 2048 MB * 1.4 = 2867 -> arredondado para cima no teto de 1 GB.
+        let mem = sug.mem_limit_mb.expect("sugere memoria");
+        assert!(mem >= 2048, "memoria sugerida {mem} deve cobrir o pico medido");
+        assert!(sug.reason.contains("medições"), "razão: {}", sug.reason);
     }
 }

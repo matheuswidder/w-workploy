@@ -821,7 +821,8 @@ pub fn scene_editor(s: &mut AppState) {
     *s = AppState::init_demo();
     s.navigate_to(NavTarget::Runs);
     if let Some(wf) = s.snapshot.workflows.get(1).cloned() {
-        let draft = WorkflowDraft::from_workflow(&wf, &mut s.next_uid);
+        let extras = workploy::model::WorkflowExtras::default();
+        let draft = WorkflowDraft::from_workflow(&wf, &extras, &mut s.next_uid);
         s.modal = ModalState::WorkflowEditor(Box::new(draft));
     }
 }

@@ -629,6 +629,11 @@ fn execute_run_inner(
     commit_sha: Option<String>,
 ) {
     let total = Instant::now();
+    // Extras da receita: limites de CPU/RAM aplicados na VPS e passos a pular.
+    let extras: crate::model::WorkflowExtras = {
+        let s = sh.lock().unwrap();
+        s.workflow_extras.get(&wf.id).cloned().unwrap_or_default()
+    };
     // Quando o destino é uma VPS com o daemon `workploy-runner` instalado e
     // ativo, delega a execução ao runner 24/7 via `POST /trigger`: o build
     // sobrevive se o desktop dormir/fechar, respeita concorrência na VPS e
@@ -715,6 +720,22 @@ fn execute_run_inner(
         if is_cancelled(&sh, &run_id) {
             finish_cancelled(&sh, &run_id, i, total.elapsed().as_secs_f64(), None);
             return;
+        }
+        // Passo marcado como "Pular" na receita: ignorado sem quebrar o fluxo.
+        if extras.skips(&step.name) {
+            update_run(&sh, &run_id, |r| {
+                if let Some(st) = r.steps.get_mut(i) {
+                    st.status = StepStatus::Skipped;
+                    st.secs = 0.0;
+                }
+            });
+            append_log(
+                &sh,
+                &run_id,
+                i,
+                "[pulado] este passo está marcado como 'Pular' na receita.\n",
+            );
+            continue;
         }
         if step.approval {
             update_run(&sh, &run_id, |r| {
@@ -905,6 +926,8 @@ fn execute_run_inner(
             &github_token,
             repo_name.as_deref(),
             branch.as_deref(),
+            extras.cpu_limit,
+            extras.mem_limit_mb,
         );
         if is_cancelled(&sh, &run_id) {
             finish_cancelled(
@@ -1000,6 +1023,8 @@ fn exec_step(
     known_token: &str,
     repo_name: Option<&str>,
     branch: Option<&str>,
+    cpu_limit: Option<u32>,
+    mem_limit_mb: Option<u32>,
 ) -> (bool, f64) {
     let start = Instant::now();
     if cmd.trim().is_empty() {
@@ -1010,15 +1035,42 @@ fn exec_step(
     if runner == RunnerKind::Ssh
         && let Some(srv) = target_server
     {
-        let body = if workdir.trim().is_empty() {
-            cmd.to_string()
-        } else {
-            let escaped = workdir.trim().replace('\'', "'\"'\"'");
-            format!("cd '{escaped}' && {cmd}")
-        };
         let workdir_q = shell_single_quote(workdir.trim());
         let repo_q = shell_single_quote(repo_name.unwrap_or("").trim());
         let branch_q = shell_single_quote(branch.unwrap_or("").trim());
+        let inner_q = shell_single_quote(cmd);
+        // Limites de recursos na VPS:
+        //  - `taskset` prende o passo em N vCPUs (deixa os demais para a
+        //    produção que convive na máquina);
+        //  - `systemd-run --scope` cria um cgroup com teto de memória, o que
+        //    dá um OOM previsível em vez de o servidor inteiro trocar.
+        let mut limits_desc: Vec<String> = Vec::new();
+        let mut limits_setup = String::new();
+        if let Some(cores) = cpu_limit.filter(|c| *c > 0) {
+            limits_setup.push_str(&format!("export WORKPLOY_CPU_LIMIT={cores}; "));
+            limits_desc.push(format!("{cores} vCPU"));
+        }
+        if let Some(mb) = mem_limit_mb.filter(|m| *m > 0) {
+            limits_setup.push_str(&format!("export WORKPLOY_MEM_LIMIT_MB={mb}; "));
+            limits_desc.push(format!("{mb} MB RAM"));
+        }
+        let limits_apply = if limits_setup.is_empty() {
+            String::new()
+        } else {
+            "CPUS_TOTAL=$(nproc 2>/dev/null || echo 1); LIMCPU=''; \
+             if [ -n \"${WORKPLOY_CPU_LIMIT:-}\" ] && [ \"$CPUS_TOTAL\" -gt \"$WORKPLOY_CPU_LIMIT\" ]; then LIMCPU=\"taskset -c 0-$((WORKPLOY_CPU_LIMIT-1))\"; fi; \
+             LIMMEM=''; if [ -n \"${WORKPLOY_MEM_LIMIT_MB:-}\" ] && command -v systemd-run >/dev/null 2>&1; then LIMMEM=\"systemd-run --scope --quiet -p MemoryMax=${WORKPLOY_MEM_LIMIT_MB}M --\"; fi; \
+             "
+                .to_string()
+        };
+        let cd_part = if workdir.trim().is_empty() {
+            String::new()
+        } else {
+            format!("cd {workdir_q} && ")
+        };
+        let body = format!(
+            "{cd_part}{limits_setup}{limits_apply}$LIMCPU $LIMMEM /bin/bash -lc {inner_q}"
+        );
         let wrapped = format!(
             "export HOME=\"${{HOME:-/root}}\"; \
              export PATH=\"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/share/pnpm:/usr/local/share/pnpm:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\"; \
@@ -1028,6 +1080,17 @@ fn exec_step(
              export WORKPLOY_BRANCH='{branch_q}'; \
              {body}"
         );
+        if !limits_desc.is_empty() {
+            append_log(
+                sh,
+                run_id,
+                idx,
+                &format!(
+                    "[limites] aplicado neste passo: {}\n",
+                    limits_desc.join(" · ")
+                ),
+            );
+        }
         let remote_cmd = format!(
             "if [ -x /bin/bash ]; then /bin/bash -lc {}; else sh -c {}; fi",
             shell_single_quote(&wrapped),
@@ -2681,4 +2744,39 @@ mod tests {
         cancel(&sh, &other_wf_run);
         cancel(&sh, &second_main);
     }
+
+    #[test]
+    fn skipped_step_is_not_executed_and_flow_continues() {
+        let sh: SharedHandle = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = sh.lock().unwrap();
+            let mut wf = echo_workflow("wf-skip", false, None);
+            wf.steps[0].name = "Preparo".into();
+            wf.steps.push(Step {
+                name: "Rodar".into(),
+                run: "echo rodou".into(),
+                approval: false,
+            });
+            s.workflows.push(wf);
+            s.workflow_extras.insert(
+                "wf-skip".into(),
+                crate::model::WorkflowExtras {
+                    skipped_steps: vec!["Preparo".into()],
+                    ..Default::default()
+                },
+            );
+        }
+        let rid = start_run(&sh, "wf-skip", "teste").expect("run criada");
+        assert!(
+            wait_status(&sh, &rid, RunStatus::Success, 20_000),
+            "fluxo com passo pulado deve concluir"
+        );
+        let s = sh.lock().unwrap();
+        let r = s.runs.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.steps[0].status, StepStatus::Skipped);
+        assert!(r.steps[0].log.contains("pulado"), "log: {}", r.steps[0].log);
+        assert_eq!(r.steps[1].status, StepStatus::Success);
+        assert!(r.steps[1].log.contains("rodou"));
+    }
 }
+

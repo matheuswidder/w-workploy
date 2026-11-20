@@ -92,6 +92,9 @@ O passo a passo completo, incluindo onde o Workploy procura os ymls e um exemplo
 | **Workflows encadeados e Aprovações** | Executa etapas em sequência com portões manuais (`approval: true` / `x-approval: true` na aba **Aprovações**) e encadeamento (`on_success` / `x-chain`) no padrão **CI -> Portão de Aprovação -> Deploy VPS**. |
 | **Multi-VPS via SSH e Telemetria** | Autentica por chave **Ed25519** (gerador integrado via `ssh-keygen`), alias do `~/.ssh/config` ou senha via `SSH_ASKPASS`. A sonda SSH coleta sistema operacional, arquitetura, vCPU, RAM, disco e ferramentas (`Git`, `Docker`, `Node`, `pnpm`, `Rust`, `workploy-runner`). |
 | **Conexão GitHub e Cofre** | Salva o PAT e segredos no Cofre do Windows (`Windows Credential Manager`) ou no cofre local do Linux protegido com permissão `0600`. |
+| **Limites de recursos por receita** | Define teto de **vCPU** (`taskset`) e **RAM** (`systemd-run --scope`, OOM controlado) por passo, com **sugestão automática** calculada a partir da capacidade real da VPS e do consumo medido nas execuções anteriores. |
+| **Pular passos** | Cada passo do editor tem o interruptor **"Pular este passo"** (`x-skip: true` no YAML): o fluxo continua sem ele. |
+| **Consumo medido (KPIs)** | O runner da VPS mede pico de RAM e CPU de cada execução e mostra em *Resumo da execução → Consumo medido*, alimentando a próxima sugestão de limites. |
 | **Regra de Limpeza (Purge)** | Remove workspaces antigos, caches de build (`target`, `node_modules`, `.next`, `.turbo`, `.parcel-cache`, `.cache`, `dist`, `build`) e cache/imagens do Docker por limite de execuções ou teto em **MB/GB**. |
 | **Bandeja do sistema e auto-update** | Minimiza para a bandeja do sistema e baixa/aplica atualizações integradas pela aba **Sobre** no Windows (`.exe`) e no Linux (`.tar.gz`). |
 

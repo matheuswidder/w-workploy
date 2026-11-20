@@ -1014,6 +1014,48 @@ def append_step_log(run_id, step_idx, text):
             save_runs_locked()
 
 
+def _limit_prefix(cpu_limit, mem_limit_mb):
+    """Comandos de shell que aplicam os limites de recursos do Workploy.
+
+    CPU: `taskset` fixa o processo em N nucleos (deixa os demais livres para a
+    producao que convive na mesma VPS).
+    RAM: `systemd-run --scope` cria um cgroup com MemoryMax (limite real de
+    memoria, com OOM previsivel); sem systemd, cai para `ulimit -v`.
+    """
+    parts = []
+    if cpu_limit and int(cpu_limit) > 0:
+        cores = int(cpu_limit)
+        try:
+            total = os.cpu_count() or cores
+        except Exception:
+            total = cores
+        if cores < total and shutil.which("taskset"):
+            parts.append(f"taskset -c 0-{cores - 1}")
+    if mem_limit_mb and int(mem_limit_mb) > 0:
+        mb = int(mem_limit_mb)
+        if shutil.which("systemd-run"):
+            parts.append(f"systemd-run --scope --quiet -p MemoryMax={mb}M --")
+        else:
+            parts.append(f"bash -c 'ulimit -v {mb * 1024}; exec \"$0\"'")
+    return parts
+
+
+def _apply_limits(cmd, cpu_limit, mem_limit_mb):
+    parts = _limit_prefix(cpu_limit, mem_limit_mb)
+    if not parts:
+        return cmd
+    return " ".join(parts) + " " + cmd
+
+
+def _measure_children():
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return usage.ru_utime + usage.ru_stime, int(usage.ru_maxrss / 1024)
+    except Exception:
+        return 0.0, 0
+
+
 def _build_step_env(workdir="", repo="", branch=""):
     env = os.environ.copy()
     # HOME pode não vir no ambiente do serviço (systemd) — sem ele, `~` e
@@ -1078,6 +1120,21 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
 
         steps = wf.get("steps", [])
         step_env = _build_step_env(workdir, repo_full_name, branch)
+        extras = wf.get("extras") or {}
+        if not extras:
+            try:
+                extras = (load_config().get("extras") or {}).get(wf.get("id"), {}) or {}
+            except Exception:
+                extras = {}
+        skipped = [str(s) for s in (extras.get("skipped_steps") or [])]
+        cpu_limit = extras.get("cpu_limit")
+        mem_limit_mb = extras.get("mem_limit_mb")
+        limits_desc = []
+        if cpu_limit:
+            limits_desc.append(f"{cpu_limit} vCPU")
+        if mem_limit_mb:
+            limits_desc.append(f"{mem_limit_mb} MB RAM")
+        metrics = {"cpu_secs": 0.0, "peak_rss_mb": 0, "oom_step": None}
         for idx, step in enumerate(steps):
             with STATE_LOCK:
                 r = find_run_locked(run_id)
@@ -1091,6 +1148,17 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
                                 st["status"] = "Skipped"
                         save_runs_locked()
                     return
+
+            step_name = step.get("name", "")
+            if skipped and step_name in skipped:
+                with STATE_LOCK:
+                    r = find_run_locked(run_id)
+                    if r:
+                        r["steps"][idx]["status"] = "Skipped"
+                        r["steps"][idx]["secs"] = 0.0
+                        save_runs_locked()
+                append_step_log(run_id, idx, "[pulado] este passo está marcado como 'Pular' na receita.\n")
+                continue
 
             if step.get("approval"):
                 with STATE_LOCK:
@@ -1134,12 +1202,20 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
                 append_step_log(run_id, idx, "[passo sem comando — nada a fazer]\n")
             else:
                 shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+                limited_cmd = _apply_limits(cmd, cpu_limit, mem_limit_mb)
+                if limits_desc:
+                    append_step_log(
+                        run_id,
+                        idx,
+                        "[limites] aplicado neste passo: " + " · ".join(limits_desc) + "\n",
+                    )
+                cpu_before, _rss_before = _measure_children()
                 # start_new_session: o comando ganha seu próprio grupo de
                 # processos, permitindo matar shell + subprocessos de uma vez
                 # no cancelamento (sem isso, filhos como cargo/node sobrevivem
                 # órfãos à morte do shell).
                 proc = subprocess.Popen(
-                    [shell_bin, "-lc", cmd],
+                    [shell_bin, "-lc", limited_cmd],
                     cwd=workdir,
                     env=step_env,
                     stdout=subprocess.PIPE,
@@ -1182,10 +1258,21 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
                 t_pump.join(timeout=2)
                 with STATE_LOCK:
                     PROCESSES.pop(run_id, None)
+                cpu_after, rss_after = _measure_children()
+                metrics["cpu_secs"] = round(metrics["cpu_secs"] + max(0.0, cpu_after - cpu_before), 2)
+                metrics["peak_rss_mb"] = max(metrics["peak_rss_mb"], rss_after)
                 ok = (not cancelled) and (proc.returncode == 0)
                 if cancelled:
                     append_step_log(run_id, idx, "[cancelado pelo usuário]\n")
                 elif not ok:
+                    # 137 / -9 com limite de memoria = cgroup OOM.
+                    if mem_limit_mb and (proc.returncode in (137, -9, 9)):
+                        metrics["oom_step"] = step_name
+                        append_step_log(
+                            run_id,
+                            idx,
+                            f"[limite de memória] o passo ultrapassou o teto de {mem_limit_mb} MB e foi encerrado pelo sistema.\n",
+                        )
                     append_step_log(run_id, idx, "[passo falhou — o fluxo para aqui]\n")
 
             s_secs = time.monotonic() - s_start
@@ -1207,6 +1294,7 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
                 final_sub_status = "Success" if ok else "Failed"
                 _finalize_running_substep(run_id, idx, r["steps"][idx], final_sub_status)
                 r["steps"][idx]["status"] = final_sub_status
+                r["metrics"] = dict(metrics)
                 if not ok:
                     headline, anns = _diagnose_failure(r["steps"][idx].get("name", "Passo"), r["steps"][idx].get("log", ""))
                     r["annotations"] = r.get("annotations", []) + anns
@@ -1221,14 +1309,18 @@ def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
                     return
                 save_runs_locked()
 
+        usage_line = f"- Consumo: {metrics['peak_rss_mb']} MB de pico de RAM · {metrics['cpu_secs']:.0f} s de CPU"
+        if metrics.get("oom_step"):
+            usage_line += f" · OOM no passo '{metrics['oom_step']}'"
         with STATE_LOCK:
             r = find_run_locked(run_id)
             if r:
                 r["status"] = "Success"
                 r["finished_at"] = now_str()
                 r["secs"] = time.monotonic() - t_start
+                r["metrics"] = dict(metrics)
                 if not r.get("summary"):
-                    r["summary"] = f"# {r.get('workflow_name', 'Fluxo')} concluído com sucesso\n- Etapas concluídas: {len(steps)}/{len(steps)}\n"
+                    r["summary"] = f"# {r.get('workflow_name', 'Fluxo')} concluído com sucesso\n- Etapas concluídas: {len(steps)}/{len(steps)}\n{usage_line}\n"
                 save_runs_locked()
 
         next_id = wf.get("on_success")
@@ -1574,6 +1666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": "invalid_json"})
             wf_id = body.get("workflow_id", "")
             inline_wf = body.get("workflow") if isinstance(body.get("workflow"), dict) else None
+            inline_extras = body.get("extras") if isinstance(body.get("extras"), dict) else {}
             cfg = load_config()
             target_wf = None
             for w in cfg.get("workflows", []):
@@ -1581,9 +1674,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     target_wf = w
                     break
             if inline_wf is not None:
-                target_wf = inline_wf
+                target_wf = dict(inline_wf)
             if target_wf is None:
                 return self.send_json(404, {"error": "workflow_not_found"})
+            extras = (cfg.get("extras") or {}).get(wf_id, {}) or {}
+            if not extras and isinstance(inline_extras, dict):
+                extras = inline_extras.get(wf_id, {}) or {}
+            target_wf["extras"] = extras
             commit_sha = (body.get("commit_sha") or "").strip()
             commit_msg = (body.get("commit_msg") or body.get("trigger_label") or "manual").strip()
             commit_info = (commit_sha, commit_msg) if commit_sha else None
@@ -2018,7 +2115,13 @@ pub fn trigger_vps_run(
     // atualizados para que `on_success` continue funcionando 24/7 na VPS.
     let (cfg_opt, gh_tok_opt) = {
         let s = sh.lock().unwrap();
-        let cfg = crate::github::build_runner_config_json(&s.settings, &s.workflows, &server.id).ok();
+        let cfg = crate::github::build_runner_config_json_with_extras(
+            &s.settings,
+            &s.workflows,
+            &s.workflow_extras,
+            &server.id,
+        )
+        .ok();
         let needs_tok = crate::github::server_needs_github_token(&s.settings, &server.id);
         let tok = if needs_tok {
             if !s.settings.github_token.trim().is_empty() {
@@ -2041,9 +2144,17 @@ pub fn trigger_vps_run(
     }
 
     let port = runner_http_port(server);
+    let extras_for_wf = {
+        let s = sh.lock().unwrap();
+        s.workflow_extras.get(&wf.id).cloned()
+    };
     let payload = serde_json::json!({
         "workflow_id": wf.id,
         "workflow": wf,
+        "extras": match extras_for_wf {
+            Some(e) => serde_json::json!({ wf.id.clone(): e }),
+            None => serde_json::json!({}),
+        },
         "trigger_label": trigger_label,
         "repo": repo.unwrap_or(""),
         "branch": branch.unwrap_or("main"),
@@ -2103,6 +2214,31 @@ pub fn trigger_vps_run(
     })
 }
 
+/// Converte a resposta `/runs` do runner em execuções + métricas de consumo.
+/// O runner devolve um array de runs; cada run pode trazer um objeto
+/// `metrics` (medido pelo próprio daemon) que o `Run` do Rust ignora.
+pub fn parse_runs_with_metrics(
+    stdout: &str,
+) -> (Vec<Run>, std::collections::HashMap<String, RunMetrics>) {
+    let mut runs = Vec::new();
+    let mut metrics = std::collections::HashMap::new();
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
+        return (runs, metrics);
+    };
+    for value in values {
+        let Ok(run) = serde_json::from_value::<Run>(value.clone()) else {
+            continue;
+        };
+        if let Some(m) = value.get("metrics")
+            && let Ok(parsed) = serde_json::from_value::<RunMetrics>(m.clone())
+        {
+            metrics.insert(run.id.clone(), parsed);
+        }
+        runs.push(run);
+    }
+    (runs, metrics)
+}
+
 pub fn sync_vps_runs_blocking_silent(sh: &SharedHandle, server: &VpsServer) -> bool {
     let port = runner_http_port(server);
     let cmd = format!(
@@ -2111,12 +2247,16 @@ pub fn sync_vps_runs_blocking_silent(sh: &SharedHandle, server: &VpsServer) -> b
     let Ok((true, stdout, _)) = ssh_run_capture(server, &cmd) else {
         return false;
     };
-    let Ok(remote_runs) = serde_json::from_str::<Vec<Run>>(&stdout) else {
+    let (remote_runs, metrics) = parse_runs_with_metrics(&stdout);
+    if remote_runs.is_empty() {
         return false;
-    };
+    }
     {
         let mut s = sh.lock().unwrap();
         merge_remote_runs(&mut s.runs, remote_runs, &server.id);
+        for (id, m) in metrics {
+            s.run_metrics.insert(id, m);
+        }
         save_runs(&s);
     }
     engine::notify(sh);
@@ -2199,16 +2339,17 @@ pub fn sync_vps_runs(sh: &SharedHandle, server_id: &str) {
             "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/runs'"
         );
         let msg = match ssh_run_capture(&server, &cmd) {
-            Ok((true, stdout, _)) => match serde_json::from_str::<Vec<Run>>(&stdout) {
-                Ok(remote_runs) => {
-                    let count = remote_runs.len();
-                    let mut s = sh2.lock().unwrap();
-                    merge_remote_runs(&mut s.runs, remote_runs, &server.id);
-                    save_runs(&s);
-                    format!("Sincronizadas {count} execuções de '{}'.", server.name)
+            Ok((true, stdout, _)) => {
+                let (remote_runs, metrics) = parse_runs_with_metrics(&stdout);
+                let count = remote_runs.len();
+                let mut s = sh2.lock().unwrap();
+                merge_remote_runs(&mut s.runs, remote_runs, &server.id);
+                for (id, m) in metrics {
+                    s.run_metrics.insert(id, m);
                 }
-                Err(e) => format!("Resposta inválida do runner em '{}': {e}", server.name),
-            },
+                save_runs(&s);
+                format!("Sincronizadas {count} execuções de '{}'.", server.name)
+            }
             Ok((false, _, stderr)) => {
                 format!(
                     "Não foi possível consultar execuções de '{}': {}",

@@ -29,6 +29,12 @@ fn is_block_scalar_indicator(raw: &str) -> Option<bool> {
 }
 
 pub fn export_yaml(wf: &Workflow) -> String {
+    export_yaml_with_extras(wf, &WorkflowExtras::default())
+}
+
+/// Serializa a receita incluindo os extras: `x-cpu` / `x-mem` no topo e
+/// `x-skip: true` nos passos marcados para pular.
+pub fn export_yaml_with_extras(wf: &Workflow, extras: &WorkflowExtras) -> String {
     let on = match wf.trigger {
         Trigger::Push => "push",
         Trigger::Manual | Trigger::Folder => "workflow_dispatch",
@@ -40,6 +46,12 @@ pub fn export_yaml(wf: &Workflow) -> String {
     let mut out = format!("name: {}\non: [{}]\n", wf.name, on);
     if !wf.workdir.trim().is_empty() {
         out.push_str(&format!("workdir: {}\n", wf.workdir.trim()));
+    }
+    if let Some(c) = extras.cpu_limit {
+        out.push_str(&format!("x-cpu: {c}\n"));
+    }
+    if let Some(m) = extras.mem_limit_mb {
+        out.push_str(&format!("x-mem: {m}\n"));
     }
     out.push_str(&format!("\njobs:\n  build:\n    runs-on: {runner}\n    steps:\n"));
     for s in &wf.steps {
@@ -55,6 +67,9 @@ pub fn export_yaml(wf: &Workflow) -> String {
         if s.approval {
             out.push_str("        x-approval: true\n");
         }
+        if extras.skips(&s.name) {
+            out.push_str("        x-skip: true\n");
+        }
     }
     if let Some(next) = &wf.on_success {
         out.push_str(&format!("x-chain: {next}\n"));
@@ -68,6 +83,7 @@ pub fn export_yaml(wf: &Workflow) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_key(
     cur: &mut Option<Step>,
     rest: &str,
@@ -75,6 +91,7 @@ fn apply_key(
     block_indent: &mut usize,
     block_content_indent: &mut Option<usize>,
     block_folded: &mut bool,
+    pending_skip: &mut bool,
     raw_line: &str,
 ) {
     let Some(step) = cur.as_mut() else { return };
@@ -95,10 +112,18 @@ fn apply_key(
         .or_else(|| rest.strip_prefix("approval:"))
     {
         step.approval = unquote_scalar(v).eq_ignore_ascii_case("true");
+    } else if let Some(v) = rest
+        .strip_prefix("x-skip:")
+        .or_else(|| rest.strip_prefix("skip:"))
+    {
+        *pending_skip = unquote_scalar(v).eq_ignore_ascii_case("true");
     }
 }
 
-fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Option<String>), String> {
+fn parse_yaml_with_symbolic_id(
+    text: &str,
+    id: String,
+) -> Result<(Workflow, Option<String>, WorkflowExtras), String> {
     let mut name = String::from("Fluxo importado");
     let mut symbolic_id: Option<String> = None;
     let mut trigger = Trigger::Manual;
@@ -107,8 +132,12 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
     let mut on_success = None;
     let mut server_id = None;
     let mut repo_id = None;
+    let mut cpu_limit: Option<u32> = None;
+    let mut mem_limit_mb: Option<u32> = None;
+    let mut skipped_steps: Vec<String> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
     let mut cur: Option<Step> = None;
+    let mut pending_skip = false;
 
     let mut in_run_block = false;
     let mut block_indent = 0usize;
@@ -176,8 +205,12 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
 
         if trimmed.starts_with("- ") || trimmed == "-" {
             if let Some(s) = cur.take() {
+                if pending_skip && !s.name.trim().is_empty() {
+                    skipped_steps.push(s.name.trim().to_string());
+                }
                 steps.push(s);
             }
+            pending_skip = false;
             cur = Some(Step {
                 name: String::new(),
                 run: String::new(),
@@ -192,6 +225,7 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
                     &mut block_indent,
                     &mut block_content_indent,
                     &mut block_folded,
+                    &mut pending_skip,
                     line,
                 );
             }
@@ -277,6 +311,25 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
             }
             continue;
         }
+        if let Some(v) = trimmed
+            .strip_prefix("x-cpu:")
+            .or_else(|| trimmed.strip_prefix("cpu_limit:"))
+        {
+            if let Ok(n) = unquote_scalar(v).parse::<u32>() {
+                cpu_limit = (n > 0).then_some(n);
+            }
+            continue;
+        }
+        if let Some(v) = trimmed
+            .strip_prefix("x-mem:")
+            .or_else(|| trimmed.strip_prefix("x-memory:")
+                .or_else(|| trimmed.strip_prefix("mem_limit_mb:")))
+        {
+            if let Ok(n) = unquote_scalar(v).parse::<u32>() {
+                mem_limit_mb = (n > 0).then_some(n);
+            }
+            continue;
+        }
         if cur.is_some() {
             apply_key(
                 &mut cur,
@@ -285,6 +338,7 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
                 &mut block_indent,
                 &mut block_content_indent,
                 &mut block_folded,
+                &mut pending_skip,
                 line,
             );
         }
@@ -294,6 +348,9 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
         finish_run_block(&mut cur, block_folded);
     }
     if let Some(s) = cur.take() {
+        if pending_skip && !s.name.trim().is_empty() {
+            skipped_steps.push(s.name.trim().to_string());
+        }
         steps.push(s);
     }
     if steps.is_empty() {
@@ -318,11 +375,25 @@ fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Opti
             source: None,
         },
         symbolic_id,
+        WorkflowExtras {
+            cpu_limit,
+            mem_limit_mb,
+            skipped_steps,
+        },
     ))
 }
 
 pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
-    parse_yaml_with_symbolic_id(text, id).map(|(wf, _)| wf)
+    parse_yaml_with_symbolic_id(text, id).map(|(wf, _, _)| wf)
+}
+
+/// Importa uma receita e devolve também os extras (limites de CPU/RAM e
+/// passos marcados como "pular").
+pub fn import_yaml_with_extras(
+    text: &str,
+    id: String,
+) -> Result<(Workflow, WorkflowExtras), String> {
+    parse_yaml_with_symbolic_id(text, id).map(|(wf, _, extras)| (wf, extras))
 }
 
 /// Importa um YAML que pode ser uma receita única (formato clássico) ou um
@@ -349,15 +420,19 @@ pub fn import_yaml_multi(text: &str) -> Result<Vec<Workflow>, String> {
     }
     let mut out = Vec::with_capacity(items.len());
     let mut ref_to_id: HashMap<String, String> = HashMap::new();
+    let mut extras_by_id: HashMap<String, WorkflowExtras> = HashMap::new();
 
     for (idx, item) in items.iter().enumerate() {
-        let (wf, sym_id) = parse_yaml_with_symbolic_id(item, new_id("wf")).map_err(|e| {
+        let (wf, sym_id, extras) = parse_yaml_with_symbolic_id(item, new_id("wf")).map_err(|e| {
             format!("Receita {} da lista 'workflows' é inválida: {e}", idx + 1)
         })?;
         if let Some(sym) = sym_id {
             ref_to_id.insert(sym, wf.id.clone());
         }
         ref_to_id.insert(wf.name.to_ascii_lowercase(), wf.id.clone());
+        if !extras.is_empty() {
+            extras_by_id.insert(wf.id.clone(), extras);
+        }
         out.push(wf);
     }
 
@@ -372,6 +447,73 @@ pub fn import_yaml_multi(text: &str) -> Result<Vec<Workflow>, String> {
     }
 
     Ok(out)
+}
+
+/// Receitas importadas com seus extras (limites e passos pulados), indexados
+/// pelo id real de cada receita.
+#[derive(Debug, Default)]
+pub struct ImportedRecipes {
+    pub workflows: Vec<Workflow>,
+    pub extras: HashMap<String, WorkflowExtras>,
+}
+
+/// Igual a [`import_yaml_multi`], mas devolve também os extras de cada receita.
+pub fn import_yaml_multi_extras(text: &str) -> Result<ImportedRecipes, String> {
+    let is_list_doc = text.lines().any(|l| {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        let has_indent = l.len() > l.trim_start().len();
+        !has_indent && trimmed.starts_with("workflows:")
+    });
+    if !is_list_doc {
+        let (wf, extras) = import_yaml_with_extras(text, new_id("wf"))?;
+        let mut map = HashMap::new();
+        if !extras.is_empty() {
+            map.insert(wf.id.clone(), extras);
+        }
+        return Ok(ImportedRecipes {
+            workflows: vec![wf],
+            extras: map,
+        });
+    }
+    let items = split_workflow_list_items(text);
+    if items.is_empty() {
+        return Err("Nenhuma receita encontrada na lista 'workflows'.".into());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    let mut ref_to_id: HashMap<String, String> = HashMap::new();
+    let mut extras_by_id: HashMap<String, WorkflowExtras> = HashMap::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        let (wf, sym_id, extras) = parse_yaml_with_symbolic_id(item, new_id("wf")).map_err(|e| {
+            format!("Receita {} da lista 'workflows' é inválida: {e}", idx + 1)
+        })?;
+        if let Some(sym) = sym_id {
+            ref_to_id.insert(sym, wf.id.clone());
+        }
+        ref_to_id.insert(wf.name.to_ascii_lowercase(), wf.id.clone());
+        if !extras.is_empty() {
+            extras_by_id.insert(wf.id.clone(), extras);
+        }
+        out.push(wf);
+    }
+
+    for wf in &mut out {
+        if let Some(target) = &wf.on_success
+            && let Some(resolved) = ref_to_id
+                .get(target)
+                .or_else(|| ref_to_id.get(&target.to_ascii_lowercase()))
+        {
+            wf.on_success = Some(resolved.clone());
+        }
+    }
+
+    Ok(ImportedRecipes {
+        workflows: out,
+        extras: extras_by_id,
+    })
 }
 
 /// Coluna da primeira chave de um item de lista (`"  - name:"` → 4).
@@ -591,8 +733,6 @@ workflows:
 
     #[test]
     fn oktopus_central_recipe_imports_with_parser_real() {
-        // Valida o `.workploy.yml` do monorepo Oktopus com o parser real
-        // quando o repositório irmão está disponível no disco.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -624,5 +764,53 @@ workflows:
             .map(|w| w.id.clone())
             .unwrap();
         assert_eq!(ci.on_success.as_deref(), Some(deploy_id.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod extras_tests {
+    use super::*;
+
+    const DOC: &str = "\
+name: CI com limites
+on: [push]
+x-cpu: 2
+x-mem: 4096
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Instalar
+        run: pnpm install
+      - name: Testes pesados
+        run: pnpm test
+        x-skip: true
+      - name: Deploy
+        run: docker compose up -d
+";
+
+    #[test]
+    fn importa_limites_e_passos_pulados() {
+        let (wf, extras) = import_yaml_with_extras(DOC, "wf-x".into()).unwrap();
+        assert_eq!(extras.cpu_limit, Some(2));
+        assert_eq!(extras.mem_limit_mb, Some(4096));
+        assert_eq!(extras.skipped_steps, vec!["Testes pesados".to_string()]);
+        assert!(extras.skips("Testes pesados"));
+        assert!(!extras.skips("Instalar"));
+        assert_eq!(wf.steps.len(), 3);
+    }
+
+    #[test]
+    fn exporta_limites_e_passos_pulados() {
+        let (wf, extras) = import_yaml_with_extras(DOC, "wf-x".into()).unwrap();
+        let text = export_yaml_with_extras(&wf, &extras);
+        assert!(text.contains("x-cpu: 2"), "{text}");
+        assert!(text.contains("x-mem: 4096"), "{text}");
+        assert!(text.contains("x-skip: true"), "{text}");
+        // Ida e volta preserva os limites.
+        let (_, back) = import_yaml_with_extras(&text, "wf-y".into()).unwrap();
+        assert_eq!(back.cpu_limit, Some(2));
+        assert_eq!(back.mem_limit_mb, Some(4096));
+        assert_eq!(back.skipped_steps.len(), 1);
     }
 }

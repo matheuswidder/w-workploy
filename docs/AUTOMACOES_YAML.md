@@ -571,3 +571,64 @@ disponíveis na máquina.
 
 Detalhes, checklist e tabela de anti-padrões em
 [`RECEITA_POR_VPS.md`](RECEITA_POR_VPS.md).
+
+---
+
+## 9. Limites de recursos e passos pulados
+
+Uma receita pode **limitar os recursos** consumidos na VPS (para não
+estourar uma máquina que também hospeda produção) e **pular passos**.
+
+### 9.1 Limites de CPU e RAM
+
+```yaml
+name: CI Oktopus
+on: [push]
+x-cpu: 2        # prende o passo em 2 vCPUs (taskset)
+x-mem: 4096     # teto de 4 GB de RAM por passo (cgroup systemd)
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Suítes
+        run: pnpm test
+```
+
+| Campo | Efeito na VPS | Implementação |
+|---|---|---|
+| `x-cpu: N` | O passo roda apenas em `N` núcleos; os demais ficam livres para a produção. | `taskset -c 0-(N-1)` (só aplica se a VPS tiver mais núcleos que o limite). |
+| `x-mem: MB` | O passo é encerrado se passar do teto — OOM controlado, sem derrubar a VPS. | `systemd-run --scope -p MemoryMax=MB` (fallback: `ulimit -v`). |
+
+Os limites também podem ser ajustados pela interface: **Editar fluxo → Recursos na VPS**.
+O Workploy **sugere** valores a partir do peso dos passos, da capacidade real da VPS
+de destino (medida pelo diagnóstico) e do histórico medido das execuções — você aceita
+ou edita como preferir.
+
+### 9.2 Pular passos
+
+```yaml
+      - name: Testes de navegador
+        run: pnpm test:e2e
+        x-skip: true      # ignorado nesta execução
+```
+
+Na interface, cada passo do editor tem o interruptor **"Pular este passo"**. Passos
+pulados aparecem como *Ignorado* na linha do tempo e **não quebram o fluxo** — os
+demais continuam rodando normalmente.
+
+> O YAML exportado pelo app mantém `x-skip: true` e `x-cpu`/`x-mem`, então o arquivo
+> continua sendo a fonte da verdade de verdade.
+
+### 9.3 Consumo medido (KPIs)
+
+Depois de rodar na VPS, o runner mede o consumo real de cada execução
+(pico de RAM pela cgroup e CPU acumulada) e o Workploy mostra em **Resumo da execução →
+Consumo medido na VPS**:
+
+- **Pico de RAM** — o maior consumo de memória do passo mais pesado.
+- **CPU acumulada** — total de segundos de CPU consumidos.
+- **Aviso de OOM** — quando o passo estourou o limite de memória configurado.
+
+Esses números alimentam a próxima sugestão de limites: quanto maior o pico medido,
+maior a margem sugerida.

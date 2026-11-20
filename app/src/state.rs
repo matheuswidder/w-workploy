@@ -176,6 +176,8 @@ pub struct StepDraft {
     pub name: TextEdit,
     pub run: TextEdit,
     pub approval: bool,
+    /// Passo marcado para ser pulado na execução.
+    pub skip: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +189,10 @@ pub struct WorkflowDraft {
     pub workdir: TextEdit,
     pub on_success: Option<String>,
     pub steps: Vec<StepDraft>,
+    /// Limite de vCPU aplicado aos passos na VPS (vazio = sem limite).
+    pub cpu_limit: TextEdit,
+    /// Limite de RAM em MB aplicado aos passos na VPS (vazio = sem limite).
+    pub mem_limit_mb: TextEdit,
     pub error: Option<String>,
 }
 
@@ -203,6 +209,7 @@ impl WorkflowDraft {
                     name: TextEdit::new(*name),
                     run: TextEdit::new(*cmd),
                     approval: false,
+                    skip: false,
                 }
             })
             .collect();
@@ -223,12 +230,19 @@ impl WorkflowDraft {
                 name: TextEdit::new("Build e testes"),
                 run: TextEdit::new("echo Executando build... && echo Tudo certo"),
                 approval: false,
+                skip: false,
             }],
+            cpu_limit: TextEdit::new(""),
+            mem_limit_mb: TextEdit::new(""),
             error: None,
         }
     }
 
-    pub fn from_workflow(wf: &Workflow, next_uid: &mut u64) -> Self {
+    pub fn from_workflow(
+        wf: &Workflow,
+        extras: &model::WorkflowExtras,
+        next_uid: &mut u64,
+    ) -> Self {
         let steps = wf
             .steps
             .iter()
@@ -239,6 +253,7 @@ impl WorkflowDraft {
                     name: TextEdit::new(st.name.clone()),
                     run: TextEdit::new(st.run.clone()),
                     approval: st.approval,
+                    skip: extras.skips(&st.name),
                 }
             })
             .collect();
@@ -250,6 +265,18 @@ impl WorkflowDraft {
             workdir: TextEdit::new(wf.workdir.clone()),
             on_success: wf.on_success.clone(),
             steps,
+            cpu_limit: TextEdit::new(
+                extras
+                    .cpu_limit
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            mem_limit_mb: TextEdit::new(
+                extras
+                    .mem_limit_mb
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
+            ),
             error: None,
         }
     }
@@ -3308,7 +3335,13 @@ impl AppState {
     pub fn open_edit_workflow_modal(&mut self, wf_id: &str) {
         self.open_select = None;
         if let Some(wf) = self.snapshot.workflows.iter().find(|w| w.id == wf_id).cloned() {
-            let draft = WorkflowDraft::from_workflow(&wf, &mut self.next_uid);
+            let extras = self
+                .snapshot
+                .workflow_extras
+                .get(&wf.id)
+                .cloned()
+                .unwrap_or_default();
+            let draft = WorkflowDraft::from_workflow(&wf, &extras, &mut self.next_uid);
             self.modal = ModalState::WorkflowEditor(Box::new(draft));
         }
     }
@@ -3318,7 +3351,14 @@ impl AppState {
         let (id, name, content) = match wf_id
             .and_then(|id| self.snapshot.workflows.iter().find(|w| w.id == id))
         {
-            Some(wf) => (Some(wf.id.clone()), wf.name.clone(), yaml::export_yaml(wf)),
+            Some(wf) => {
+                let extras = self.snapshot.workflow_extras.get(&wf.id).cloned();
+                (
+                    Some(wf.id.clone()),
+                    wf.name.clone(),
+                    yaml::export_yaml_with_extras(wf, &extras.unwrap_or_default()),
+                )
+            }
             None => (
                 None,
                 "Novo fluxo".into(),
@@ -3383,11 +3423,18 @@ impl AppState {
             source: existing_wf.and_then(|w| w.source),
         };
         let wf_id = wf.id.clone();
+        let extras = Self::build_extras_from_draft(draft);
+        let extras_for_wf = extras.clone();
         if self.demo_mode {
             if let Some(existing) = self.snapshot.workflows.iter_mut().find(|w| w.id == wf_id) {
                 *existing = wf;
             } else {
                 self.snapshot.workflows.push(wf);
+            }
+            if extras_for_wf.is_empty() {
+                self.snapshot.workflow_extras.remove(&wf_id);
+            } else {
+                self.snapshot.workflow_extras.insert(wf_id.clone(), extras_for_wf);
             }
         } else {
             let installed_servers: Vec<String> = {
@@ -3396,6 +3443,11 @@ impl AppState {
                     *existing = wf;
                 } else {
                     guard.workflows.push(wf);
+                }
+                if extras_for_wf.is_empty() {
+                    guard.workflow_extras.remove(&wf_id);
+                } else {
+                    guard.workflow_extras.insert(wf_id.clone(), extras_for_wf);
                 }
                 model::save_workflows(&guard);
                 guard
@@ -3425,6 +3477,120 @@ impl AppState {
         );
     }
 
+    /// Sugestão de limites (vCPU/RAM) para a receita em edição, calculada com
+    /// a capacidade da VPS de destino e o histórico medido.
+    pub fn limit_suggestion_for_draft(
+        &self,
+        draft: &WorkflowDraft,
+    ) -> Option<model::LimitSuggestion> {
+        let steps: Vec<model::Step> = draft
+            .steps
+            .iter()
+            .filter(|st| !st.skip)
+            .map(|st| model::Step {
+                name: st.name.text.trim().to_string(),
+                run: st.run.text.clone(),
+                approval: st.approval,
+            })
+            .collect();
+        if steps.is_empty() {
+            return None;
+        }
+        let wf = model::Workflow {
+            id: draft.id.clone().unwrap_or_default(),
+            name: draft.name.text.trim().to_string(),
+            trigger: draft.trigger,
+            runner: draft.runner,
+            workdir: draft.workdir.text.trim().to_string(),
+            steps,
+            on_success: None,
+            server_id: None,
+            repo_id: None,
+            source: None,
+        };
+        let server_id = draft
+            .id
+            .as_ref()
+            .and_then(|id| self.snapshot.workflows.iter().find(|w| &w.id == id))
+            .and_then(|w| w.server_id.clone())
+            .or_else(|| {
+                self.selected_project_id.as_ref().and_then(|pid| {
+                    self.snapshot
+                        .settings
+                        .repo_bindings
+                        .iter()
+                        .find(|b| &b.id == pid)
+                        .and_then(|b| b.target_server_id.clone())
+                })
+            })
+            .or_else(|| {
+                self.snapshot
+                    .settings
+                    .servers
+                    .iter()
+                    .find(|s| s.runner_installed)
+                    .map(|s| s.id.clone())
+            })
+            .or_else(|| self.snapshot.settings.servers.first().map(|s| s.id.clone()));
+        let probe = server_id
+            .as_ref()
+            .and_then(|sid| self.snapshot.settings.servers.iter().find(|s| &s.id == sid))
+            .and_then(|s| s.last_probe.as_ref());
+        let history: Vec<&model::Run> = draft
+            .id
+            .as_ref()
+            .map(|id| {
+                self.snapshot
+                    .runs
+                    .iter()
+                    .filter(|r| &r.workflow_id == id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let metrics = self
+            .snapshot
+            .run_metrics
+            .values()
+            .max_by(|a, b| a.peak_rss_mb.cmp(&b.peak_rss_mb));
+        Some(model::suggest_workflow_limits(
+            &wf,
+            probe,
+            &history,
+            metrics,
+        ))
+    }
+
+    /// Monta os extras (limites de CPU/RAM e passos pulados) a partir do rascunho
+    /// do editor de fluxo.
+    pub fn build_extras_from_draft(draft: &WorkflowDraft) -> model::WorkflowExtras {
+        let cpu_limit = draft
+            .cpu_limit
+            .text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v > 0);
+        let mem_limit_mb = draft
+            .mem_limit_mb
+            .text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v > 0);
+        let skipped_steps = draft
+            .steps
+            .iter()
+            .filter(|st| st.skip)
+            .map(|st| st.name.text.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect::<Vec<_>>();
+        model::WorkflowExtras {
+            cpu_limit,
+            mem_limit_mb,
+            skipped_steps,
+        }
+    }
+
     pub fn apply_yaml_draft(&mut self, tx: &mut Tx) {
         let ModalState::YamlModal(draft) = &mut self.modal else {
             return;
@@ -3433,8 +3599,8 @@ impl AppState {
             .wf_id
             .clone()
             .unwrap_or_else(|| model::new_id("wf"));
-        match yaml::import_yaml(&draft.edit.text, target_id.clone()) {
-            Ok(mut wf) => {
+        match yaml::import_yaml_with_extras(&draft.edit.text, target_id.clone()) {
+            Ok((mut wf, mut extras)) => {
                 if let Some(existing) = draft
                     .wf_id
                     .as_deref()
@@ -3452,6 +3618,11 @@ impl AppState {
                     if wf.source.is_none() {
                         wf.source = existing.source.clone();
                     }
+                    if extras.is_empty()
+                        && let Some(prev) = self.snapshot.workflow_extras.get(existing.id.as_str())
+                    {
+                        extras = prev.clone();
+                    }
                 }
                 let wf_name = wf.name.clone();
                 if self.demo_mode {
@@ -3462,12 +3633,22 @@ impl AppState {
                     } else {
                         self.snapshot.workflows.push(wf);
                     }
+                    if extras.is_empty() {
+                        self.snapshot.workflow_extras.remove(&target_id);
+                    } else {
+                        self.snapshot.workflow_extras.insert(target_id.clone(), extras);
+                    }
                 } else {
                     let mut guard = self.shared.lock().unwrap();
                     if let Some(existing) = guard.workflows.iter_mut().find(|w| w.id == target_id) {
                         *existing = wf;
                     } else {
                         guard.workflows.push(wf);
+                    }
+                    if extras.is_empty() {
+                        guard.workflow_extras.remove(&target_id);
+                    } else {
+                        guard.workflow_extras.insert(target_id.clone(), extras);
                     }
                     model::save_workflows(&guard);
                     self.snapshot = guard.clone();

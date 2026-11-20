@@ -1950,7 +1950,6 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
                     .color(t.text_muted),
             ),
     );
-
     if matching_bindings.is_empty() {
         let empty_msg = match w.trigger {
             model::Trigger::Manual => "Somente execução manual ou por encadeamento.",
@@ -2001,6 +2000,34 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         if dest_warn { t.warning } else { t.accent },
         if dest_warn { t.warning_bg } else { t.accent_soft },
     ));
+
+    // Limites de recursos e passos pulados configurados na receita.
+    let extras = s.snapshot.workflow_extras.get(&w.id).cloned();
+    if let Some(ex) = extras.as_ref() {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(c) = ex.cpu_limit {
+            parts.push(format!("{c} vCPU"));
+        }
+        if let Some(m) = ex.mem_limit_mb {
+            parts.push(format!("{} MB RAM", m));
+        }
+        if !parts.is_empty() {
+            triggers_row = triggers_row.child(pill_badge(
+                t,
+                &format!("Limites: {}", parts.join(" · ")),
+                t.success,
+                t.success_bg,
+            ));
+        }
+        if !ex.skipped_steps.is_empty() {
+            triggers_row = triggers_row.child(pill_badge(
+                t,
+                &format!("{} passo(s) pulado(s)", ex.skipped_steps.len()),
+                t.warning,
+                t.warning_bg,
+            ));
+        }
+    }
 
     // Receita importada do repo: linha compacta de proveniência
     // (repo · caminho · SHA curto) com "Atualizar do repo" ao lado.
