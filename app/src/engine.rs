@@ -903,6 +903,8 @@ fn execute_run_inner(
             &workdir,
             &step.run,
             &github_token,
+            repo_name.as_deref(),
+            branch.as_deref(),
         );
         if is_cancelled(&sh, &run_id) {
             finish_cancelled(
@@ -996,6 +998,8 @@ fn exec_step(
     workdir: &str,
     cmd: &str,
     known_token: &str,
+    repo_name: Option<&str>,
+    branch: Option<&str>,
 ) -> (bool, f64) {
     let start = Instant::now();
     if cmd.trim().is_empty() {
@@ -1013,11 +1017,15 @@ fn exec_step(
             format!("cd '{escaped}' && {cmd}")
         };
         let workdir_q = shell_single_quote(workdir.trim());
+        let repo_q = shell_single_quote(repo_name.unwrap_or("").trim());
+        let branch_q = shell_single_quote(branch.unwrap_or("").trim());
         let wrapped = format!(
             "export HOME=\"${{HOME:-/root}}\"; \
              export PATH=\"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/share/pnpm:/usr/local/share/pnpm:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH\"; \
              if [ -d \"$HOME/.nvm/versions/node\" ]; then NVM_BIN=$(ls -d \"$HOME/.nvm/versions/node\"/*/bin 2>/dev/null | tail -n 1); [ -n \"$NVM_BIN\" ] && export PATH=\"$NVM_BIN:$PATH\"; fi; \
              export WORKPLOY_WORKDIR='{workdir_q}'; \
+             export WORKPLOY_REPO='{repo_q}'; \
+             export WORKPLOY_BRANCH='{branch_q}'; \
              {body}"
         );
         let remote_cmd = format!(

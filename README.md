@@ -54,6 +54,23 @@ Para configurar pipelines avançados, consulte o guia completo em [`docs/AUTOMAC
 - Tabela de **requisitos estimados por tipo de projeto** (Node/Next.js monorepo, Rust/Cargo e Docker Compose) e dicas de diagnóstico para deploys em subpastas como `infra/api` ou `infra/web`.
 - Exemplos prontos para copiar, encadeamento (`on_success` / `x-chain`) e portões de aprovação.
 
+## Escrevendo a receita pensando na VPS que vai rodar
+
+A receita **não roda onde você escreveu**: ela roda na máquina escolhida no **Vínculo**.
+O guia [`docs/RECEITA_POR_VPS.md`](docs/RECEITA_POR_VPS.md) é o contrato entre a receita
+e a VPS de destino:
+
+- **O ambiente que o Workploy garante** (`HOME`, `PATH` com `/usr/bin` primeiro, e as variáveis `WORKPLOY_WORKDIR`, `WORKPLOY_REPO` e `WORKPLOY_BRANCH`).
+- **O que a receita precisa garantir sozinha**: ferramentas ausentes, gerenciador de pacotes (Debian × RHEL) e raiz do código.
+- **Preflight da VPS** — rode [`scripts/vps-preflight.sh`](scripts/vps-preflight.sh) na máquina de destino e leia o relatório (SO, `HOME`/`PATH`, ferramentas, Docker, navegador, versão do runner e raízes de código disponíveis) **antes** de escrever a receita.
+- **Os 5 padrões** que evitam a maioria das falhas: normalizar `HOME`/`PATH`, resolver a raiz do repo dinamicamente, instalar o navegador por detecção de SO, verificar as ferramentas após instalar e usar `nice` em VPS que hospeda produção.
+- **Checklist** de validação e **tabela de anti-padrões** com o que já quebrou em produção.
+
+```bash
+# Diagnóstico completo da VPS de destino
+ssh <alias-vps> 'bash -s' < scripts/vps-preflight.sh
+```
+
 ## Importar do repositório em 4 passos
 
 Mantenha as receitas versionadas no próprio repo e trate o arquivo commitado como fonte da verdade:

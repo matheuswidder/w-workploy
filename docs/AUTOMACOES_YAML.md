@@ -2,6 +2,12 @@
 
 Este guia explica como criar, estruturar, importar e diagnosticar automações `.yml` no Workploy v0.1.12.
 
+> **Antes de escrever a receita, leia [`RECEITA_POR_VPS.md`](RECEITA_POR_VPS.md).**
+> A receita roda na VPS escolhida no vínculo, não na sua máquina: o guia traz o
+> contrato de ambiente (`HOME`, `PATH`, `WORKPLOY_WORKDIR`), o **preflight** para
+> diagnosticar a VPS de destino (`scripts/vps-preflight.sh`) e os padrões de
+> portabilidade entre Debian e RHEL.
+
 ## 1. Conceito central: Receita vs. Vínculo
 
 O Workploy separa o fluxo em duas partes independentes para que você reaproveite a mesma receita em projetos e servidores diferentes.
@@ -471,3 +477,97 @@ Monorepos costumam guardar arquivos Compose e Dockerfiles em subpastas como `inf
 2. **Acompanhar Jobs, Sub-etapas e Live Logs:** abra a execução em andamento para expandir cada job e suas sub-etapas (`::workploy-substep::`). Os logs rolam automaticamente (`stick_bottom`) acompanhando a linha mais recente e a sub-etapa ativa.
 3. **Conferir commits e filtrar por branch:** use o seletor de **Branch** em **Execuções** e o botão **Ver commits** para consultar os commits recentes via API do GitHub (SHA abreviado, mensagem, autor e data).
 4. **Liberar portões de aprovação:** passos com `approval: true` ou `x-approval: true` geram um cartão destacado em âmbar na aba **Aprovações**. Revise o resumo ou os logs e clique em **Aprovar e continuar** ou **Rejeitar**.
+
+---
+
+## 8. Ambiente do passo: o contrato com a VPS
+
+Cada passo executado numa VPS recebe um ambiente padronizado pelo Workploy:
+
+| Variável | Conteúdo | Motivo |
+|---|---|---|
+| `HOME` | `/root` (ou o `HOME` do serviço) | Sem `HOME`, `~` e `$HOME/.cargo/env` quebram. |
+| `PATH` | `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` primeiro, depois `~/.local/share/pnpm`, `/usr/local/share/pnpm`, `~/.cargo/bin`, `/usr/local/cargo/bin`, e o `PATH` herdado | `git`, `curl`, `dnf`/`apt-get`, `docker`, `node` e `pnpm` sempre resolvidos. |
+| `WORKPLOY_WORKDIR` | Raiz do workspace do runner ou o `workdir` da receita | A receita encontra o código sem chutar caminho. |
+| `WORKPLOY_REPO` | `dono/repo` do vínculo | Provenance nos logs. |
+| `WORKPLOY_BRANCH` | Branch monitorada | Provenance nos logs. |
+
+### 8.1 Template de recipe portátil (Debian × RHEL)
+
+```yaml
+name: CI e Deploy (portátil)
+on: [push]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: "Preparar ambiente"
+        run: |
+          set -e
+          export HOME="${HOME:-/root}"
+          export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+          echo "::workploy-substep::Ambiente"
+          cat /etc/os-release 2>/dev/null | head -2 || true
+          node --version; pnpm --version; git --version
+
+          echo "::workploy-substep::Navegador (se a suíte usar)"
+          BROWSER=""
+          for c in google-chrome google-chrome-stable chromium chromium-browser; do
+            command -v "$c" >/dev/null 2>&1 && { BROWSER="$(command -v "$c")"; break; }
+          done
+          if [ -z "$BROWSER" ]; then
+            SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+            if command -v dnf >/dev/null 2>&1; then
+              curl -fsSL -o /tmp/chrome.rpm https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+              $SUDO dnf install -y /tmp/chrome.rpm; rm -f /tmp/chrome.rpm
+            elif command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+              $SUDO apt-get install -y /tmp/chrome.deb; rm -f /tmp/chrome.deb
+            fi
+            for c in google-chrome google-chrome-stable chromium chromium-browser; do
+              command -v "$c" >/dev/null 2>&1 && { BROWSER="$(command -v "$c")"; break; }
+            done
+          fi
+          [ -z "$BROWSER" ] && { echo "ERRO: sem navegador." >&2; exit 1; }
+          export CHROME_PATH="$BROWSER"
+
+      - name: "Rodar os testes"
+        run: |
+          set -e
+          export HOME="${HOME:-/root}"
+          export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+          export CI=1
+          export CHROME_PATH="${CHROME_PATH:-$(command -v google-chrome || command -v chromium || true)}"
+
+          REPO_ROOT=""
+          if [ -n "${WORKPLOY_WORKDIR:-}" ] && [ -f "$WORKPLOY_WORKDIR/package.json" ]; then
+            REPO_ROOT="$WORKPLOY_WORKDIR"
+          elif [ -d /root/Projects/meu-repo ]; then
+            REPO_ROOT="/root/Projects/meu-repo"
+          else
+            echo "ERRO: raiz do repositório não encontrada." >&2; exit 1
+          fi
+          cd "$REPO_ROOT"
+
+          pnpm install --frozen-lockfile
+          nice -n 10 pnpm typecheck
+          nice -n 10 node scripts/run-package-checks.mjs --concurrency=1
+```
+
+### 8.2 Diagnóstico da VPS de destino
+
+Rode o preflight **antes** de escrever a receita:
+
+```bash
+ssh <alias-vps> 'bash -s' < scripts/vps-preflight.sh
+```
+
+O relatório detalha SO, gerenciador de pacotes, `HOME`/`PATH` herdados, ferramentas,
+Docker + plugin compose, navegador, versão do `workploy-runner` e as raízes de código
+disponíveis na máquina.
+
+Detalhes, checklist e tabela de anti-padrões em
+[`RECEITA_POR_VPS.md`](RECEITA_POR_VPS.md).
