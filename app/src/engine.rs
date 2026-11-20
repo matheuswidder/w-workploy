@@ -339,6 +339,10 @@ pub fn start_run_for_binding(
         (b, s.workflows.clone(), s.settings.repo_bindings.clone())
     };
     let wf_ids = matching_workflows_for_binding_with_bindings(&workflows, &binding, &all_bindings);
+    let primary_branch = crate::github::expand_branch_targets(&binding.branch, "main")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "main".into());
     let mut first_run_id = None;
     for wf_id in wf_ids {
         if let Some(rid) = start_run_with_target(
@@ -348,7 +352,7 @@ pub fn start_run_for_binding(
             None,
             binding.target_server_id.clone(),
             Some(binding.full_name.clone()),
-            Some(binding.branch.clone()),
+            Some(primary_branch.clone()),
         ) && first_run_id.is_none()
         {
             first_run_id = Some(rid);
@@ -575,7 +579,8 @@ fn run_vps_sync_step(
             Ok(success) => success,
             Err(e) => {
                 let masked = mask_secrets_in_log(&e, &[known_token]);
-                append_log(sh, run_id, 0, &format!("[erro SSH] {masked}\n"));
+                let human = crate::diagnostic::humanize_transport_error(&masked);
+                append_log(sh, run_id, 0, &format!("[erro SSH] {human}\n"));
                 false
             }
         }
@@ -624,6 +629,87 @@ fn execute_run_inner(
     commit_sha: Option<String>,
 ) {
     let total = Instant::now();
+    // Quando o destino é uma VPS com o daemon `workploy-runner` instalado e
+    // ativo, delega a execução ao runner 24/7 via `POST /trigger`: o build
+    // sobrevive se o desktop dormir/fechar, respeita concorrência na VPS e
+    // o desktop acompanha logs e sub-etapas ao vivo via auto-sync. Se o
+    // daemon não responder, cai de forma transparente para SSH streaming direto.
+    let daemon_candidate = {
+        let s = sh.lock().unwrap();
+        let override_sid = target_server_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|x| !x.is_empty());
+        let trigger_label = s
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .map(|r| r.trigger_label.clone())
+            .unwrap_or_else(|| "manual".to_string());
+        if let Some(sid) = override_sid {
+            s.settings
+                .servers
+                .iter()
+                .find(|v| v.id == sid)
+                .filter(|v| v.runner_installed && !v.host.trim().is_empty())
+                .map(|v| (v.clone(), trigger_label))
+        } else if wf.runner == RunnerKind::Ssh {
+            wf.server_id
+                .as_ref()
+                .and_then(|sid| s.settings.servers.iter().find(|v| &v.id == sid))
+                .filter(|v| v.runner_installed && !v.host.trim().is_empty())
+                .map(|v| (v.clone(), trigger_label))
+        } else {
+            None
+        }
+    };
+    if let Some((srv, trig_lbl)) = daemon_candidate
+        && !wf.steps.is_empty()
+    {
+        append_log(
+            &sh,
+            &run_id,
+            0,
+            &format!(
+                "[workploy-runner] enviando execução para o daemon 24/7 em '{}'...\n",
+                srv.name
+            ),
+        );
+        match vps::trigger_vps_run(
+            &sh,
+            &srv,
+            &wf,
+            &trig_lbl,
+            repo_name.as_deref(),
+            branch.as_deref(),
+            commit_sha.as_deref(),
+        ) {
+            Ok(remote_run) => {
+                update_run(&sh, &run_id, |r| {
+                    r.vps_run_id = Some(remote_run.id.clone());
+                    r.vps_server_id = Some(srv.id.clone());
+                    r.actor = "workploy-runner".into();
+                    r.status = remote_run.status;
+                    r.number = remote_run.number;
+                    if !remote_run.steps.is_empty() {
+                        r.steps = remote_run.steps;
+                    }
+                });
+                return;
+            }
+            Err(err) => {
+                append_log(
+                    &sh,
+                    &run_id,
+                    0,
+                    &format!(
+                        "[aviso] daemon workploy-runner indisponível ({err}) — executando via SSH direto...\n"
+                    ),
+                );
+            }
+        }
+    }
+
     let mut synced_vps_workdir: Option<String> = None;
     for (i, step) in wf.steps.iter().enumerate() {
         if is_cancelled(&sh, &run_id) {
@@ -704,6 +790,53 @@ fn execute_run_inner(
             }
         };
         if runner == RunnerKind::Ssh
+            && target_server.is_none()
+            && ssh_host.trim().is_empty()
+        {
+            append_log(
+                &sh,
+                &run_id,
+                i,
+                "[erro de configuração] Este fluxo exige execução em VPS (self-hosted), mas nenhuma VPS está configurada no vínculo do projeto ou no fluxo. Selecione a VPS em Configurações → GitHub → Vínculo.\n",
+            );
+            update_run(&sh, &run_id, |r| {
+                if let Some(st) = r.steps.get_mut(i) {
+                    finalize_step_substeps(st, StepStatus::Failed);
+                    st.status = StepStatus::Failed;
+                    let (_headline, anns) = crate::diagnostic::diagnose_step_failure(st);
+                    r.annotations.extend(anns);
+                }
+                r.status = RunStatus::Failed;
+                r.finished_at = Some(now_str());
+                r.secs = total.elapsed().as_secs_f64();
+                for st in r.steps.iter_mut().skip(i + 1) {
+                    if st.status == StepStatus::Pending {
+                        st.status = StepStatus::Skipped;
+                    }
+                }
+                r.summary = crate::diagnostic::build_run_summary(r, "VPS não configurada");
+            });
+            return;
+        }
+        let step_server_label = target_server
+            .as_ref()
+            .map(|srv| srv.name.clone())
+            .unwrap_or_else(|| {
+                if runner == RunnerKind::Ssh {
+                    ssh_host.clone()
+                } else {
+                    "Local (Esta máquina)".to_string()
+                }
+            });
+        if let Some(srv) = target_server.as_ref() {
+            let sid = srv.id.clone();
+            update_run(&sh, &run_id, |r| {
+                if r.vps_server_id.is_none() {
+                    r.vps_server_id = Some(sid);
+                }
+            });
+        }
+        if runner == RunnerKind::Ssh
             && let Some(srv) = target_server.as_ref()
             && let Some(repo) = repo_name.as_deref().map(str::trim).filter(|s| !s.is_empty())
             && wf.workdir.trim().is_empty()
@@ -722,7 +855,7 @@ fn execute_run_inner(
                         &sh,
                         &run_id,
                         0,
-                        &format!("[git sync] preparando workspace {effective_wd}...\n"),
+                        &format!("[git sync] preparando workspace {effective_wd} em '{}'...\n", srv.name),
                     );
                     let (sync_ok, cancelled, sync_secs) =
                         run_vps_sync_step(&sh, &run_id, srv, &sync_cmd, &github_token);
@@ -741,6 +874,8 @@ fn execute_run_inner(
                             if let Some(st) = r.steps.get_mut(0) {
                                 st.secs = sync_secs;
                                 st.status = StepStatus::Failed;
+                                let (_headline, anns) = crate::diagnostic::diagnose_step_failure(st);
+                                r.annotations.extend(anns);
                             }
                             r.status = RunStatus::Failed;
                             r.finished_at = Some(now_str());
@@ -750,6 +885,7 @@ fn execute_run_inner(
                                     st.status = StepStatus::Skipped;
                                 }
                             }
+                            r.summary = crate::diagnostic::build_run_summary(r, &step_server_label);
                         });
                         return;
                     }
@@ -788,6 +924,10 @@ fn execute_run_inner(
                 };
                 finalize_step_substeps(st, final_status);
                 st.status = final_status;
+                if !ok {
+                    let (_headline, anns) = crate::diagnostic::diagnose_step_failure(st);
+                    r.annotations.extend(anns);
+                }
             }
             if !ok {
                 r.status = RunStatus::Failed;
@@ -798,16 +938,37 @@ fn execute_run_inner(
                         st.status = StepStatus::Skipped;
                     }
                 }
+                r.summary = crate::diagnostic::build_run_summary(r, &step_server_label);
             }
         });
         if !ok {
             return;
         }
     }
+    let final_server_label = {
+        let s = sh.lock().unwrap();
+        let override_sid = target_server_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|x| !x.is_empty());
+        let sid = override_sid.or(wf.server_id.as_deref());
+        sid.and_then(|id| s.settings.servers.iter().find(|v| v.id == id))
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| {
+                if wf.runner == RunnerKind::Ssh {
+                    "VPS via SSH".to_string()
+                } else {
+                    "Local (Esta máquina)".to_string()
+                }
+            })
+    };
     update_run(&sh, &run_id, |r| {
         r.status = RunStatus::Success;
         r.finished_at = Some(now_str());
         r.secs = total.elapsed().as_secs_f64();
+        if r.summary.is_empty() {
+            r.summary = crate::diagnostic::build_run_summary(r, &final_server_label);
+        }
     });
     if let Some(next) = &wf.on_success
         && next != &wf.id
@@ -845,12 +1006,22 @@ fn exec_step(
     if runner == RunnerKind::Ssh
         && let Some(srv) = target_server
     {
-        let remote_cmd = if workdir.trim().is_empty() {
+        let body = if workdir.trim().is_empty() {
             cmd.to_string()
         } else {
             let escaped = workdir.trim().replace('\'', "'\"'\"'");
             format!("cd '{escaped}' && {cmd}")
         };
+        let wrapped = format!(
+            "export PATH=\"$HOME/.local/share/pnpm:/usr/local/share/pnpm:$HOME/.cargo/bin:/usr/local/cargo/bin:/usr/local/bin:$PATH\"; \
+             if [ -d \"$HOME/.nvm/versions/node\" ]; then NVM_BIN=$(ls -d \"$HOME/.nvm/versions/node\"/*/bin 2>/dev/null | tail -n 1); [ -n \"$NVM_BIN\" ] && export PATH=\"$NVM_BIN:$PATH\"; fi; \
+             {body}"
+        );
+        let remote_cmd = format!(
+            "if [ -x /bin/bash ]; then /bin/bash -lc {}; else sh -c {}; fi",
+            shell_single_quote(&wrapped),
+            shell_single_quote(&wrapped)
+        );
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let done_flag = Arc::new(AtomicBool::new(false));
         let ok = std::thread::scope(|scope| {
@@ -874,7 +1045,8 @@ fn exec_step(
                 Ok(success) => success,
                 Err(e) => {
                     let masked = mask_secrets_in_log(&e, &[known_token]);
-                    append_log(sh, run_id, idx, &format!("[erro SSH] {masked}\n"));
+                    let human = crate::diagnostic::humanize_transport_error(&masked);
+                    append_log(sh, run_id, idx, &format!("[erro SSH] {human}\n"));
                     false
                 }
             }
@@ -1065,13 +1237,32 @@ pub fn matching_workflows_for_binding_with_bindings(
     {
         return vec![wid.clone()];
     }
-    let by_repo: Vec<String> = workflows
+    let by_repo_wfs: Vec<&Workflow> = workflows
         .iter()
         .filter(|w| w.repo_id.as_deref() == Some(binding.id.as_str()))
-        .map(|w| w.id.clone())
         .collect();
-    if !by_repo.is_empty() {
-        return by_repo;
+    if !by_repo_wfs.is_empty() {
+        let push_wfs: Vec<String> = by_repo_wfs
+            .iter()
+            .filter(|w| w.trigger == Trigger::Push)
+            .map(|w| w.id.clone())
+            .collect();
+        if !push_wfs.is_empty() {
+            return push_wfs;
+        }
+        let chained_targets: std::collections::HashSet<&str> = by_repo_wfs
+            .iter()
+            .filter_map(|w| w.on_success.as_deref())
+            .collect();
+        let roots: Vec<String> = by_repo_wfs
+            .iter()
+            .filter(|w| !chained_targets.contains(w.id.as_str()))
+            .map(|w| w.id.clone())
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+        return by_repo_wfs.into_iter().map(|w| w.id.clone()).collect();
     }
     let is_vps_target = binding.target_server_id.is_some();
     workflows
@@ -1597,6 +1788,60 @@ mod tests {
         );
         assert!(r.secs > 0.0 && r.steps[0].secs > 0.0);
         assert_eq!(r.elapsed_secs(), r.secs);
+    }
+
+    #[test]
+    fn matching_workflows_by_repo_prefers_push_over_manual_recipes() {
+        let workflows = vec![
+            Workflow {
+                id: "wf-ci".into(),
+                name: "CI Oktopus".into(),
+                trigger: Trigger::Push,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: Some("wf-deploy".into()),
+                server_id: Some("vps-1".into()),
+                repo_id: Some("rb-erp".into()),
+                source: None,
+            },
+            Workflow {
+                id: "wf-deploy".into(),
+                name: "Deploy Oktopus VPS".into(),
+                trigger: Trigger::Manual,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: Some("vps-1".into()),
+                repo_id: Some("rb-erp".into()),
+                source: None,
+            },
+            Workflow {
+                id: "wf-smoke".into(),
+                name: "Smoke Produção Oktopus".into(),
+                trigger: Trigger::Manual,
+                runner: RunnerKind::Ssh,
+                workdir: String::new(),
+                steps: vec![],
+                on_success: None,
+                server_id: Some("vps-1".into()),
+                repo_id: Some("rb-erp".into()),
+                source: None,
+            },
+        ];
+        let binding = RepoBinding {
+            id: "rb-erp".into(),
+            full_name: "matheuswidder/w-erp-central".into(),
+            target_server_id: Some("vps-1".into()),
+            branch: "main".into(),
+            trigger_mode: TriggerMode::WebhookOnVps,
+            workflow_id: None,
+            enabled: true,
+            ..RepoBinding::default()
+        };
+        let matched = matching_workflows_for_binding(&workflows, &binding);
+        assert_eq!(matched, vec!["wf-ci"]);
     }
 
     #[test]

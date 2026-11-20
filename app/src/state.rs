@@ -1009,13 +1009,25 @@ impl AppState {
     }
 
     pub fn project_workflows<'a>(&'a self, b: &RepoBinding) -> Vec<&'a Workflow> {
-        let base_ids = engine::matching_workflows_for_binding_with_bindings(
+        let mut seed_ids = engine::matching_workflows_for_binding_with_bindings(
             &self.snapshot.workflows,
             b,
             &self.snapshot.settings.repo_bindings,
         );
+        let repo_trim = b.full_name.trim();
+        for wf in &self.snapshot.workflows {
+            let owned = wf.repo_id.as_deref() == Some(b.id.as_str())
+                || (!repo_trim.is_empty()
+                    && wf
+                        .source
+                        .as_ref()
+                        .is_some_and(|src| src.repo.trim().eq_ignore_ascii_case(repo_trim)));
+            if owned && !seed_ids.contains(&wf.id) {
+                seed_ids.push(wf.id.clone());
+            }
+        }
         let mut out: Vec<&'a Workflow> = Vec::new();
-        for wid in base_ids {
+        for wid in seed_ids {
             let mut cur_id = Some(wid.as_str());
             while let Some(cid) = cur_id {
                 if out.iter().any(|w| w.id == cid) {
@@ -1066,8 +1078,13 @@ impl AppState {
     }
 
     pub fn is_remote_vps_run(&self, run: &Run) -> Option<String> {
-        if !run.id.starts_with("run-vps-") {
+        if run.vps_run_id.is_none() && !run.id.starts_with("run-vps-") {
             return None;
+        }
+        if let Some(sid) = &run.vps_server_id
+            && self.snapshot.settings.servers.iter().any(|s| &s.id == sid)
+        {
+            return Some(sid.clone());
         }
         let wf_srv = self
             .snapshot
@@ -1088,15 +1105,63 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn start_workflow(&mut self, wf_id: &str, trigger: &str, tx: &mut Tx) {
-        if self.demo_mode {
-            let wf = self
+    pub fn resolve_binding_for_workflow(&self, wf_id: &str) -> Option<RepoBinding> {
+        if let Some(pid) = &self.selected_project_id
+            && let Some(b) = self
                 .snapshot
-                .workflows
+                .settings
+                .repo_bindings
                 .iter()
-                .find(|w| w.id == wf_id)
-                .cloned();
-            if let Some(wf) = wf {
+                .find(|b| &b.id == pid)
+            && self.project_workflows(b).iter().any(|w| w.id == wf_id)
+        {
+            return Some(b.clone());
+        }
+        let wf = self.snapshot.workflows.iter().find(|w| w.id == wf_id)?;
+        if let Some(bid) = self.binding_id_for_workflow(wf)
+            && let Some(b) = self
+                .snapshot
+                .settings
+                .repo_bindings
+                .iter()
+                .find(|b| b.id == bid)
+        {
+            return Some(b.clone());
+        }
+        self.snapshot
+            .settings
+            .repo_bindings
+            .iter()
+            .find(|b| self.project_workflows(b).iter().any(|w| w.id == wf_id))
+            .cloned()
+    }
+
+    pub fn start_workflow(&mut self, wf_id: &str, trigger: &str, tx: &mut Tx) {
+        let resolved_binding = self.resolve_binding_for_workflow(wf_id);
+        let wf_opt = self
+            .snapshot
+            .workflows
+            .iter()
+            .find(|w| w.id == wf_id)
+            .cloned();
+        let target_server_override = resolved_binding
+            .as_ref()
+            .and_then(|b| b.target_server_id.clone())
+            .or_else(|| wf_opt.as_ref().and_then(|w| w.server_id.clone()));
+        let repo_name = resolved_binding
+            .as_ref()
+            .map(|b| b.full_name.clone())
+            .or_else(|| {
+                wf_opt
+                    .as_ref()
+                    .and_then(|w| w.source.as_ref().map(|src| src.repo.clone()))
+            });
+        let branch = resolved_binding
+            .as_ref()
+            .map(|b| Self::resolve_primary_branch(&b.branch));
+
+        if self.demo_mode {
+            if let Some(wf) = wf_opt {
                 let number = self
                     .snapshot
                     .runs
@@ -1160,33 +1225,54 @@ impl AppState {
                     cancel_requested: false,
                     secs: 0.0,
                     actor: "maestro".into(),
-                    repo_name: None,
-                    branch: "main".into(),
+                    repo_name: repo_name.clone(),
+                    branch: branch.clone().unwrap_or_else(|| "main".into()),
                     summary: String::new(),
                     annotations: Vec::new(),
                     vps_run_id: None,
-                    vps_server_id: None,
+                    vps_server_id: target_server_override.clone(),
                 };
                 let rid = run.id.clone();
                 self.snapshot.runs.insert(0, run);
                 self.open_run_summary(&rid);
+                let where_lbl = self.server_label(target_server_override.as_deref());
                 self.push_toast(
                     format!("run-{rid}"),
                     format!("Fluxo '{}' iniciado", wf.name),
-                    Some(format!("Execução #{number} aberta no modo demonstração.")),
+                    Some(format!("Destino: {where_lbl} · execução #{number} (modo demonstração).")),
                     ToastKind::Success,
                     tx,
                 );
             }
             return;
         }
-        if let Some(rid) = engine::start_run(&self.shared, wf_id, trigger) {
+        if let Some(rid) = engine::start_run_with_target(
+            &self.shared,
+            wf_id,
+            trigger,
+            None,
+            target_server_override.clone(),
+            repo_name.clone(),
+            branch.clone(),
+        ) {
             self.snapshot = self.shared.lock().unwrap().clone();
             self.open_run_summary(&rid);
+            let where_lbl = if target_server_override.is_some()
+                || wf_opt.as_ref().is_some_and(|w| w.runner == RunnerKind::Ssh)
+            {
+                let srv = self.server_label(target_server_override.as_deref());
+                match (&repo_name, &branch) {
+                    (Some(rp), Some(br)) => format!("Destino: {srv} · {rp} ({br})"),
+                    (Some(rp), None) => format!("Destino: {srv} · {rp}"),
+                    _ => format!("Destino: {srv}"),
+                }
+            } else {
+                "Destino: Local (Esta máquina)".to_string()
+            };
             self.push_toast(
                 format!("run-{rid}"),
                 "Fluxo iniciado",
-                Some("Acompanhando execução em tempo real.".into()),
+                Some(where_lbl),
                 ToastKind::Success,
                 tx,
             );
@@ -1341,11 +1427,12 @@ impl AppState {
         {
             self.snapshot = self.shared.lock().unwrap().clone();
             tx.wake_after(std::time::Duration::from_millis(120));
+            let where_lbl = self.server_label(binding.target_server_id.as_deref());
             self.push_toast(
                 format!("run-bind-{rid}"),
                 "Execução iniciada",
                 Some(format!(
-                    "Projeto '{}' em execução.",
+                    "Projeto '{}' em execução em '{where_lbl}'.",
                     binding.full_name
                 )),
                 ToastKind::Success,
@@ -2299,8 +2386,9 @@ impl AppState {
         let sh = self.shared.clone();
         let inbox = self.repo_yaml_inbox.clone();
         let bid = binding.id;
+        let branch_hint = binding.branch.clone();
         std::thread::spawn(move || {
-            let paths = github::fetch_repo_yaml_candidates(&sh, &repo_label);
+            let paths = github::fetch_repo_yaml_candidates_on_branch(&sh, &repo_label, Some(&branch_hint));
             let status = if paths.is_empty() {
                 "Nenhum .workploy.yml ou infra/workploy/*.yml encontrado — commit o arquivo e tente de novo.".to_string()
             } else {
@@ -3275,6 +3363,11 @@ impl AppState {
             draft.error = Some("Adicione pelo menos um passo válido.".into());
             return;
         }
+        let existing_wf = draft
+            .id
+            .as_deref()
+            .and_then(|id| self.snapshot.workflows.iter().find(|w| w.id == id))
+            .cloned();
         let wf = Workflow {
             id: draft.id.clone().unwrap_or_else(|| model::new_id("wf")),
             name: name.clone(),
@@ -3283,15 +3376,11 @@ impl AppState {
             workdir: draft.workdir.text.trim().to_string(),
             steps,
             on_success: draft.on_success.clone(),
-            server_id: None,
-            repo_id: None,
+            server_id: existing_wf.as_ref().and_then(|w| w.server_id.clone()),
+            repo_id: existing_wf.as_ref().and_then(|w| w.repo_id.clone()),
             // Editar uma receita não pode apagar a proveniência de importação
             // do repositório (mantida quando a receita já existia).
-            source: draft
-                .id
-                .as_deref()
-                .and_then(|id| self.snapshot.workflows.iter().find(|w| w.id == id))
-                .and_then(|w| w.source.clone()),
+            source: existing_wf.and_then(|w| w.source),
         };
         let wf_id = wf.id.clone();
         if self.demo_mode {
@@ -3345,7 +3434,25 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| model::new_id("wf"));
         match yaml::import_yaml(&draft.edit.text, target_id.clone()) {
-            Ok(wf) => {
+            Ok(mut wf) => {
+                if let Some(existing) = draft
+                    .wf_id
+                    .as_deref()
+                    .and_then(|id| self.snapshot.workflows.iter().find(|w| w.id == id))
+                {
+                    if wf.on_success.is_none() {
+                        wf.on_success = existing.on_success.clone();
+                    }
+                    if wf.server_id.is_none() {
+                        wf.server_id = existing.server_id.clone();
+                    }
+                    if wf.repo_id.is_none() {
+                        wf.repo_id = existing.repo_id.clone();
+                    }
+                    if wf.source.is_none() {
+                        wf.source = existing.source.clone();
+                    }
+                }
                 let wf_name = wf.name.clone();
                 if self.demo_mode {
                     if let Some(existing) =
@@ -3525,6 +3632,7 @@ pub fn setup_app(s: &mut AppState, waker: rune::Waker) {
     if !s.demo_mode && !rune::tooling::is_headless() {
         engine::spawn_github_poller(s.shared.clone());
         engine::spawn_folder_watcher(s.shared.clone());
+        vps::spawn_vps_runs_poller(s.shared.clone());
     }
 }
 

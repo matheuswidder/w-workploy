@@ -1,3 +1,4 @@
+pub mod diagnostic;
 pub mod engine;
 pub mod github;
 pub mod model;

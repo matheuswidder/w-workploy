@@ -38,32 +38,32 @@ pub fn brand_icon_for_theme(dark: bool) -> &'static Pixels {
 
 pub static PLAY: Icon = Icon {
     name: "w-play",
-    view: 16.0,
-    body: r#"<path d="M5 3.5L13 8L5 12.5V3.5Z" fill="currentColor"/>"#,
+    view: 24.0,
+    body: r#"<path d="M7.2 4.8C6.4 4.35 5.4 4.92 5.4 5.84V18.16C5.4 19.08 6.4 19.65 7.2 19.2L18.4 13.04C19.22 12.58 19.22 11.42 18.4 10.96L7.2 4.8Z" fill="currentColor"/>"#,
 };
 
 pub static CHECK_CIRCLE: Icon = Icon {
     name: "w-check-circle",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.35"/><path d="M5.5 8.2L7.2 9.9L10.7 6.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22ZM16.0303 8.96967C16.3232 9.26256 16.3232 9.73744 16.0303 10.0303L11.0303 15.0303C10.7374 15.3232 10.2626 15.3232 9.96967 15.0303L7.96967 13.0303C7.67678 12.7374 7.67678 12.2626 7.96967 11.9697C8.26256 11.6768 8.73744 11.6768 9.03033 11.9697L10.5 13.4393L14.9697 8.96967C15.2626 8.67678 15.7374 8.67678 16.0303 8.96967Z"/>"#,
 };
 
 pub static X_CIRCLE: Icon = Icon {
     name: "w-x-circle",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.35"/><path d="M5.8 5.8L10.2 10.2M10.2 5.8L5.8 10.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22ZM8.96967 8.96967C9.26256 8.67678 9.73744 8.67678 10.0303 8.96967L12 10.9393L13.9697 8.96967C14.2626 8.67678 14.7374 8.67678 15.0303 8.96967C15.3232 9.26256 15.3232 9.73744 15.0303 10.0303L13.0607 12L15.0303 13.9697C15.3232 14.2626 15.3232 14.7374 15.0303 15.0303C14.7374 15.3232 14.2626 15.3232 13.9697 15.0303L12 13.0607L10.0303 15.0303C9.73744 15.3232 9.26256 15.3232 8.96967 15.0303C8.67678 14.7374 8.67678 14.2626 8.96967 13.9697L10.9393 12L8.96967 10.0303C8.67678 9.73744 8.67678 9.26256 8.96967 8.96967Z"/>"#,
 };
 
 pub static CLOCK: Icon = Icon {
     name: "w-clock",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.35"/><path d="M8 4.8V8.2L10.3 9.6" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22ZM12.75 8C12.75 7.58579 12.4142 7.25 12 7.25C11.5858 7.25 11.25 7.58579 11.25 8V12C11.25 12.1989 11.329 12.3897 11.4697 12.5303L13.9697 15.0303C14.2626 15.3232 14.7374 15.3232 15.0303 15.0303C15.3232 14.7374 15.3232 14.2626 15.0303 13.9697L12.75 11.6893V8Z"/>"#,
 };
 
 pub static BOLT: Icon = Icon {
     name: "w-bolt",
-    view: 16.0,
-    body: r#"<path d="M9.2 1.8L3.8 9H7.8L6.8 14.2L12.2 7H8.2L9.2 1.8Z" fill="currentColor"/>"#,
+    view: 24.0,
+    body: r#"<path d="M13.6 2.4L5.6 13.2H11.6L10.2 21.6L18.4 10.8H12.4L13.6 2.4Z" fill="currentColor"/>"#,
 };
 
 /// Solar: escudo (segurança/cofre).
@@ -82,32 +82,32 @@ pub static SERVER: Icon = Icon {
 
 pub static BRANCH: Icon = Icon {
     name: "w-branch",
-    view: 16.0,
-    body: r#"<circle cx="5" cy="4" r="1.6" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="12" r="1.6" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="6" r="1.6" stroke="currentColor" stroke-width="1.3"/><path d="M5 5.6V10.4M5 10.2C5 8 11.5 9.2 11.5 7.6" stroke="currentColor" stroke-width="1.3"/>"#,
+    view: 24.0,
+    body: r#"<circle cx="7" cy="5.5" r="2.7" fill="currentColor"/><circle cx="7" cy="18.5" r="2.7" fill="currentColor"/><circle cx="17.5" cy="8.5" r="2.7" fill="currentColor"/><path d="M7 8.2V15.8M7 15.2C7 11.8 17.5 13.5 17.5 11.2" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/>"#,
 };
 
 pub static COMMIT: Icon = Icon {
     name: "w-commit",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="2.4" stroke="currentColor" stroke-width="1.35"/><path d="M1.8 8H5.6M10.4 8H14.2" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="3.6" fill="currentColor"/><path d="M2.5 12H8.4M15.6 12H21.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>"#,
 };
 
 pub static REFRESH: Icon = Icon {
     name: "w-refresh",
-    view: 16.0,
-    body: r#"<path d="M13.2 4.5V7.8H9.9" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/><path d="M12.7 7.6A5.2 5.2 0 1 0 11.8 11.6" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M20 6.5V11.5H15" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M19.2 11.2A7.6 7.6 0 1 0 17.8 17.2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>"#,
 };
 
 pub static COPY: Icon = Icon {
     name: "w-copy",
-    view: 16.0,
-    body: r#"<rect x="5.2" y="2.5" width="8.3" height="8.8" rx="1.2" stroke="currentColor" stroke-width="1.25"/><rect x="2.5" y="4.7" width="8.3" height="8.8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.25"/>"#,
+    view: 24.0,
+    body: r#"<rect x="8" y="3.5" width="12.5" height="13.5" rx="2.4" stroke="currentColor" stroke-width="2.0"/><rect x="3.5" y="7" width="12.5" height="13.5" rx="2.4" fill="currentColor" fill-opacity="0.18" stroke="currentColor" stroke-width="2.0"/>"#,
 };
 
 pub static EDIT: Icon = Icon {
     name: "w-edit",
-    view: 16.0,
-    body: r#"<path d="M10.8 2.6L13.4 5.2L5.6 13H3V10.4L10.8 2.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M16.2 3.8L20.2 7.8L8.4 19.6H4.4V15.6L16.2 3.8Z" fill="currentColor" fill-opacity="0.2" stroke="currentColor" stroke-width="2.0" stroke-linejoin="round"/>"#,
 };
 
 /// Solar: lixeira (excluir).
@@ -119,80 +119,80 @@ pub static TRASH: Icon = Icon {
 
 pub static CODE: Icon = Icon {
     name: "w-code",
-    view: 16.0,
-    body: r#"<path d="M5.5 4.5L2 8L5.5 11.5M10.5 4.5L14 8L10.5 11.5M9 3.5L7 12.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M8.2 6.8L3 12L8.2 17.2M15.8 6.8L21 12L15.8 17.2M13.5 5.2L10.5 18.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static PLUS: Icon = Icon {
     name: "w-plus",
-    view: 16.0,
-    body: r#"<path d="M8 3V13M3 8H13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M12 4.5V19.5M4.5 12H19.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>"#,
 };
 
 pub static ARROW_LEFT: Icon = Icon {
     name: "w-arrow-left",
-    view: 16.0,
-    body: r#"<path d="M13 8H3M7.2 3.8L3 8L7.2 12.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M19.5 12H4.5M10.8 5.7L4.5 12L10.8 18.3" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static CHEVRON_DOWN: Icon = Icon {
     name: "w-chevron-down",
-    view: 16.0,
-    body: r#"<path d="M4.2 6.2L8 10L11.8 6.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M6.2 9.2L12 15L17.8 9.2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static CHEVRON_RIGHT: Icon = Icon {
     name: "w-chevron-right",
-    view: 16.0,
-    body: r#"<path d="M6.2 4.2L10 8L6.2 11.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M9.2 6.2L15 12L9.2 17.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static CHEVRON_UP: Icon = Icon {
     name: "w-chevron-up",
-    view: 16.0,
-    body: r#"<path d="M4.2 9.8L8 6L11.8 9.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M6.2 14.8L12 9L17.8 14.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static LIST: Icon = Icon {
     name: "w-list",
-    view: 16.0,
-    body: r#"<path d="M3 4.2H13M3 8H13M3 11.8H10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<rect x="3" y="4.5" width="18" height="3" rx="1.5" fill="currentColor"/><rect x="3" y="10.5" width="18" height="3" rx="1.5" fill="currentColor"/><rect x="3" y="16.5" width="13" height="3" rx="1.5" fill="currentColor"/>"#,
 };
 
 pub static SUN_MOON: Icon = Icon {
     name: "w-theme",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="4.5" stroke="currentColor" stroke-width="1.35"/><path d="M8 3.5V12.5A4.5 4.5 0 0 0 8 3.5Z" fill="currentColor"/>"#,
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="7" stroke="currentColor" stroke-width="2.0"/><path d="M12 5V19A7 7 0 0 0 12 5Z" fill="currentColor"/>"#,
 };
 
 pub static SLIDERS: Icon = Icon {
     name: "w-sliders",
-    view: 16.0,
-    body: r#"<path d="M2.5 5H13.5M2.5 11H13.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="5.5" cy="5" r="1.6" fill="currentColor"/><circle cx="10.5" cy="11" r="1.6" fill="currentColor"/>"#,
+    view: 24.0,
+    body: r#"<path d="M3.5 7.5H20.5M3.5 16.5H20.5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/><circle cx="8.5" cy="7.5" r="2.8" fill="currentColor"/><circle cx="15.5" cy="16.5" r="2.8" fill="currentColor"/>"#,
 };
 
 pub static HOME: Icon = Icon {
     name: "w-home",
-    view: 16.0,
-    body: r#"<path d="M2.5 7.2L8 2.5L13.5 7.2V13.2C13.5 13.6 13.2 14 12.7 14H3.3C2.8 14 2.5 13.6 2.5 13.2V7.2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M6.2 14V9.5H9.8V14" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M10.707 2.293a1.8 1.8 0 0 1 2.586 0l7.5 7.5A1.8 1.8 0 0 1 21 11.066V19.5A2.5 2.5 0 0 1 18.5 22H15a1 1 0 0 1-1-1v-4.5a2 2 0 0 0-4 0V21a1 1 0 0 1-1 1H5.5A2.5 2.5 0 0 1 3 19.5v-8.434a1.8 1.8 0 0 1 .207-1.273l7.5-7.5Z"/>"#,
 };
 
 pub static ACTIVITY: Icon = Icon {
     name: "w-activity",
-    view: 16.0,
-    body: r#"<path d="M1.8 8H4.2L5.8 3.5L8.2 12.5L10.4 6.2L11.8 8H14.2" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M2.5 12H6.2L8.8 5L12.4 19L15.8 9.2L17.8 12H21.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 pub static INFO: Icon = Icon {
     name: "w-info",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.35"/><path d="M8 7.2V11.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="5.1" r="0.85" fill="currentColor"/>"#,
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22ZM12 7.25C12.5523 7.25 13 7.69772 13 8.25C13 8.80228 12.5523 9.25 12 9.25C11.4477 9.25 11 8.80228 11 8.25C11 7.69772 11.4477 7.25 12 7.25ZM12 10.75C12.4142 10.75 12.75 11.0858 12.75 11.5V16.5C12.75 16.9142 12.4142 17.25 12 17.25C11.5858 17.25 11.25 16.9142 11.25 16.5V11.5C11.25 11.0858 11.5858 10.75 12 10.75Z"/>"#,
 };
 
 pub static EXTERNAL_LINK: Icon = Icon {
     name: "w-external",
-    view: 16.0,
-    body: r#"<path d="M9.5 2.5H13.5V6.5M13.3 2.7L7.5 8.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/><path d="M12.5 9.2V12.7C12.5 13.1 12.1 13.5 11.7 13.5H3.3C2.9 13.5 2.5 13.1 2.5 12.7V4.3C2.5 3.9 2.9 3.5 3.3 3.5H6.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
+    view: 24.0,
+    body: r#"<path d="M14.5 3.5H20.5V9.5M20.2 3.8L11.2 12.8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M18.8 13.8V19.2C18.8 19.9 18.2 20.5 17.5 20.5H4.8C4.1 20.5 3.5 19.9 3.5 19.2V6.5C3.5 5.8 4.1 5.2 4.8 5.2H10.2" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/>"#,
 };
 
 pub static WORKFLOW: Icon = Icon {

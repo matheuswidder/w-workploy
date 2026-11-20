@@ -2,7 +2,10 @@ use std::ops::Range;
 
 use rune::compose::{Compositor, Frame};
 use rune::render::{EffectPhase, EffectSite, KIND_EFFECT};
-use rune_fx::{Fx, FxFrame, FxLayer, FxOptions, FxRenderer, FxSlot, PulseParams, PulseStyle, Rgb, Shape, rgb};
+use rune_fx::{
+    ElectricParams, ElectricStyle, Fx, FxFrame, FxLayer, FxOptions, FxRenderer, FxSlot,
+    PulseParams, PulseStyle, Rgb, Shape, ShimmerParams, rgb,
+};
 use workploy::model::SpinnerKind;
 
 use crate::state::AppState;
@@ -20,6 +23,10 @@ pub const MARK_SPINNER_BLOCKS_SCALE: u32 = 8;
 pub const MARK_SPINNER_BLOCKS_SHUFFLE_2: u32 = 9;
 pub const MARK_SPINNER_BLOCKS_SHUFFLE_3: u32 = 10;
 pub const MARK_SPINNER_BLOCKS_WAVE: u32 = 11;
+/// Borda elétrica calma (`ElectricStyle::Charged`) para cards em execução ativa.
+pub const MARK_ELECTRIC_BORDER: u32 = 12;
+/// Shimmer sutil para barras de progresso em andamento.
+pub const MARK_SHIMMER_BAR: u32 = 13;
 
 // ——————————————————————————————————————————————————————————————————————
 // Ritmo central dos efeitos de pulso — todo tuning de período (s por
@@ -139,7 +146,7 @@ impl Compositor<AppState> for WorkployGfx {
             match kind {
                 MARK_PULSE_BREATHE => {
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 8.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 5.0 };
                     let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_CALM };
                     layers.push(
                         Fx::pulse(PulseParams {
@@ -158,7 +165,7 @@ impl Compositor<AppState> for WorkployGfx {
                 }
                 MARK_PULSE_RADAR => {
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 10.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 6.0 };
                     let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_ACTIVE };
                     layers.push(
                         Fx::pulse(PulseParams {
@@ -167,7 +174,7 @@ impl Compositor<AppState> for WorkployGfx {
                             count: 2,
                             reach,
                             period,
-                            width: 1.2,
+                            width: 0.9,
                             intensity: if d[3] > 0.0 { d[3] } else { PULSE_INTENSITY_ACTIVE },
                             ..Default::default()
                         })
@@ -179,7 +186,7 @@ impl Compositor<AppState> for WorkployGfx {
                 }
                 MARK_PULSE_HEARTBEAT => {
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 10.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 6.0 };
                     let period = if d[2] > 0.0 { d[2] } else { PULSE_TEMPO_ACTIVE };
                     layers.push(
                         Fx::pulse(PulseParams {
@@ -197,11 +204,8 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_SOFT => {
-                    // `pulse-2`: dois pontos suaves que crescem e somem. A
-                    // defasagem entre os pontos é uma fração do período no
-                    // shader (`1/n`), então alongar o ciclo mantém o ritmo.
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 7.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 5.0 };
                     let period = if d[2] > 0.0 { d[2] } else { spinner_period(SpinnerKind::PulseSoft) };
                     layers.push(
                         Fx::pulse(PulseParams {
@@ -209,7 +213,7 @@ impl Compositor<AppState> for WorkployGfx {
                             color: col,
                             count: 2,
                             reach,
-                            width: reach * 0.42,
+                            width: 0.9,
                             period,
                             intensity: if d[3] > 0.0 {
                                 d[3]
@@ -225,10 +229,8 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_MULTIPLE => {
-                    // `pulse-multiple`: três pontos em sequência, cada um
-                    // iniciando pouco depois do anterior (stagger = período/3).
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 8.5 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 6.0 };
                     let period = if d[2] > 0.0 {
                         d[2]
                     } else {
@@ -240,7 +242,7 @@ impl Compositor<AppState> for WorkployGfx {
                             color: col,
                             count: 3,
                             reach,
-                            width: reach * 0.34,
+                            width: 0.95,
                             period,
                             intensity: if d[3] > 0.0 {
                                 d[3]
@@ -256,9 +258,8 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_RINGS_2 => {
-                    // `pulse-rings-2`: dois anéis finos que expandem e somem.
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 11.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 7.5 };
                     let period = if d[2] > 0.0 {
                         d[2]
                     } else {
@@ -270,7 +271,7 @@ impl Compositor<AppState> for WorkployGfx {
                             color: col,
                             count: 2,
                             reach,
-                            width: 1.1,
+                            width: 1.0,
                             period,
                             intensity: if d[3] > 0.0 {
                                 d[3]
@@ -286,9 +287,8 @@ impl Compositor<AppState> for WorkployGfx {
                     placements.push(slot);
                 }
                 MARK_SPINNER_PULSE_RINGS_3 => {
-                    // `pulse-rings-3`: três anéis acelerando.
                     let col = color_by_idx(d[0]);
-                    let reach = if d[1] > 0.0 { d[1] } else { 12.0 };
+                    let reach = if d[1] > 0.0 { d[1] } else { 8.5 };
                     let period = if d[2] > 0.0 {
                         d[2]
                     } else {
@@ -300,7 +300,7 @@ impl Compositor<AppState> for WorkployGfx {
                             color: col,
                             count: 3,
                             reach,
-                            width: 1.1,
+                            width: 1.0,
                             period,
                             intensity: if d[3] > 0.0 {
                                 d[3]
@@ -366,7 +366,7 @@ impl Compositor<AppState> for WorkployGfx {
                             Fx::pulse(PulseParams {
                                 style: PulseStyle::Breathe,
                                 color: col,
-                                reach: bs * 0.9,
+                                reach: bs * 0.45,
                                 period,
                                 intensity: inten,
                                 ..Default::default()
@@ -383,6 +383,58 @@ impl Compositor<AppState> for WorkployGfx {
                         );
                         placements.push(slot);
                     }
+                }
+                MARK_ELECTRIC_BORDER => {
+                    let col = color_by_idx(d[0]);
+                    let intensity = if d[3] > 0.0 { d[3] } else { 0.34 };
+                    layers.push(
+                        Fx::electric(ElectricParams {
+                            style: ElectricStyle::Charged,
+                            color: col,
+                            core: rgb(0xeaf3ff),
+                            cool: col,
+                            amplitude: 0.65,
+                            frequency: 2.2,
+                            speed: 1.4,
+                            core_width: 0.45,
+                            intensity,
+                            glow: 1.8,
+                            forks: 0.08,
+                            flicker: 0.0,
+                            strands: 1,
+                            gap: 0.5,
+                            fork_len: 7.0,
+                            occlusion: 0.14,
+                            zap: None,
+                        })
+                        .on(shape)
+                        .at(phase_t)
+                        .reduced(rm),
+                    );
+                    placements.push(slot);
+                }
+                MARK_SHIMMER_BAR => {
+                    let col = color_by_idx(d[0]);
+                    let period = if d[2] > 0.0 { d[2] } else { 2.4 };
+                    let intensity = if d[3] > 0.0 { d[3] } else { 0.38 };
+                    layers.push(
+                        Fx::shimmer(ShimmerParams {
+                            color: rgb(0xffffff),
+                            base: col,
+                            base_alpha: 0.0,
+                            period,
+                            band: 32.0,
+                            angle: 0.25,
+                            intensity,
+                            use_mask: false,
+                            pause: 0.45,
+                            feather: 2.0,
+                        })
+                        .on(shape)
+                        .at(phase_t)
+                        .reduced(rm),
+                    );
+                    placements.push(slot);
                 }
                 _ => {}
             }

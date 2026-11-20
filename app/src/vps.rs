@@ -512,7 +512,7 @@ pub fn probe_vps(sh: &SharedHandle, server_id: &str) {
                 let msg = if err.is_empty() {
                     "Falha ao executar diagnóstico na VPS.".into()
                 } else {
-                    format!("Falha SSH: {err}")
+                    crate::diagnostic::humanize_transport_error(err)
                 };
                 VpsProbeResult {
                     ok: false,
@@ -523,7 +523,7 @@ pub fn probe_vps(sh: &SharedHandle, server_id: &str) {
             }
             Err(e) => VpsProbeResult {
                 ok: false,
-                verdict: e,
+                verdict: crate::diagnostic::humanize_transport_error(&e),
                 checked_at: now_str(),
                 ..Default::default()
             },
@@ -593,7 +593,7 @@ fn generate_random_hex(prefix: &str) -> String {
     format!("{prefix}-{nanos:x}-{mixed:016x}")
 }
 
-pub const WORKPLOY_RUNNER_PY: &str = r#"#!/usr/bin/env python3
+pub const WORKPLOY_RUNNER_PY: &str = r##"#!/usr/bin/env python3
 import argparse
 import hashlib
 import hmac
@@ -862,14 +862,14 @@ def run_manual_purge():
         return res
 
 
-def prepare_workspace(repo_full_name, branch, custom_workdir):
+def prepare_workspace(repo_full_name, branch, custom_workdir, commit_sha=None):
     if custom_workdir and custom_workdir.strip():
         wd = custom_workdir.strip()
         os.makedirs(wd, exist_ok=True)
-        return wd, ""
+        return wd, "", True
     os.makedirs(WORKSPACES_DIR, exist_ok=True)
     if not repo_full_name:
-        return WORKSPACES_DIR, ""
+        return WORKSPACES_DIR, "", True
     wd = os.path.join(WORKSPACES_DIR, safe_slug(repo_full_name))
     gh_tok = read_text(GITHUB_TOKEN_PATH, "")
     if gh_tok:
@@ -877,11 +877,12 @@ def prepare_workspace(repo_full_name, branch, custom_workdir):
     else:
         remote_url = f"https://github.com/{repo_full_name}.git"
     logs = []
+    target_branch = (branch or "main").strip() or "main"
     try:
         if not os.path.isdir(os.path.join(wd, ".git")):
             os.makedirs(wd, exist_ok=True)
             res = subprocess.run(
-                ["git", "clone", "--branch", branch or "main", remote_url, wd],
+                ["git", "clone", "--branch", target_branch, remote_url, wd],
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -891,26 +892,76 @@ def prepare_workspace(repo_full_name, branch, custom_workdir):
                 logs.append(res.stdout)
             if res.stderr:
                 logs.append(res.stderr.replace(gh_tok, "***") if gh_tok else res.stderr)
+            if res.returncode != 0:
+                return wd, "\n".join(logs) + "\n", False
         else:
+            subprocess.run(["git", "-C", wd, "remote", "set-url", "origin", remote_url], capture_output=True, text=True)
             res = subprocess.run(
-                ["git", "-C", wd, "fetch", "origin", branch or "main"],
+                ["git", "-C", wd, "fetch", "origin"],
                 capture_output=True,
                 text=True,
                 timeout=180,
             )
-            subprocess.run(["git", "-C", wd, "checkout", branch or "main"], capture_output=True, text=True)
+            if res.returncode != 0:
+                err_txt = (res.stderr or res.stdout or "").replace(gh_tok, "***") if gh_tok else (res.stderr or res.stdout or "")
+                logs.append(f"[git fetch erro] exit={res.returncode}\n{err_txt}")
+                return wd, "\n".join(logs) + "\n", False
+        if commit_sha and commit_sha.strip():
             res2 = subprocess.run(
-                ["git", "-C", wd, "pull", "--ff-only", "origin", branch or "main"],
+                ["git", "-C", wd, "checkout", "--force", commit_sha.strip()],
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=120,
             )
-            logs.append(f"[git sync] fetch={res.returncode} pull={res2.returncode}")
-            if res2.stdout:
-                logs.append(res2.stdout)
+        else:
+            subprocess.run(["git", "-C", wd, "checkout", "-B", target_branch, f"origin/{target_branch}"], capture_output=True, text=True)
+            res2 = subprocess.run(
+                ["git", "-C", wd, "reset", "--hard", f"origin/{target_branch}"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        if res2.returncode != 0:
+            err_txt = (res2.stderr or res2.stdout or "").replace(gh_tok, "***") if gh_tok else (res2.stderr or res2.stdout or "")
+            logs.append(f"[git checkout erro] exit={res2.returncode}\n{err_txt}")
+            return wd, "\n".join(logs) + "\n", False
+        rev = subprocess.run(["git", "-C", wd, "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+        logs.append(f"[git sync] workspace={wd} ref={(rev.stdout or '?').strip()}")
     except Exception as exc:
-        logs.append(f"[git sync erro] {exc}")
-    return wd, "\n".join(logs) + ("\n" if logs else "")
+        err_s = str(exc).replace(gh_tok, "***") if gh_tok else str(exc)
+        logs.append(f"[git sync erro] {err_s}")
+        return wd, "\n".join(logs) + "\n", False
+    return wd, "\n".join(logs) + ("\n" if logs else ""), True
+
+
+def _diagnose_failure(step_name, log_text):
+    low = (log_text or "").lower()
+    sub_name = None
+    for line in reversed((log_text or "").splitlines()):
+        t = line.strip()
+        if t.startswith("=== ") and t.endswith(" ==="):
+            sub_name = t[4:-4].strip()
+            break
+    job_label = f"{step_name} › {sub_name}" if sub_name else step_name
+    if "err_pnpm_no_pkg_manifest" in low or "no package.json" in low:
+        headline = "Diretório sem package.json — verifique workspace/workdir."
+    elif "command not found" in low:
+        headline = "Comando não encontrado no PATH da VPS."
+    elif "no space left on device" in low:
+        headline = "Disco da VPS sem espaço livre."
+    elif "error ts" in low:
+        headline = "Erro de tipagem TypeScript."
+    elif "fail " in low or "assertionerror" in low or "test timed out" in low:
+        headline = f"Falha nos testes em '{sub_name or step_name}'."
+    elif "docker compose" in low or "copy failed" in low:
+        headline = "Falha no build ou subida dos containers Docker."
+    elif "[git " in low or "authentication failed" in low:
+        headline = "Falha ao sincronizar repositório do GitHub."
+    else:
+        headline = f"Etapa '{sub_name or step_name}' retornou código de erro."
+    tail = [l.strip()[:180] for l in (log_text or "").splitlines() if l.strip() and not l.strip().startswith("=== ")][-4:]
+    msg = headline + ("\nEvidência:\n• " + "\n• ".join(tail) if tail else "")
+    return headline, [{"kind": "Error", "job": job_label, "msg": msg}]
 
 
 def _finalize_running_substep(run_id, step_idx, step_obj, final_status):
@@ -963,16 +1014,57 @@ def append_step_log(run_id, step_idx, text):
             save_runs_locked()
 
 
-def execute_run(run_id, wf, repo_full_name="", branch="main"):
+def _build_step_env():
+    env = os.environ.copy()
+    home = env.get("HOME", "/root")
+    extra = [
+        os.path.join(home, ".local/share/pnpm"),
+        "/usr/local/share/pnpm",
+        os.path.join(home, ".cargo/bin"),
+        "/usr/local/cargo/bin",
+        "/usr/local/bin",
+    ]
+    nvm_dir = os.path.join(home, ".nvm/versions/node")
+    if os.path.isdir(nvm_dir):
+        try:
+            vers = sorted(os.listdir(nvm_dir))
+            if vers:
+                extra.insert(0, os.path.join(nvm_dir, vers[-1], "bin"))
+        except OSError:
+            pass
+    cur = env.get("PATH", "")
+    env["PATH"] = ":".join([p for p in extra if p] + ([cur] if cur else []))
+    return env
+
+
+def execute_run(run_id, wf, repo_full_name="", branch="main", commit_sha=None):
     t_start = time.monotonic()
-    workdir, prep_log = prepare_workspace(repo_full_name, branch, wf.get("workdir", ""))
+    workdir, prep_log, sync_ok = prepare_workspace(repo_full_name, branch, wf.get("workdir", ""), commit_sha)
     with STATE_LOCK:
         ACTIVE_WORKDIRS[run_id] = workdir
     try:
         if prep_log and len(wf.get("steps", [])) > 0:
             append_step_log(run_id, 0, prep_log)
+        if not sync_ok:
+            with STATE_LOCK:
+                r = find_run_locked(run_id)
+                if r:
+                    if r["steps"]:
+                        r["steps"][0]["status"] = "Failed"
+                        headline, anns = _diagnose_failure(r["steps"][0].get("name", "Git sync"), r["steps"][0].get("log", ""))
+                        r["annotations"] = anns
+                        r["summary"] = f"# Falha em {r.get('workflow_name', 'Fluxo')}\n- Etapa: {r['steps'][0].get('name')}\n- Motivo: {headline}\n"
+                    for st in r["steps"][1:]:
+                        if st["status"] == "Pending":
+                            st["status"] = "Skipped"
+                    r["status"] = "Failed"
+                    r["finished_at"] = now_str()
+                    r["secs"] = time.monotonic() - t_start
+                    save_runs_locked()
+            return
 
         steps = wf.get("steps", [])
+        step_env = _build_step_env()
         for idx, step in enumerate(steps):
             with STATE_LOCK:
                 r = find_run_locked(run_id)
@@ -1036,6 +1128,7 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                 proc = subprocess.Popen(
                     [shell_bin, "-lc", cmd],
                     cwd=workdir,
+                    env=step_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1102,6 +1195,9 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                 _finalize_running_substep(run_id, idx, r["steps"][idx], final_sub_status)
                 r["steps"][idx]["status"] = final_sub_status
                 if not ok:
+                    headline, anns = _diagnose_failure(r["steps"][idx].get("name", "Passo"), r["steps"][idx].get("log", ""))
+                    r["annotations"] = r.get("annotations", []) + anns
+                    r["summary"] = f"# Falha em {r.get('workflow_name', 'Fluxo')}\n- Etapa: {r['steps'][idx].get('name')}\n- Motivo: {headline}\n"
                     r["status"] = "Failed"
                     r["finished_at"] = now_str()
                     r["secs"] = time.monotonic() - t_start
@@ -1118,6 +1214,8 @@ def execute_run(run_id, wf, repo_full_name="", branch="main"):
                 r["status"] = "Success"
                 r["finished_at"] = now_str()
                 r["secs"] = time.monotonic() - t_start
+                if not r.get("summary"):
+                    r["summary"] = f"# {r.get('workflow_name', 'Fluxo')} concluído com sucesso\n- Etapas concluídas: {len(steps)}/{len(steps)}\n"
                 save_runs_locked()
 
         next_id = wf.get("on_success")
@@ -1193,7 +1291,7 @@ def queue_workflow(wf, trigger_label, repo_full_name="", branch="main", commit_i
         save_runs_locked()
     threading.Thread(
         target=execute_run,
-        args=(run_id, wf, repo_full_name, branch or "main"),
+        args=(run_id, wf, repo_full_name, branch or "main", commit_sha),
         daemon=True,
     ).start()
     return run_id
@@ -1211,21 +1309,57 @@ def branch_matches(pattern, branch):
     return False
 
 
-def resolve_workflow_for_binding(cfg, b):
+def _is_windows_only_workflow(w):
+    wd = (w.get("workdir") or "").strip()
+    if ":\\" in wd or ":/" in wd:
+        return True
+    if "windows" in (w.get("name") or "").lower():
+        return True
+    for st in w.get("steps", []):
+        if "powershell" in (st.get("run") or "").lower():
+            return True
+    return False
+
+
+def resolve_workflows_for_binding(cfg, b):
     wf_list = cfg.get("workflows", [])
     workflows = {w.get("id"): w for w in wf_list if w.get("id")}
     wf_id = b.get("workflow_id")
     if wf_id and wf_id in workflows:
-        return workflows[wf_id]
+        return [workflows[wf_id]]
     bid = b.get("id")
     if bid:
-        for w in wf_list:
-            if w.get("repo_id") == bid:
-                return w
+        by_repo = [w for w in wf_list if w.get("repo_id") == bid]
+        if by_repo:
+            push_only = [w for w in by_repo if w.get("trigger") == "Push"]
+            if push_only:
+                return push_only
+            chained_targets = {w.get("on_success") for w in by_repo if w.get("on_success")}
+            roots = [w for w in by_repo if w.get("id") not in chained_targets]
+            return roots or by_repo
+    all_bindings = cfg.get("bindings", [])
+    claimed = {
+        other.get("workflow_id")
+        for other in all_bindings
+        if other.get("id") != bid and other.get("workflow_id")
+    }
+    matched = []
     for w in wf_list:
-        if w.get("trigger") == "Push":
-            return w
-    return None
+        if w.get("trigger") != "Push":
+            continue
+        if (w.get("repo_id") or "").strip():
+            continue
+        if w.get("id") in claimed:
+            continue
+        if _is_windows_only_workflow(w):
+            continue
+        matched.append(w)
+    return matched
+
+
+def resolve_workflow_for_binding(cfg, b):
+    wfs = resolve_workflows_for_binding(cfg, b)
+    return wfs[0] if wfs else None
 
 
 def poller_loop():
@@ -1247,8 +1381,8 @@ def poller_loop():
             repo = (b.get("full_name") or "").strip()
             raw_branch = b.get("branch")
             branch_pat = (raw_branch if raw_branch is not None else "main").strip()
-            wf = resolve_workflow_for_binding(cfg, b)
-            if not repo or not wf:
+            wfs = resolve_workflows_for_binding(cfg, b)
+            if not repo or not wfs:
                 continue
             headers = {
                 "User-Agent": "workploy-runner",
@@ -1310,7 +1444,8 @@ def poller_loop():
                             except Exception:
                                 pass
                         poll_state[key] = sha
-                        queue_workflow(wf, "sondagem 24/7 na VPS", repo, br, (sha, msg), "github-poll")
+                        for wf in wfs:
+                            queue_workflow(wf, "sondagem 24/7 na VPS", repo, br, (sha, msg), "github-poll")
                     elif sha and not prev:
                         poll_state[key] = sha
                     with open(POLL_STATE_PATH, "w", encoding="utf-8") as f:
@@ -1400,8 +1535,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pat = raw_branch if raw_branch is not None else "main"
                 if not branch_matches(pat, branch):
                     continue
-                wf = resolve_workflow_for_binding(cfg, b)
-                if wf:
+                for wf in resolve_workflows_for_binding(cfg, b):
                     rid = queue_workflow(wf, "webhook no GitHub", b_repo or repo, branch, (sha, msg), actor)
                     triggered.append(rid)
             return self.send_json(200, {"ok": True, "triggered": triggered})
@@ -1423,19 +1557,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 return self.send_json(400, {"error": "invalid_json"})
             wf_id = body.get("workflow_id", "")
+            inline_wf = body.get("workflow") if isinstance(body.get("workflow"), dict) else None
             cfg = load_config()
+            target_wf = None
             for w in cfg.get("workflows", []):
                 if w.get("id") == wf_id:
-                    rid = queue_workflow(
-                        w,
-                        body.get("trigger_label", "manual"),
-                        body.get("repo", ""),
-                        body.get("branch", "main"),
-                        None,
-                        "maestro",
-                    )
-                    return self.send_json(200, {"ok": True, "run_id": rid})
-            return self.send_json(404, {"error": "workflow_not_found"})
+                    target_wf = w
+                    break
+            if inline_wf is not None:
+                target_wf = inline_wf
+            if target_wf is None:
+                return self.send_json(404, {"error": "workflow_not_found"})
+            commit_sha = (body.get("commit_sha") or "").strip()
+            commit_msg = (body.get("commit_msg") or body.get("trigger_label") or "manual").strip()
+            commit_info = (commit_sha, commit_msg) if commit_sha else None
+            rid = queue_workflow(
+                target_wf,
+                body.get("trigger_label", "manual"),
+                body.get("repo", ""),
+                body.get("branch", "main"),
+                commit_info,
+                body.get("actor", "maestro"),
+            )
+            with STATE_LOCK:
+                created_run = find_run_locked(rid)
+            return self.send_json(200, {"ok": True, "run_id": rid, "run": created_run})
 
         m_app = re.fullmatch(r"/runs/([^/]+)/approve", self.path)
         if m_app:
@@ -1478,7 +1624,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-"#;
+"##;
 
 pub fn build_provision_script(
     opts: &ProvisionOptions,
@@ -1745,9 +1891,13 @@ pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_i
         let remote_cancel = r.cancel_requested;
         let remote_approved = r.approved;
         let mut incoming = r;
-        incoming.vps_run_id = Some(incoming.id.clone());
+        let remote_id = incoming.id.clone();
+        incoming.vps_run_id = Some(remote_id.clone());
         incoming.vps_server_id = Some(vps_server_id.to_string());
-        if let Some(slot) = existing.iter_mut().find(|e| e.id == incoming.id) {
+        if let Some(slot) = existing
+            .iter_mut()
+            .find(|e| e.id == remote_id || e.vps_run_id.as_deref() == Some(remote_id.as_str()))
+        {
             // Cancelamento é pedido, não estado consolidado: um pedido já
             // registrado em qualquer um dos lados permanece até o runner
             // confirmar na sincronização seguinte. Sem isso, uma sincronização
@@ -1756,9 +1906,11 @@ pub fn merge_remote_runs(existing: &mut Vec<Run>, remote: Vec<Run>, vps_server_i
             // enviar o POST ao runner; até o runner consolidar e devolver o
             // estado, a sincronização não pode apagar o flag local — senão o
             // espelho volta a parecer "aguardando aprovação" eternamente.
+            let local_id = slot.id.clone();
             let local_cancel = slot.cancel_requested;
             let local_approved = slot.approved;
             *slot = incoming;
+            slot.id = local_id;
             slot.cancel_requested = local_cancel || remote_cancel;
             slot.approved = local_approved || remote_approved;
         } else {
@@ -1837,6 +1989,180 @@ pub fn cancel_vps_run(sh: &SharedHandle, server: &VpsServer, vps_run_id: &str) -
     result
 }
 
+pub fn trigger_vps_run(
+    sh: &SharedHandle,
+    server: &VpsServer,
+    wf: &Workflow,
+    trigger_label: &str,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    commit_sha: Option<&str>,
+) -> Result<Run, String> {
+    // Garante que /etc/workploy/config.json tenha as receitas e encadeamentos
+    // atualizados para que `on_success` continue funcionando 24/7 na VPS.
+    let (cfg_opt, gh_tok_opt) = {
+        let s = sh.lock().unwrap();
+        let cfg = crate::github::build_runner_config_json(&s.settings, &s.workflows, &server.id).ok();
+        let needs_tok = crate::github::server_needs_github_token(&s.settings, &server.id);
+        let tok = if needs_tok {
+            if !s.settings.github_token.trim().is_empty() {
+                Some(s.settings.github_token.trim().to_string())
+            } else {
+                vault::load_secret(vault::KEY_GITHUB_PAT).ok().flatten()
+            }
+        } else {
+            None
+        };
+        (cfg, tok)
+    };
+    if let Some(cfg_json) = cfg_opt {
+        let upload_cfg_cmd = "sh -c 'if [ \"$(id -u)\" -eq 0 ]; then SUDO=\"\"; else SUDO=\"sudo -n\"; fi; $SUDO mkdir -p /etc/workploy && $SUDO tee /etc/workploy/config.json >/dev/null'";
+        let _ = ssh_run_with_stdin(server, upload_cfg_cmd, cfg_json.as_bytes());
+    }
+    if let Some(tok) = gh_tok_opt.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let upload_tok_cmd = "sh -c 'if [ \"$(id -u)\" -eq 0 ]; then SUDO=\"\"; else SUDO=\"sudo -n\"; fi; $SUDO tee /etc/workploy/github_token >/dev/null && $SUDO chmod 600 /etc/workploy/github_token'";
+        let _ = ssh_run_with_stdin(server, upload_tok_cmd, tok.as_bytes());
+    }
+
+    let port = runner_http_port(server);
+    let payload = serde_json::json!({
+        "workflow_id": wf.id,
+        "workflow": wf,
+        "trigger_label": trigger_label,
+        "repo": repo.unwrap_or(""),
+        "branch": branch.unwrap_or("main"),
+        "commit_sha": commit_sha.unwrap_or(""),
+        "actor": "maestro",
+    });
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("Falha ao serializar disparo para VPS: {e}"))?;
+    let cmd = format!(
+        "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:{port}/trigger'"
+    );
+    let (ok, stdout, stderr) = ssh_run_with_stdin(server, &cmd, &payload_bytes)?;
+    if !ok {
+        let detail = crate::diagnostic::humanize_transport_error(stderr.trim());
+        return Err(detail);
+    }
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Resposta inválida do runner em '{}': {e}", server.name))?;
+    if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("erro desconhecido");
+        return Err(format!("Runner '{}' recusou o disparo: {err}", server.name));
+    }
+    if let Some(run_val) = v.get("run").filter(|x| x.is_object())
+        && let Ok(mut run) = serde_json::from_value::<Run>(run_val.clone())
+    {
+        run.vps_run_id = Some(run.id.clone());
+        run.vps_server_id = Some(server.id.clone());
+        return Ok(run);
+    }
+    let rid = v
+        .get("run_id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "Runner não retornou run_id.".to_string())?;
+    Ok(Run {
+        id: rid.to_string(),
+        workflow_id: wf.id.clone(),
+        workflow_name: wf.name.clone(),
+        status: RunStatus::Queued,
+        trigger_label: trigger_label.to_string(),
+        title: trigger_label.to_string(),
+        number: 1,
+        commit: commit_sha.map(str::to_string),
+        started_at: stamp_list(now_ts()),
+        started_ts: Some(now_ts()),
+        finished_at: None,
+        steps: Vec::new(),
+        approved: false,
+        cancel_requested: false,
+        secs: 0.0,
+        actor: "workploy-runner".into(),
+        repo_name: repo.map(str::to_string),
+        branch: branch.unwrap_or("main").to_string(),
+        summary: String::new(),
+        annotations: Vec::new(),
+        vps_run_id: Some(rid.to_string()),
+        vps_server_id: Some(server.id.clone()),
+    })
+}
+
+pub fn sync_vps_runs_blocking_silent(sh: &SharedHandle, server: &VpsServer) -> bool {
+    let port = runner_http_port(server);
+    let cmd = format!(
+        "sh -c 'TOKEN=$(cat /etc/workploy/token 2>/dev/null) && curl -fsS -H \"Authorization: Bearer $TOKEN\" http://127.0.0.1:{port}/runs'"
+    );
+    let Ok((true, stdout, _)) = ssh_run_capture(server, &cmd) else {
+        return false;
+    };
+    let Ok(remote_runs) = serde_json::from_str::<Vec<Run>>(&stdout) else {
+        return false;
+    };
+    {
+        let mut s = sh.lock().unwrap();
+        merge_remote_runs(&mut s.runs, remote_runs, &server.id);
+        save_runs(&s);
+    }
+    engine::notify(sh);
+    true
+}
+
+pub fn spawn_vps_runs_poller(sh: SharedHandle) {
+    std::thread::spawn(move || {
+        let mut last_idle_poll = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let (active_servers, idle_servers) = {
+                let s = sh.lock().unwrap();
+                let mut active_ids: Vec<String> = Vec::new();
+                for r in &s.runs {
+                    if r.status.active()
+                        && r.vps_run_id.is_some()
+                        && let Some(sid) = &r.vps_server_id
+                        && !active_ids.contains(sid)
+                    {
+                        active_ids.push(sid.clone());
+                    }
+                }
+                let active: Vec<VpsServer> = s
+                    .settings
+                    .servers
+                    .iter()
+                    .filter(|srv| {
+                        !srv.host.trim().is_empty()
+                            && active_ids.iter().any(|id| id == &srv.id)
+                    })
+                    .cloned()
+                    .collect();
+                let idle: Vec<VpsServer> = s
+                    .settings
+                    .servers
+                    .iter()
+                    .filter(|srv| {
+                        srv.runner_installed
+                            && !srv.host.trim().is_empty()
+                            && !active_ids.iter().any(|id| id == &srv.id)
+                    })
+                    .cloned()
+                    .collect();
+                (active, idle)
+            };
+
+            for srv in active_servers {
+                let _ = sync_vps_runs_blocking_silent(&sh, &srv);
+            }
+            if !idle_servers.is_empty() && last_idle_poll.elapsed() >= Duration::from_secs(20) {
+                last_idle_poll = Instant::now();
+                for srv in idle_servers {
+                    let _ = sync_vps_runs_blocking_silent(&sh, &srv);
+                }
+            }
+        }
+    });
+}
+
 pub fn sync_vps_runs(sh: &SharedHandle, server_id: &str) {
     let server = {
         let s = sh.lock().unwrap();
@@ -1885,12 +2211,18 @@ pub fn sync_vps_runs(sh: &SharedHandle, server_id: &str) {
 }
 
 pub fn remote_approve_or_cancel(sh: &SharedHandle, server_id: &str, run_id: &str, approve: bool) {
-    let server = {
+    let (server, remote_rid) = {
         let s = sh.lock().unwrap();
         let Some(srv) = s.settings.servers.iter().find(|v| v.id == server_id).cloned() else {
             return;
         };
-        srv
+        let remote_id = s
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .and_then(|r| r.vps_run_id.clone())
+            .unwrap_or_else(|| run_id.to_string());
+        (srv, remote_id)
     };
 
     let sh2 = sh.clone();
@@ -1898,7 +2230,7 @@ pub fn remote_approve_or_cancel(sh: &SharedHandle, server_id: &str, run_id: &str
     let sid = server_id.to_string();
     std::thread::spawn(move || {
         let action = if approve { "approve" } else { "cancel" };
-        let cmd = build_runner_action_cmd(runner_http_port(&server), &sanitize_run_id(&rid), action);
+        let cmd = build_runner_action_cmd(runner_http_port(&server), &sanitize_run_id(&remote_rid), action);
         let status_msg = match ssh_run_capture(&server, &cmd) {
             Ok((true, _, _)) => {
                 let mut s = sh2.lock().unwrap();
@@ -2366,6 +2698,24 @@ RUNNER_ACTIVE=1\r\n";
         remote_approved.approved = true;
         merge_remote_runs(&mut fresh, vec![remote_approved], "vps-a");
         assert!(fresh[0].approved, "aprovação consolidada no runner chega ao espelho");
+    }
+
+    #[test]
+    fn merge_remote_runs_matches_by_vps_run_id_and_preserves_local_id() {
+        let mut local = vec![Run {
+            id: "run-local-placeholder".into(),
+            vps_run_id: Some("run-vps-99".into()),
+            vps_server_id: Some("vps-a".into()),
+            ..run_for_merge("run-local-placeholder", RunStatus::Queued, false)
+        }];
+        let mut remote = run_for_merge("run-vps-99", RunStatus::Running, false);
+        remote.title = "Executando na VPS".into();
+        merge_remote_runs(&mut local, vec![remote], "vps-a");
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].id, "run-local-placeholder");
+        assert_eq!(local[0].vps_run_id.as_deref(), Some("run-vps-99"));
+        assert_eq!(local[0].status, RunStatus::Running);
+        assert_eq!(local[0].title, "Executando na VPS");
     }
 
     #[test]

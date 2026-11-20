@@ -817,6 +817,11 @@ pub fn build_runner_config_json(settings: &Settings, workflows: &[Workflow], ser
         ) {
             needed_wf_ids.insert(wid);
         }
+        for wf in workflows {
+            if wf.repo_id.as_deref() == Some(b.id.as_str()) {
+                needed_wf_ids.insert(wf.id.clone());
+            }
+        }
     }
     for wf in workflows {
         if wf.server_id.as_deref() == Some(server_id) {
@@ -2448,14 +2453,38 @@ fn workflow_source_diverged(src: &WorkflowSource, current_sha: Option<&str>) -> 
 /// `.workploy.yml` e `.workploy.yaml` na raiz; quando a raiz não tem
 /// `.workploy.yml`, lista também `infra/workploy/*.yml|*.yaml` via Contents
 /// API. Faz rede (1–2 chamadas): chame fora da thread de UI.
+fn build_ref_query_for_branch(branch: Option<&str>) -> String {
+    let Some(raw) = branch.map(str::trim).filter(|b| !b.is_empty() && *b != "*") else {
+        return String::new();
+    };
+    let primary = expand_branch_targets(raw, "")
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if primary.is_empty() {
+        String::new()
+    } else {
+        format!("?ref={}", encode_query_component(&primary))
+    }
+}
+
 pub fn fetch_repo_yaml_candidates(sh: &SharedHandle, full_name: &str) -> Vec<String> {
+    fetch_repo_yaml_candidates_on_branch(sh, full_name, None)
+}
+
+pub fn fetch_repo_yaml_candidates_on_branch(
+    sh: &SharedHandle,
+    full_name: &str,
+    branch: Option<&str>,
+) -> Vec<String> {
     let repo = full_name.trim();
     if repo.is_empty() {
         return Vec::new();
     }
+    let ref_query = build_ref_query_for_branch(branch);
     let token = resolve_github_token(sh, None);
     let root_names: Vec<String> = match github_get_request(
-        &format!("https://api.github.com/repos/{repo}/contents/"),
+        &format!("https://api.github.com/repos/{repo}/contents/{ref_query}"),
         token.as_deref(),
     )
     .call()
@@ -2490,7 +2519,7 @@ pub fn fetch_repo_yaml_candidates(sh: &SharedHandle, full_name: &str) -> Vec<Str
     }
     if !has_yml
         && let Ok(resp) = github_get_request(
-            &format!("https://api.github.com/repos/{repo}/contents/infra/workploy"),
+            &format!("https://api.github.com/repos/{repo}/contents/infra/workploy{ref_query}"),
             token.as_deref(),
         )
         .call()
@@ -2523,16 +2552,30 @@ pub fn fetch_repo_yaml_candidates(sh: &SharedHandle, full_name: &str) -> Vec<Str
     out
 }
 
-/// Lê um yml de receita no repo (branch padrão) e devolve `(texto, sha)`.
+/// Lê um yml de receita no repo (branch do vínculo ou padrão) e devolve `(texto, sha)`.
 /// Faz rede: chame fora da thread de UI.
 pub fn fetch_repo_yaml(
     sh: &SharedHandle,
     full_name: &str,
     path: &str,
 ) -> Result<(String, Option<String>), String> {
+    fetch_repo_yaml_on_branch(sh, full_name, path, None)
+}
+
+pub fn fetch_repo_yaml_on_branch(
+    sh: &SharedHandle,
+    full_name: &str,
+    path: &str,
+    branch: Option<&str>,
+) -> Result<(String, Option<String>), String> {
     let repo = full_name.trim().to_string();
     let token = resolve_github_token(sh, None);
-    fetch_repo_file_with_sha(&repo, path, "", token.as_deref())
+    let ref_query = build_ref_query_for_branch(branch);
+    match fetch_repo_file_with_sha(&repo, path, &ref_query, token.as_deref()) {
+        Ok(res) => Ok(res),
+        Err(_) if !ref_query.is_empty() => fetch_repo_file_with_sha(&repo, path, "", token.as_deref()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Resultado do merge de uma receita importada do repo.
@@ -2586,9 +2629,11 @@ fn merge_repo_workflow(
         )
     };
     wf.id = existing_id.clone();
-    wf.on_success = existing_on_success;
-    wf.server_id = existing_server;
-    wf.repo_id = existing_repo;
+    if wf.on_success.is_none() {
+        wf.on_success = existing_on_success;
+    }
+    wf.server_id = existing_server.or_else(|| binding.target_server_id.clone());
+    wf.repo_id = existing_repo.or_else(|| Some(binding.id.clone()));
     wf.source = Some(source.clone());
     s.workflows[idx] = wf;
     MergeKind::Updated {
@@ -2670,7 +2715,12 @@ pub fn import_workflow_from_repo(sh: &SharedHandle, binding_id: &str, path: &str
         ));
     }
 
-    let (yaml_text, sha) = match fetch_repo_yaml(sh, &binding.full_name, clean_path) {
+    let (yaml_text, sha) = match fetch_repo_yaml_on_branch(
+        sh,
+        &binding.full_name,
+        clean_path,
+        Some(&binding.branch),
+    ) {
         Ok(v) => v,
         Err(err) => return Some(finish_import_error(sh, binding_id, err)),
     };
@@ -2697,11 +2747,39 @@ pub fn import_workflow_from_repo(sh: &SharedHandle, binding_id: &str, path: &str
     let mut skipped: Vec<String> = Vec::new();
     {
         let mut s = sh.lock().unwrap();
+        let mut id_remap: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut touched_ids: Vec<String> = Vec::new();
         for wf in recipes {
+            let parsed_id = wf.id.clone();
+            let parsed_name_key = wf.name.to_ascii_lowercase();
             match merge_repo_workflow(&mut s, &binding, wf, &source) {
-                MergeKind::Created { id, name } => created.push((id, name)),
-                MergeKind::Updated { id, name } => updated.push((id, name)),
+                MergeKind::Created { id, name } => {
+                    id_remap.insert(parsed_id, id.clone());
+                    id_remap.insert(parsed_name_key, id.clone());
+                    touched_ids.push(id.clone());
+                    created.push((id, name));
+                }
+                MergeKind::Updated { id, name } => {
+                    id_remap.insert(parsed_id, id.clone());
+                    id_remap.insert(parsed_name_key, id.clone());
+                    touched_ids.push(id.clone());
+                    updated.push((id, name));
+                }
                 MergeKind::Skipped { name } => skipped.push(name),
+            }
+        }
+        // Se uma receita do lote apontava para o id provisório de outra receita
+        // do mesmo YAML (que manteve o id antigo ao atualizar in-place), ajusta
+        // `on_success` para o id realmente persistido.
+        for wf in &mut s.workflows {
+            if touched_ids.contains(&wf.id)
+                && let Some(target) = &wf.on_success
+                && let Some(kept) = id_remap
+                    .get(target)
+                    .or_else(|| id_remap.get(&target.to_ascii_lowercase()))
+            {
+                wf.on_success = Some(kept.clone());
             }
         }
         // A cópia local acabou de sair do repo: avisos anti-drift destas

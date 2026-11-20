@@ -1556,7 +1556,7 @@ pub fn mount_modal(s: &AppState, t: UiTheme, k: &Kit, layer: &mut Vec<El>) {
                 .w_full()
                 .gap(12.0)
                 .child(
-                    text("O repositório vira a fonte da verdade: o Workploy procura .workploy.yml na raiz (ou receitas em infra/workploy/*.yml) e importa ou atualiza preservando id, encadeamento e vínculos.")
+                    text("O repositório vira a fonte da verdade: o Workploy procura .workploy.yml na raiz (ou receitas em infra/workploy/*.yml), importa ou atualiza preservando id e vínculos, e resolve o encadeamento (on_success) automaticamente.")
                         .font(ty::SMALL)
                         .color(t.text_muted)
                         .wrap(),

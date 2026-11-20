@@ -5,8 +5,9 @@ use workploy::model::{self, AnnKind, Run, RunStatus, StepRun, StepStatus};
 
 use crate::state::{AppState, DetailTab, JobFilter, ToastKind};
 use crate::ui::components::{
-    btn_danger, btn_ghost, btn_neutral, chip, copyable_sha, gate_card, header_card, phase_spinner,
-    primary_button, run_status_icon, status_pill, step_status_icon, surface_card,
+    active_electric_effect, btn_danger, btn_ghost, btn_neutral, chip, copyable_sha, gate_card,
+    header_card, phase_spinner, primary_button, run_progress_strip, run_status_icon, status_pill,
+    step_status_icon, surface_card,
 };
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -215,6 +216,34 @@ pub fn view(
         )
         .child(header_actions);
 
+    let header_body = if run.status.active() {
+        let frac = model::run_progress_frac(run);
+        let (bar_col, cidx) = if run.status == RunStatus::AwaitingApproval {
+            (t.warning, 2.0)
+        } else {
+            (t.info, 4.0)
+        };
+        col()
+            .w_full()
+            .child(header_inner)
+            .child(
+                col()
+                    .w_full()
+                    .px(18.0)
+                    .pb(12.0)
+                    .child(run_progress_strip(
+                        t,
+                        format!("detail-prog-{}", run.id),
+                        frac,
+                        matches!(run.status, RunStatus::Running | RunStatus::Queued),
+                        bar_col,
+                        cidx,
+                    )),
+            )
+    } else {
+        header_inner
+    };
+
     let hdr_card = match run.status {
         RunStatus::Success => el()
             .key("detail-hdr-card")
@@ -222,18 +251,31 @@ pub fn view(
             .radius(10.0)
             .fill(t.surface_1)
             .border(1.0, t.success.alpha(0.35))
-            .child(header_inner.w_full()),
+            .child(header_body.w_full()),
         RunStatus::Failed => el()
             .key("detail-hdr-card")
             .w_full()
             .radius(10.0)
             .fill(t.surface_1)
             .border(1.0, t.danger.alpha(0.40))
-            .child(header_inner.w_full()),
-        RunStatus::AwaitingApproval => {
-            gate_card(t, "detail-hdr-card", 10.0, header_inner)
-        }
-        _ => header_card(t, "detail-hdr-card", 10.0, header_inner),
+            .child(header_body.w_full()),
+        RunStatus::AwaitingApproval => el()
+            .key("detail-hdr-card")
+            .w_full()
+            .radius(10.0)
+            .fill(t.surface_1)
+            .border(1.0, t.warning.alpha(0.38))
+            .child(active_electric_effect(2.0, 10.0, 0.24))
+            .child(header_body.w_full()),
+        RunStatus::Running | RunStatus::Queued => el()
+            .key("detail-hdr-card")
+            .w_full()
+            .radius(10.0)
+            .fill(t.surface_1)
+            .border(1.0, t.info.alpha(0.38))
+            .child(active_electric_effect(4.0, 10.0, 0.30))
+            .child(header_body.w_full()),
+        _ => header_card(t, "detail-hdr-card", 10.0, header_body),
     };
 
     // Sub-menu lateral da execução
@@ -528,7 +570,9 @@ fn detail_sub_menu(
         );
 
     let remote_srv_id = s.is_remote_vps_run(run);
-    let runner_label = if let Some(sid) = remote_srv_id.as_deref() {
+    let runner_label = if let Some(sid) = run.vps_server_id.as_deref() {
+        s.server_label(Some(sid))
+    } else if let Some(sid) = remote_srv_id.as_deref() {
         s.server_label(Some(sid))
     } else if let Some(w) = wf {
         if w.runner == workploy::model::RunnerKind::Ssh {
@@ -937,16 +981,32 @@ fn summary_view(s: &AppState, t: UiTheme, run: &Run) -> El {
         });
     }
 
-    // 5. Annotations card (expandable)
-    if !run.annotations.is_empty() {
-        let total = run.annotations.len();
+    // 5. Annotations / Failure diagnostics card (expandable)
+    let computed_anns: Vec<workploy::model::Annotation> = if run.annotations.is_empty()
+        && run.status == RunStatus::Failed
+    {
+        run.steps
+            .iter()
+            .filter(|st| st.status == StepStatus::Failed)
+            .flat_map(|st| workploy::diagnostic::diagnose_step_failure(st).1)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let effective_anns: &[workploy::model::Annotation] = if run.annotations.is_empty() {
+        &computed_anns
+    } else {
+        &run.annotations
+    };
+    if !effective_anns.is_empty() {
+        let total = effective_anns.len();
         let show_n = if s.annotations_expanded {
             total
         } else {
             total.min(2)
         };
         let mut ann_list = col().w_full().gap(8.0);
-        for (i, ann) in run.annotations.iter().take(show_n).enumerate() {
+        for (i, ann) in effective_anns.iter().take(show_n).enumerate() {
             let (bg, fg, label) = match ann.kind {
                 AnnKind::Error => (t.danger_bg, t.danger, "Erro"),
                 AnnKind::Warning => (t.warning_bg, t.warning, "Aviso"),
@@ -993,9 +1053,13 @@ fn summary_view(s: &AppState, t: UiTheme, run: &Run) -> El {
             .justify_between()
             .center_y()
             .child(
-                text(format!("Anotações ({total})"))
-                    .font(ty::H3)
-                    .color(t.text_primary),
+                text(if run.status == RunStatus::Failed {
+                    format!("Diagnóstico e anotações ({total})")
+                } else {
+                    format!("Anotações ({total})")
+                })
+                .font(ty::H3)
+                .color(t.text_primary),
             );
         if total > 2 {
             ann_hdr = ann_hdr.child(btn_ghost(

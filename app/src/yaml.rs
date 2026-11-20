@@ -1,4 +1,32 @@
+use std::collections::HashMap;
+
 use crate::model::*;
+
+fn unquote_scalar(raw: &str) -> String {
+    let t = raw.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let inner = &t[1..t.len() - 1];
+        return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        let inner = &t[1..t.len() - 1];
+        return inner.replace("''", "'");
+    }
+    if let Some((before, _)) = t.split_once(" #") {
+        before.trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn is_block_scalar_indicator(raw: &str) -> Option<bool> {
+    let style = raw.split_once(" #").map(|(a, _)| a.trim()).unwrap_or(raw.trim());
+    match style {
+        "|" | "|-" | "|+" => Some(false),
+        ">" | ">-" | ">+" => Some(true),
+        _ => None,
+    }
+}
 
 pub fn export_yaml(wf: &Workflow) -> String {
     let on = match wf.trigger {
@@ -9,10 +37,11 @@ pub fn export_yaml(wf: &Workflow) -> String {
         RunnerKind::Local => "local",
         RunnerKind::Ssh => "self-hosted",
     };
-    let mut out = format!(
-        "name: {}\non: [{}]\n\njobs:\n  build:\n    runs-on: {runner}\n    steps:\n",
-        wf.name, on
-    );
+    let mut out = format!("name: {}\non: [{}]\n", wf.name, on);
+    if !wf.workdir.trim().is_empty() {
+        out.push_str(&format!("workdir: {}\n", wf.workdir.trim()));
+    }
+    out.push_str(&format!("\njobs:\n  build:\n    runs-on: {runner}\n    steps:\n"));
     for s in &wf.steps {
         out.push_str(&format!("      - name: {}\n", s.name));
         if s.run.contains('\n') {
@@ -44,56 +73,107 @@ fn apply_key(
     rest: &str,
     in_block: &mut bool,
     block_indent: &mut usize,
+    block_content_indent: &mut Option<usize>,
+    block_folded: &mut bool,
     raw_line: &str,
 ) {
     let Some(step) = cur.as_mut() else { return };
     if let Some(v) = rest.strip_prefix("name:") {
-        step.name = v.trim().trim_matches('"').to_string();
+        step.name = unquote_scalar(v);
     } else if let Some(v) = rest.strip_prefix("run:") {
         let v = v.trim();
-        if v == "|" || v == ">" {
+        if let Some(folded) = is_block_scalar_indicator(v) {
             *in_block = true;
             *block_indent = raw_line.len() - raw_line.trim_start().len();
+            *block_content_indent = None;
+            *block_folded = folded;
         } else {
-            step.run = v.trim_matches('"').to_string();
+            step.run = unquote_scalar(v);
         }
-    } else if let Some(v) = rest.strip_prefix("x-approval:") {
-        step.approval = v.trim() == "true";
+    } else if let Some(v) = rest
+        .strip_prefix("x-approval:")
+        .or_else(|| rest.strip_prefix("approval:"))
+    {
+        step.approval = unquote_scalar(v).eq_ignore_ascii_case("true");
     }
 }
 
-pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
+fn parse_yaml_with_symbolic_id(text: &str, id: String) -> Result<(Workflow, Option<String>), String> {
     let mut name = String::from("Fluxo importado");
+    let mut symbolic_id: Option<String> = None;
     let mut trigger = Trigger::Manual;
     let mut runner = RunnerKind::Ssh;
+    let mut workdir = String::new();
     let mut on_success = None;
     let mut server_id = None;
     let mut repo_id = None;
     let mut steps: Vec<Step> = Vec::new();
     let mut cur: Option<Step> = None;
+
     let mut in_run_block = false;
     let mut block_indent = 0usize;
+    let mut block_content_indent: Option<usize> = None;
+    let mut block_folded = false;
+
+    let mut in_on_block = false;
+    let mut on_indent = 0usize;
+
+    let finish_run_block = |cur: &mut Option<Step>, block_folded: bool| {
+        if let Some(s) = cur.as_mut() {
+            if block_folded {
+                let joined = s
+                    .run
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                s.run = joined;
+            } else {
+                s.run = s.run.trim_end().to_string();
+            }
+        }
+    };
 
     for raw in text.lines() {
         let line = raw.trim_end();
         let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
         if in_run_block {
-            let indent = line.len() - line.trim_start().len();
             if trimmed.is_empty() || indent > block_indent {
                 if let Some(s) = cur.as_mut() {
-                    s.run.push_str(trimmed);
-                    s.run.push('\n');
+                    if trimmed.is_empty() {
+                        s.run.push('\n');
+                    } else {
+                        let ci = *block_content_indent.get_or_insert(indent);
+                        let drop = ci.min(indent);
+                        s.run.push_str(&line[drop..]);
+                        s.run.push('\n');
+                    }
                 }
                 continue;
             }
             in_run_block = false;
-            if let Some(s) = cur.as_mut() {
-                s.run = s.run.trim_end().to_string();
-            }
+            block_content_indent = None;
+            finish_run_block(&mut cur, block_folded);
         }
+
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+
+        if in_on_block {
+            if indent > on_indent {
+                let low = trimmed.to_ascii_lowercase();
+                if low == "push:" || low.starts_with("push:") || low == "- push" {
+                    trigger = Trigger::Push;
+                }
+                continue;
+            }
+            in_on_block = false;
+        }
+
         if trimmed.starts_with("- ") || trimmed == "-" {
             if let Some(s) = cur.take() {
                 steps.push(s);
@@ -105,52 +185,113 @@ pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
             });
             let rest = trimmed.trim_start_matches('-').trim();
             if !rest.is_empty() {
-                apply_key(&mut cur, rest, &mut in_run_block, &mut block_indent, line);
+                apply_key(
+                    &mut cur,
+                    rest,
+                    &mut in_run_block,
+                    &mut block_indent,
+                    &mut block_content_indent,
+                    &mut block_folded,
+                    line,
+                );
+            }
+            continue;
+        }
+
+        if cur.is_none()
+            && steps.is_empty()
+            && let Some(v) = trimmed.strip_prefix("name:")
+        {
+            let val = unquote_scalar(v);
+            if !val.is_empty() {
+                name = val;
             }
             continue;
         }
         if cur.is_none()
             && steps.is_empty()
-            && let Some(v) = trimmed.strip_prefix("name:")
+            && let Some(v) = trimmed.strip_prefix("id:")
         {
-            name = v.trim().trim_matches('"').to_string();
+            let val = unquote_scalar(v);
+            if !val.is_empty() {
+                symbolic_id = Some(val);
+            }
             continue;
         }
         if let Some(v) = trimmed.strip_prefix("on:") {
-            if v.contains("push") {
+            let val = unquote_scalar(v);
+            if val.is_empty() {
+                in_on_block = true;
+                on_indent = indent;
+            } else if val.to_ascii_lowercase().contains("push") {
                 trigger = Trigger::Push;
             }
             continue;
         }
+        if let Some(v) = trimmed.strip_prefix("trigger:") {
+            let val = unquote_scalar(v).to_ascii_lowercase();
+            trigger = match val.as_str() {
+                "push" => Trigger::Push,
+                "folder" | "watch" => Trigger::Folder,
+                _ => Trigger::Manual,
+            };
+            continue;
+        }
+        if let Some(v) = trimmed.strip_prefix("workdir:") {
+            let val = unquote_scalar(v);
+            if !val.is_empty() {
+                workdir = val;
+            }
+            continue;
+        }
         if let Some(v) = trimmed.strip_prefix("runs-on:") {
-            runner = if v.trim().trim_matches('"') == "local" {
+            let val = unquote_scalar(v);
+            runner = if val.eq_ignore_ascii_case("local") {
                 RunnerKind::Local
             } else {
                 RunnerKind::Ssh
             };
             continue;
         }
-        if let Some(v) = trimmed.strip_prefix("x-chain:") {
-            on_success = Some(v.trim().trim_matches('"').to_string());
+        if let Some(v) = trimmed
+            .strip_prefix("x-chain:")
+            .or_else(|| trimmed.strip_prefix("on_success:"))
+        {
+            let val = unquote_scalar(v);
+            if !val.is_empty() {
+                on_success = Some(val);
+            }
             continue;
         }
         if let Some(v) = trimmed.strip_prefix("x-server:") {
-            let val = v.trim().trim_matches('"');
+            let val = unquote_scalar(v);
             if !val.is_empty() {
-                server_id = Some(val.to_string());
+                server_id = Some(val);
             }
             continue;
         }
         if let Some(v) = trimmed.strip_prefix("x-repo:") {
-            let val = v.trim().trim_matches('"');
+            let val = unquote_scalar(v);
             if !val.is_empty() {
-                repo_id = Some(val.to_string());
+                repo_id = Some(val);
             }
             continue;
         }
         if cur.is_some() {
-            apply_key(&mut cur, trimmed, &mut in_run_block, &mut block_indent, line);
+            apply_key(
+                &mut cur,
+                trimmed,
+                &mut in_run_block,
+                &mut block_indent,
+                &mut block_content_indent,
+                &mut block_folded,
+                line,
+            );
         }
+    }
+
+    if in_run_block {
+        finish_run_block(&mut cur, block_folded);
     }
     if let Some(s) = cur.take() {
         steps.push(s);
@@ -163,23 +304,32 @@ pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
             s.name = format!("Passo {}", i + 1);
         }
     }
-    Ok(Workflow {
-        id,
-        name,
-        trigger,
-        runner,
-        workdir: String::new(),
-        steps,
-        on_success,
-        server_id,
-        repo_id,
-        source: None,
-    })
+    Ok((
+        Workflow {
+            id,
+            name,
+            trigger,
+            runner,
+            workdir,
+            steps,
+            on_success,
+            server_id,
+            repo_id,
+            source: None,
+        },
+        symbolic_id,
+    ))
+}
+
+pub fn import_yaml(text: &str, id: String) -> Result<Workflow, String> {
+    parse_yaml_with_symbolic_id(text, id).map(|(wf, _)| wf)
 }
 
 /// Importa um YAML que pode ser uma receita única (formato clássico) ou um
 /// documento com a chave `workflows:` listando várias receitas. Cada receita
-/// da lista é reutilizada por `import_yaml`, recebendo um id novo.
+/// da lista é reutilizada por `import_yaml`, recebendo um id novo, e referências
+/// simbólicas em `on_success:` / `x-chain:` (`id:` ou nome de outra receita do
+/// mesmo arquivo) são resolvidas para o id real gerado.
 pub fn import_yaml_multi(text: &str) -> Result<Vec<Workflow>, String> {
     let is_list_doc = text.lines().any(|l| {
         let trimmed = l.trim();
@@ -198,12 +348,29 @@ pub fn import_yaml_multi(text: &str) -> Result<Vec<Workflow>, String> {
         return Err("Nenhuma receita encontrada na lista 'workflows'.".into());
     }
     let mut out = Vec::with_capacity(items.len());
+    let mut ref_to_id: HashMap<String, String> = HashMap::new();
+
     for (idx, item) in items.iter().enumerate() {
-        let wf = import_yaml(item, new_id("wf")).map_err(|e| {
+        let (wf, sym_id) = parse_yaml_with_symbolic_id(item, new_id("wf")).map_err(|e| {
             format!("Receita {} da lista 'workflows' é inválida: {e}", idx + 1)
         })?;
+        if let Some(sym) = sym_id {
+            ref_to_id.insert(sym, wf.id.clone());
+        }
+        ref_to_id.insert(wf.name.to_ascii_lowercase(), wf.id.clone());
         out.push(wf);
     }
+
+    for wf in &mut out {
+        if let Some(target) = &wf.on_success
+            && let Some(resolved) = ref_to_id
+                .get(target)
+                .or_else(|| ref_to_id.get(&target.to_ascii_lowercase()))
+        {
+            wf.on_success = Some(resolved.clone());
+        }
+    }
+
     Ok(out)
 }
 
@@ -293,7 +460,7 @@ mod tests {
                 name: "teste".into(),
                 trigger: Trigger::Push,
                 runner,
-                workdir: String::new(),
+                workdir: "/srv/app".into(),
                 steps: vec![Step {
                     name: "teste".into(),
                     run: "echo ok".into(),
@@ -306,6 +473,7 @@ mod tests {
             };
             let imported = import_yaml(&export_yaml(&wf), "a".into()).unwrap();
             assert_eq!(imported.runner, runner);
+            assert_eq!(imported.workdir, "/srv/app");
             assert_eq!(imported.on_success, wf.on_success);
             assert_eq!(imported.server_id, wf.server_id);
             assert_eq!(imported.repo_id, wf.repo_id);
@@ -367,13 +535,43 @@ workflows:
         assert_eq!(list[0].runner, RunnerKind::Local);
         assert_eq!(list[0].steps.len(), 2);
         assert_eq!(list[0].steps[0].name, "Instalar dependências");
-        // O parser clássico de bloco `run: |` mantém a quebra final quando o
-        // documento acaba dentro do bloco; a lista preserva essa paridade.
         assert_eq!(list[0].steps[1].run.trim_end(), "pnpm test\npnpm lint");
         assert_ne!(list[0].id, list[1].id, "cada receita recebe id próprio");
         assert_eq!(list[1].name, "Deploy VPS");
         assert_eq!(list[1].runner, RunnerKind::Ssh);
         assert_eq!(list[1].server_id.as_deref(), Some("vps-prod"));
+        assert!(list[1].steps[0].approval);
+    }
+
+    #[test]
+    fn import_yaml_multi_resolves_symbolic_id_and_workploy_shorthand_fields() {
+        let doc = "\
+workflows:
+  - id: wf-ci
+    name: CI Principal
+    trigger: push
+    on_success: wf-deploy
+    steps:
+      - name: Testes
+        run: |-
+          if [ -f package.json ]; then
+            pnpm test
+          fi
+  - id: wf-deploy
+    name: Deploy Produção
+    trigger: manual
+    workdir: /srv/app
+    steps:
+      - name: Rebuild
+        run: docker compose up -d --build
+        approval: true
+";
+        let list = import_yaml_multi(doc).expect("formato shorthand deve importar");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].trigger, Trigger::Push);
+        assert_eq!(list[0].on_success.as_deref(), Some(list[1].id.as_str()));
+        assert!(list[0].steps[0].run.contains("  pnpm test"));
+        assert_eq!(list[1].workdir, "/srv/app");
         assert!(list[1].steps[0].approval);
     }
 

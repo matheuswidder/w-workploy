@@ -9,8 +9,9 @@ use workploy::model::{self, PlatformTarget, RepoBinding, Run, RunStatus, StepSta
 use crate::gfx::{MARK_PULSE_RADAR, PULSE_INTENSITY_ACTIVE, PULSE_TEMPO_ACTIVE};
 use crate::state::{AppState, ModalState, SettingsTab, StatusFilter, platform_compat_warning};
 use crate::ui::components::{
-    btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha, header_card, pill_badge,
-    primary_button, run_status_icon, status_pill, surface_card,
+    active_electric_effect, btn_danger, btn_ghost, btn_icon, btn_neutral, chip, copyable_sha,
+    header_card, pill_badge, primary_button, run_progress_strip, run_status_icon, status_pill,
+    surface_card,
 };
 use crate::ui::icons;
 use crate::ui::theme::{UiTheme, ty};
@@ -911,15 +912,15 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
     };
 
     let target_label = match b.target_server_id.as_deref() {
-        None => "Local".to_string(),
-        Some(sid) => s
-            .snapshot
-            .settings
-            .servers
-            .iter()
-            .find(|v| v.id == sid)
-            .map(|v| v.name.clone())
-            .unwrap_or_else(|| "VPS removida".into()),
+        None => "Local (Esta máquina)".to_string(),
+        Some(sid) => {
+            let srv = s.snapshot.settings.servers.iter().find(|v| v.id == sid);
+            match srv {
+                Some(v) if v.runner_installed => format!("VPS: {} · Runner 24/7", v.name),
+                Some(v) => format!("VPS: {} · SSH direto", v.name),
+                None => "VPS removida".to_string(),
+            }
+        }
     };
     let mode_label = match b.trigger_mode {
         TriggerMode::WebhookOnVps => "Webhook 24/7",
@@ -1329,6 +1330,28 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             .help("Dispara imediatamente uma execução para este projeto usando a receita e o destino configurados."),
         );
 
+    let header_dest_badge = match b.target_server_id.as_deref() {
+        None => pill_badge(t, "Destino: Local", t.text_secondary, t.surface_2),
+        Some(sid) => {
+            let srv = s.snapshot.settings.servers.iter().find(|v| v.id == sid);
+            match srv {
+                Some(v) if v.runner_installed => pill_badge(
+                    t,
+                    &format!("VPS: {} · Runner 24/7", v.name),
+                    t.success,
+                    t.success_bg,
+                ),
+                Some(v) => pill_badge(
+                    t,
+                    &format!("VPS: {} · SSH direto", v.name),
+                    t.accent,
+                    t.accent_soft,
+                ),
+                None => pill_badge(t, "VPS removida", t.danger, t.danger_bg),
+            }
+        }
+    };
+
     let title_row = row()
         .w_full()
         .min_w(0.0)
@@ -1361,6 +1384,7 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             pill_badge(t, b.platform.label(), t.text_secondary, t.surface_2)
                 .key(format!("project-platform-{}", b.id)),
         )
+        .child(header_dest_badge)
         .child(status_badge);
 
     let mut inner = col()
@@ -1884,6 +1908,31 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
         }
     }
 
+    let effective_binding = s.resolve_binding_for_workflow(&w.id);
+    let effective_server_id = effective_binding
+        .as_ref()
+        .and_then(|b| b.target_server_id.as_deref())
+        .or(w.server_id.as_deref());
+    let dest_label = if effective_server_id.is_some()
+        || w.runner == workploy::model::RunnerKind::Ssh
+    {
+        match effective_server_id {
+            Some(sid) => format!("Destino configurado: {}", s.server_label(Some(sid))),
+            None => "Destino configurado: VPS via SSH (selecione uma VPS no vínculo)".to_string(),
+        }
+    } else {
+        "Destino configurado: Local (Esta máquina)".to_string()
+    };
+    let dest_warn = w.runner == workploy::model::RunnerKind::Ssh
+        && effective_server_id.is_none()
+        && s.snapshot.settings.ssh_host.trim().is_empty();
+    triggers_row = triggers_row.child(pill_badge(
+        t,
+        &dest_label,
+        if dest_warn { t.warning } else { t.accent },
+        if dest_warn { t.warning_bg } else { t.accent_soft },
+    ));
+
     // Receita importada do repo: linha compacta de proveniência
     // (repo · caminho · SHA curto) com "Atualizar do repo" ao lado.
     let mut source_row = None;
@@ -1952,7 +2001,7 @@ fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> E
     summary
 }
 
-fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
+fn run_row(s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
     let rid_open = r.id.clone();
     let rid_logs = r.id.clone();
     let rid_approve = r.id.clone();
@@ -1972,8 +2021,72 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
         .unwrap_or_else(|| r.started_at.clone());
     let dur = model::fmt_dur(r.elapsed_secs());
 
+    let resolved_srv_id = r
+        .vps_server_id
+        .clone()
+        .or_else(|| s.is_remote_vps_run(r))
+        .or_else(|| {
+            s.snapshot
+                .workflows
+                .iter()
+                .find(|w| w.id == r.workflow_id)
+                .and_then(|w| w.server_id.clone())
+        })
+        .or_else(|| {
+            r.repo_name.as_deref().and_then(|rn| {
+                s.snapshot
+                    .settings
+                    .repo_bindings
+                    .iter()
+                    .find(|b| b.full_name.eq_ignore_ascii_case(rn.trim()))
+                    .and_then(|b| b.target_server_id.clone())
+            })
+        });
+    let server_badge_label = match resolved_srv_id.as_deref() {
+        Some(sid) => format!("VPS: {}", s.server_label(Some(sid))),
+        None => {
+            let is_ssh = s
+                .snapshot
+                .workflows
+                .iter()
+                .find(|w| w.id == r.workflow_id)
+                .is_some_and(|w| w.runner == model::RunnerKind::Ssh);
+            if is_ssh || r.id.starts_with("run-vps-") {
+                "VPS".to_string()
+            } else {
+                "Local".to_string()
+            }
+        }
+    };
+
     let mut meta = row().gap(8.0).center_y().flex_wrap();
     meta = meta.child(status_pill(t, r.status));
+    meta = meta.child(
+        row()
+            .h(20.0)
+            .px(7.0)
+            .gap(4.0)
+            .center_y()
+            .radius(5.0)
+            .fill(t.surface_2)
+            .child(
+                icon(
+                    if resolved_srv_id.is_some() || server_badge_label.starts_with("VPS") {
+                        &icons::SERVER
+                    } else {
+                        &icons::LAPTOP
+                    },
+                    10.5,
+                )
+                .color(t.text_muted)
+                .a11y_hidden(),
+            )
+            .child(
+                text(server_badge_label)
+                    .font(ty::CAPTION)
+                    .color(t.text_secondary),
+            ),
+    );
     // Execução "quente": vários jobs do mesmo fluxo falharam juntos.
     if r.status == RunStatus::Failed {
         let failed_jobs = r
@@ -2159,6 +2272,40 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
         )
         .child(right_actions);
 
+    let mut title_and_meta = col()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(5.0)
+        .child(
+            text(title)
+                .font(ty::BODY_MED)
+                .color(t.text_primary)
+                .w_full()
+                .truncate(),
+        )
+        .child(meta);
+
+    if let Some(fail_reason) = workploy::diagnostic::short_failure_reason(r) {
+        title_and_meta = title_and_meta.child(
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(6.0)
+                .center_y()
+                .child(icon(&icons::BUG, 11.5).color(t.danger).a11y_hidden())
+                .child(
+                    text(fail_reason)
+                        .font(ty::CAPTION)
+                        .color(t.danger)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .truncate(),
+                ),
+        );
+    }
+
     let content = row()
         .w_full()
         .px(16.0)
@@ -2174,25 +2321,69 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
                 .gap(12.0)
                 .center_y()
                 .child(run_status_icon(t, r.status, 18.0))
-                .child(
-                    col()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .gap(5.0)
-                        .child(
-                            text(title)
-                                .font(ty::BODY_MED)
-                                .color(t.text_primary)
-                                .w_full()
-                                .truncate(),
-                        )
-                        .child(meta),
-                ),
+                .child(title_and_meta),
         )
         .child(right_cluster);
 
-    row()
+    let mut card_body = col().w_full().child(content);
+    if r.status.active() {
+        let frac = model::run_progress_frac(r);
+        let (bar_col, cidx) = if r.status == RunStatus::AwaitingApproval {
+            (t.warning, 2.0)
+        } else {
+            (t.info, 4.0)
+        };
+        let active_step = r
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, st)| matches!(st.status, StepStatus::Running | StepStatus::WaitingApproval));
+        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as u8;
+        let prog_label = if let Some((sidx, st)) = active_step {
+            format!(
+                "Etapa {}/{} · {} ({pct}%)",
+                sidx + 1,
+                r.steps.len().max(1),
+                st.name
+            )
+        } else {
+            format!("{pct}%")
+        };
+        card_body = card_body.child(
+            col()
+                .w_full()
+                .px(16.0)
+                .pb(10.0)
+                .gap(5.0)
+                .child(
+                    row()
+                        .w_full()
+                        .justify_between()
+                        .center_y()
+                        .child(
+                            text(prog_label)
+                                .font(ty::CAPTION)
+                                .color(bar_col)
+                                .truncate(),
+                        )
+                        .child(
+                            text(format!("{pct}%"))
+                                .font(ty::MONO_SM)
+                                .color(t.text_muted),
+                        ),
+                )
+                .child(run_progress_strip(
+                    t,
+                    format!("row-prog-{}", r.id),
+                    frac,
+                    matches!(r.status, RunStatus::Running | RunStatus::Queued),
+                    bar_col,
+                    cidx,
+                )),
+        );
+    }
+
+    let mut card = row()
         .key(format!("run-row-{}", r.id))
         .role("button")
         .label(format!("Abrir execução {} #{}", r.workflow_name, r.number))
@@ -2205,6 +2396,7 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
             match r.status {
                 RunStatus::Failed => t.danger.alpha(0.35),
                 RunStatus::AwaitingApproval => t.warning.alpha(0.38),
+                RunStatus::Running | RunStatus::Queued => t.info.alpha(0.38),
                 _ => t.border_subtle,
             },
         )
@@ -2215,6 +2407,12 @@ fn run_row(_s: &AppState, t: UiTheme, r: &Run, show_wf_name: bool) -> El {
         .press(t.press)
         .press_scale(0.995)
         .motion(motion::SNAPPY)
-        .on_press(move |s: &mut AppState| s.open_run_summary(&rid_open))
-        .child(content)
+        .on_press(move |s: &mut AppState| s.open_run_summary(&rid_open));
+
+    if matches!(r.status, RunStatus::Running | RunStatus::Queued) {
+        card = card.child(active_electric_effect(4.0, 8.0, 0.30));
+    } else if r.status == RunStatus::AwaitingApproval {
+        card = card.child(active_electric_effect(2.0, 8.0, 0.24));
+    }
+    card.child(card_body)
 }

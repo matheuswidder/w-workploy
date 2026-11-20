@@ -2818,6 +2818,29 @@ mod tests {
         // Solar set (themable, `currentColor`): every converted icon must
         // rasterize with real coverage, and none may name its own colors.
         let solar: &[(&'static rune::Icon, &str)] = &[
+            (&ui::icons::PLAY, "play"),
+            (&ui::icons::CHECK_CIRCLE, "check-circle"),
+            (&ui::icons::X_CIRCLE, "x-circle"),
+            (&ui::icons::CLOCK, "clock"),
+            (&ui::icons::BOLT, "bolt"),
+            (&ui::icons::BRANCH, "branch"),
+            (&ui::icons::COMMIT, "commit"),
+            (&ui::icons::REFRESH, "refresh"),
+            (&ui::icons::COPY, "copy"),
+            (&ui::icons::EDIT, "edit"),
+            (&ui::icons::CODE, "code"),
+            (&ui::icons::PLUS, "plus"),
+            (&ui::icons::ARROW_LEFT, "arrow-left"),
+            (&ui::icons::CHEVRON_DOWN, "chevron-down"),
+            (&ui::icons::CHEVRON_RIGHT, "chevron-right"),
+            (&ui::icons::CHEVRON_UP, "chevron-up"),
+            (&ui::icons::LIST, "list"),
+            (&ui::icons::SUN_MOON, "sun-moon"),
+            (&ui::icons::SLIDERS, "sliders"),
+            (&ui::icons::HOME, "home"),
+            (&ui::icons::ACTIVITY, "activity"),
+            (&ui::icons::INFO, "info"),
+            (&ui::icons::EXTERNAL_LINK, "external-link"),
             (&ui::icons::SERVER, "server"),
             (&ui::icons::LAPTOP, "laptop"),
             (&ui::icons::BUG, "bug"),
@@ -3121,5 +3144,50 @@ mod tests {
                 .any(|t| t.options.description.as_deref().is_some_and(|d| d.contains("não foi importada"))),
             "receita sem source deve avisar que não há de onde atualizar"
         );
+    }
+
+    #[test]
+    fn save_workflow_draft_preserves_routing_and_start_workflow_targets_project_vps() {
+        let mut s = AppState::init_demo();
+        // Vincula o workflow `wf-deploy-vps` explicitamente ao projeto `rb-erp` (`vps-prod`).
+        if let Some(wf) = s
+            .snapshot
+            .workflows
+            .iter_mut()
+            .find(|w| w.id == "wf-deploy-vps")
+        {
+            wf.server_id = Some("vps-prod".into());
+            wf.repo_id = Some("rb-erp".into());
+        }
+
+        let mut rt = Runtime::new(s, ui::view, (1280.0, 820.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // Editar e salvar não pode apagar `server_id` nem `repo_id`.
+        rt.update(|st, tx| {
+            st.open_edit_workflow_modal("wf-deploy-vps");
+            st.save_workflow_draft(tx);
+        });
+        rt.frame(1.0 / 60.0);
+        let edited = rt
+            .state
+            .snapshot
+            .workflows
+            .iter()
+            .find(|w| w.id == "wf-deploy-vps")
+            .unwrap();
+        assert_eq!(edited.server_id.as_deref(), Some("vps-prod"));
+        assert_eq!(edited.repo_id.as_deref(), Some("rb-erp"));
+
+        // Disparar `start_workflow` diretamente deve herdar `vps-prod` + `widder/erp-central`!
+        rt.update(|st, tx| {
+            st.start_workflow("wf-deploy-vps", "manual", tx);
+        });
+        rt.frame(1.0 / 60.0);
+        let latest = &rt.state.snapshot.runs[0];
+        assert_eq!(latest.workflow_id, "wf-deploy-vps");
+        assert_eq!(latest.vps_server_id.as_deref(), Some("vps-prod"));
+        assert_eq!(latest.repo_name.as_deref(), Some("widder/erp-central"));
     }
 }
