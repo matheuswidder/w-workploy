@@ -398,10 +398,11 @@ pub fn view(s: &AppState, t: UiTheme) -> El {
 
             // Árvore do projeto: linha vertical ligando o projeto às receitas
             // e um traço horizontal para cada receita (estilo GitHub).
-            if !flow_ys.is_empty() {
+            if let (Some(&first_fy), Some(&last_fy)) = (flow_ys.first(), flow_ys.last()) {
                 let line_x = PILL_INSET + 14.0;
-                let top = (y - ROW_PITCH) + ROW_H - 3.0;
-                let bottom = *flow_ys.last().unwrap_or(&top) + SUB_ROW_H * 0.5;
+                let proj_y = first_fy - ROW_PITCH;
+                let top = proj_y + ROW_H - 6.0;
+                let bottom = last_fy + SUB_ROW_H * 0.5;
                 items.push(
                     el()
                         .key(format!("proj-tree-line-{}", b.id))

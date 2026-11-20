@@ -916,8 +916,8 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
         Some(sid) => {
             let srv = s.snapshot.settings.servers.iter().find(|v| v.id == sid);
             match srv {
-                Some(v) if v.runner_installed => format!("VPS: {} · Runner 24/7", v.name),
-                Some(v) => format!("VPS: {} · SSH direto", v.name),
+                Some(v) if v.runner_installed => format!("{} · Runner 24/7", v.name),
+                Some(v) => format!("{} · SSH direto", v.name),
                 None => "VPS removida".to_string(),
             }
         }
@@ -983,19 +983,21 @@ fn project_card(s: &AppState, t: UiTheme, b: &RepoBinding, main_w: f32) -> El {
         .gap(6.0)
         .center_y()
         .flex_wrap()
-        .child(pill_badge(
-            t,
-            &format!("Destino: {target_label}"),
-            t.accent,
-            t.accent_soft,
-        ))
+        .child(
+            pill_badge(
+                t,
+                &format!("Destino: {target_label}"),
+                t.accent,
+                t.accent_soft,
+            )
+            .key(format!("project-dest-{}", b.id)),
+        )
         .child(pill_badge(
             t,
             &format!("Modo: {mode_label}"),
             t.text_secondary,
             t.surface_2,
-        ))
-        .child(pill_badge(
+        ))        .child(pill_badge(
             t,
             &format!("Receita: {recipe_label}"),
             t.text_secondary,
@@ -1337,13 +1339,13 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             match srv {
                 Some(v) if v.runner_installed => pill_badge(
                     t,
-                    &format!("VPS: {} · Runner 24/7", v.name),
+                    &format!("{} · Runner 24/7", v.name),
                     t.success,
                     t.success_bg,
                 ),
                 Some(v) => pill_badge(
                     t,
-                    &format!("VPS: {} · SSH direto", v.name),
+                    &format!("{} · SSH direto", v.name),
                     t.accent,
                     t.accent_soft,
                 ),
