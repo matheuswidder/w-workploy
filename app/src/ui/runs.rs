@@ -1256,7 +1256,7 @@ fn project_dashboard_header(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             btn_neutral(
                 t,
                 "proj-back-all",
-                "← Todos os projetos",
+                "Todos os projetos",
                 Some(&icons::ARROW_LEFT),
                 32.0,
                 |s: &mut AppState, _| {
@@ -1581,6 +1581,16 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
     let workflows = s.project_workflows(b);
     let mut list = col().w_full().min_w(0.0).gap(8.0);
 
+    let has_repo_source = workflows.iter().any(|w| w.source.is_some());
+    let legacy_count = if has_repo_source {
+        workflows
+            .iter()
+            .filter(|w| w.repo_id.as_deref() == Some(b.id.as_str()) && w.source.is_none())
+            .count()
+    } else {
+        0
+    };
+
     if workflows.is_empty() {
         let bid_gen = b.id.clone();
         let bid_imp = b.id.clone();
@@ -1637,6 +1647,8 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             let wid_open = wf.id.clone();
             let wid_edit = wf.id.clone();
             let wid_run = wf.id.clone();
+            let wid_del = wf.id.clone();
+            let wname_del = wf.name.clone();
             let bid_open = b.id.clone();
 
             let mut badges = row()
@@ -1714,6 +1726,21 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
                         move |s: &mut AppState, tx: &mut Tx| s.start_workflow(&wid_run, "manual", tx),
                     )
                     .help("Dispara imediatamente uma execução manual deste fluxo."),
+                )
+                .child(
+                    btn_icon(
+                        t,
+                        format!("proj-wf-del-{}", wf.id),
+                        "Excluir fluxo",
+                        &icons::TRASH,
+                        28.0,
+                        move |s: &mut AppState, _| {
+                            s.modal = ModalState::DeleteConfirm {
+                                wf_id: wid_del.clone(),
+                                wf_name: wname_del.clone(),
+                            };
+                        },
+                    ),
                 );
 
             list = list.child(
@@ -1758,7 +1785,7 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
         }
     }
 
-    col()
+    let mut sec = col()
         .key("proj-workflows-section")
         .w_full()
         .min_w(0.0)
@@ -1767,8 +1794,50 @@ fn project_workflows_section(s: &AppState, t: UiTheme, b: &RepoBinding) -> El {
             text("Fluxos deste projeto")
                 .font(ty::SMALL_MED)
                 .color(t.text_secondary),
-        )
-        .child(list)
+        );
+    if legacy_count > 0 {
+        let bid_clean = b.id.clone();
+        sec = sec.child(
+            row()
+                .key(format!("proj-legacy-wfs-banner-{}", b.id))
+                .w_full()
+                .min_w(0.0)
+                .px(12.0)
+                .py(9.0)
+                .gap(10.0)
+                .center_y()
+                .flex_wrap()
+                .radius(8.0)
+                .fill(t.warning_bg)
+                .border(1.0, t.warning.alpha(0.38))
+                .child(icon(&icons::INFO, 14.0).color(t.warning).a11y_hidden())
+                .child(
+                    text(format!(
+                        "Este projeto possui {legacy_count} receita(s) antiga(s) gerada(s) antes do .workploy.yml. No push, apenas as receitas do repositório são priorizadas."
+                    ))
+                    .font(ty::CAPTION)
+                    .color(t.warning)
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .wrap(),
+                )
+                .child(
+                    btn_neutral(
+                        t,
+                        format!("proj-clean-legacy-wfs-{}", b.id),
+                        "Limpar receitas antigas",
+                        Some(&icons::TRASH),
+                        28.0,
+                        move |s: &mut AppState, tx: &mut Tx| {
+                            s.cleanup_legacy_project_workflows(&bid_clean, tx);
+                        },
+                    )
+                    .help("Remove apenas as receitas antigas sem origem de repositório deste projeto, mantendo o .workploy.yml."),
+                ),
+        );
+    }
+    sec.child(list)
 }
 
 fn workflow_pipeline_summary(s: &AppState, t: UiTheme, w: &model::Workflow) -> El {

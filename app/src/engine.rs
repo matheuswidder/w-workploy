@@ -1242,6 +1242,14 @@ pub fn matching_workflows_for_binding_with_bindings(
         .filter(|w| w.repo_id.as_deref() == Some(binding.id.as_str()))
         .collect();
     if !by_repo_wfs.is_empty() {
+        let sourced_push_wfs: Vec<String> = by_repo_wfs
+            .iter()
+            .filter(|w| w.trigger == Trigger::Push && w.source.is_some())
+            .map(|w| w.id.clone())
+            .collect();
+        if !sourced_push_wfs.is_empty() {
+            return sourced_push_wfs;
+        }
         let push_wfs: Vec<String> = by_repo_wfs
             .iter()
             .filter(|w| w.trigger == Trigger::Push)

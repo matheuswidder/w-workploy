@@ -1331,6 +1331,9 @@ def resolve_workflows_for_binding(cfg, b):
     if bid:
         by_repo = [w for w in wf_list if w.get("repo_id") == bid]
         if by_repo:
+            sourced_push = [w for w in by_repo if w.get("trigger") == "Push" and w.get("source")]
+            if sourced_push:
+                return sourced_push
             push_only = [w for w in by_repo if w.get("trigger") == "Push"]
             if push_only:
                 return push_only

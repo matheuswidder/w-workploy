@@ -3487,6 +3487,75 @@ impl AppState {
         }
     }
 
+    pub fn cleanup_legacy_project_workflows(&mut self, binding_id: &str, tx: &mut Tx) {
+        let mut removed = 0usize;
+        if self.demo_mode {
+            let has_repo = self
+                .snapshot
+                .workflows
+                .iter()
+                .any(|w| w.repo_id.as_deref() == Some(binding_id) && w.source.is_some());
+            if has_repo {
+                let before = self.snapshot.workflows.len();
+                self.snapshot
+                    .workflows
+                    .retain(|w| !(w.repo_id.as_deref() == Some(binding_id) && w.source.is_none()));
+                removed = before.saturating_sub(self.snapshot.workflows.len());
+            }
+        } else {
+            let installed_servers: Vec<String> = {
+                let mut guard = self.shared.lock().unwrap();
+                let has_repo = guard
+                    .workflows
+                    .iter()
+                    .any(|w| w.repo_id.as_deref() == Some(binding_id) && w.source.is_some());
+                if has_repo {
+                    let before = guard.workflows.len();
+                    guard
+                        .workflows
+                        .retain(|w| !(w.repo_id.as_deref() == Some(binding_id) && w.source.is_none()));
+                    removed = before.saturating_sub(guard.workflows.len());
+                    if removed > 0 {
+                        model::save_workflows(&guard);
+                    }
+                }
+                let srvs = if removed > 0 {
+                    guard
+                        .settings
+                        .servers
+                        .iter()
+                        .filter(|srv| srv.runner_installed)
+                        .map(|srv| srv.id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                self.snapshot = guard.clone();
+                srvs
+            };
+            for sid in &installed_servers {
+                github::sync_repo_bindings_to_vps(&self.shared, sid);
+            }
+            if !installed_servers.is_empty() {
+                tx.wake_after(std::time::Duration::from_millis(120));
+            }
+        }
+        if let Some(sel_wf) = &self.selected_workflow_id
+            && !self.snapshot.workflows.iter().any(|w| &w.id == sel_wf)
+        {
+            self.selected_workflow_id = None;
+        }
+        if removed > 0 {
+            self.push_toast(
+                format!("cleanup-legacy-{binding_id}"),
+                "Receitas antigas removidas",
+                Some(format!("{removed} receita(s) antiga(s) removida(s) — .workploy.yml mantido.")),
+                ToastKind::Success,
+                tx,
+            );
+        }
+    }
+
     pub fn confirm_delete_workflow(&mut self, tx: &mut Tx) {
         let ModalState::DeleteConfirm { wf_id, wf_name } = self.modal.clone() else {
             return;
@@ -3494,10 +3563,26 @@ impl AppState {
         if self.demo_mode {
             self.snapshot.workflows.retain(|w| w.id != wf_id);
         } else {
-            let mut guard = self.shared.lock().unwrap();
-            guard.workflows.retain(|w| w.id != wf_id);
-            model::save_workflows(&guard);
-            self.snapshot = guard.clone();
+            let installed_servers: Vec<String> = {
+                let mut guard = self.shared.lock().unwrap();
+                guard.workflows.retain(|w| w.id != wf_id);
+                model::save_workflows(&guard);
+                let srvs = guard
+                    .settings
+                    .servers
+                    .iter()
+                    .filter(|srv| srv.runner_installed)
+                    .map(|srv| srv.id.clone())
+                    .collect();
+                self.snapshot = guard.clone();
+                srvs
+            };
+            for sid in &installed_servers {
+                github::sync_repo_bindings_to_vps(&self.shared, sid);
+            }
+            if !installed_servers.is_empty() {
+                tx.wake_after(std::time::Duration::from_millis(120));
+            }
         }
         if self.selected_workflow_id.as_deref() == Some(wf_id.as_str()) {
             self.selected_workflow_id = None;
