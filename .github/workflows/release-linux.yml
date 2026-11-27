@@ -1,0 +1,111 @@
+name: Build & Release Linux
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag da release (ex: v0.1.3)'
+        required: true
+        default: 'v0.1.3'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout com submódulos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Instalar dependências de sistema (Rune / Vulkan / X11 / Wayland / D-Bus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libdbus-1-dev libvulkan-dev mesa-vulkan-drivers libfontconfig1-dev
+
+      - name: Instalar toolchain Rust estável
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            app/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Compilar workploy (release)
+        run: cargo build --release --manifest-path app/Cargo.toml
+
+      - name: Empacotar tarball Linux (.tar.gz)
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          PKG_DIR="workploy-${VERSION}-linux-x86_64"
+          mkdir -p "${PKG_DIR}"
+          cp app/target/release/workploy "${PKG_DIR}/workploy"
+          chmod +x "${PKG_DIR}/workploy"
+          cp app/assets/icon.png "${PKG_DIR}/workploy.png"
+
+          cat > "${PKG_DIR}/workploy.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Name=Workploy
+          Comment=Orquestrador desktop para CI/CD e Deploy self-hosted multi-VPS
+          Exec=%h/.local/bin/workploy
+          Icon=workploy
+          Terminal=false
+          Type=Application
+          Categories=Development;Utility;
+          StartupWMClass=workploy
+          DESKTOP
+
+          cat > "${PKG_DIR}/install.sh" <<'INSTALL'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/512x512/apps"
+          install -m 755 "$DIR/workploy" "$HOME/.local/bin/workploy"
+          install -m 644 "$DIR/workploy.png" "$HOME/.local/share/icons/hicolor/512x512/apps/workploy.png"
+          sed "s|%h|$HOME|g" "$DIR/workploy.desktop" > "$HOME/.local/share/applications/workploy.desktop"
+          chmod 644 "$HOME/.local/share/applications/workploy.desktop"
+          echo "Workploy instalado em $HOME/.local/bin/workploy"
+          echo "Certifique-se de que $HOME/.local/bin esta no seu PATH."
+          INSTALL
+          chmod +x "${PKG_DIR}/install.sh"
+
+          cat > "${PKG_DIR}/uninstall.sh" <<'UNINSTALL'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          rm -f "$HOME/.local/bin/workploy" \
+                "$HOME/.local/share/applications/workploy.desktop" \
+                "$HOME/.local/share/icons/hicolor/512x512/apps/workploy.png"
+          echo "Workploy removido."
+          UNINSTALL
+          chmod +x "${PKG_DIR}/uninstall.sh"
+
+          TAR_NAME="workploy-${VERSION}-linux-x86_64.tar.gz"
+          tar -czf "${TAR_NAME}" "${PKG_DIR}"
+          sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+
+      - name: Anexar artefato Linux à Release no GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --title "Workploy ${TAG}" --notes "Release ${TAG}"
+          fi
+          gh release upload "${TAG}" "${TAR_NAME}" "${TAR_NAME}.sha256" --clobber

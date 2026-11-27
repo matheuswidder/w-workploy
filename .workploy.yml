@@ -1,0 +1,16 @@
+name: Workploy Windows CI & Release
+on: [push]
+
+jobs:
+  build:
+    runs-on: local
+    steps:
+      - name: Verificação de tipos e Clippy (app)
+        run: cargo check --manifest-path app/Cargo.toml && cargo clippy --manifest-path app/Cargo.toml --no-deps -- -D warnings
+      - name: Testes unitários (workploy lib)
+        run: cargo test --manifest-path app/Cargo.toml --lib
+      - name: Compilar app + instalador e gerar pacotes em dist/
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
+      - name: Publicar Release no GitHub (dist/)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -Command "$ver = (Select-String -Path 'app/Cargo.toml' -Pattern '^version\s*=\s*\"([^\"]+)\"' | Select-Object -First 1).Matches[0].Groups[1].Value; gh release create \"v$ver\" \"dist/Workploy-Setup-$ver.exe\" \"dist/workploy-$ver-win64-portable.zip\" --title \"Workploy v$ver\" --generate-notes"
+        x-approval: true

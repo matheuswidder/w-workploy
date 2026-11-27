@@ -1,0 +1,37 @@
+# Build Linux do Workploy (x86_64) em contêiner.
+#
+# Usado quando o GitHub Actions não pode buildar (limite de conta da
+# organização) — o artefato final é o mesmo `workploy-<versão>-linux-x86_64.tar.gz`.
+#
+#   docker buildx build --platform linux/amd64 \
+#     -f scripts/Dockerfile.linux -o type=local,dest=dist/linux-build .
+#
+FROM rust:1.99-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config \
+      libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+      libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+      libdbus-1-dev libvulkan-dev mesa-vulkan-drivers libfontconfig1-dev \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# O submodule vendor/rune e os submodules dentro dele são obrigatórios.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/app/target \
+    cargo build --release --manifest-path app/Cargo.toml \
+    && mkdir -p /out \
+    && cp app/target/release/workploy /out/workploy \
+    && strip /out/workploy || true
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libx11-6 libxcursor1 libxrandr2 libxi6 libxkbcommon0 libxkbcommon-x11-0 \
+      libwayland-client0 libdbus-1-3 libvulkan1 libfontconfig1 \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/workploy /workploy
+ENTRYPOINT ["/workploy"]

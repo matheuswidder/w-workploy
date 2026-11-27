@@ -1,0 +1,12 @@
+# Contexto mínimo para o build Linux do Workploy.
+# O submodule `vendor/rune` (e os submodules dentro dele) são necessários:
+# por isso `vendor/` NÃO é ignorado — apenas o alvo de build e o git.
+target/
+app/target/
+installer/target/
+dist/
+.git/
+.gitignore
+*.log
+*.png
+!app/assets/*.png

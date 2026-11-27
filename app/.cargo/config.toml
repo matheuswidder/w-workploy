@@ -1,0 +1,10 @@
+# Build do app.
+#
+# `WORKPLOY_TEST_BUILD=1` liga o payload hostil que o teste de injeção da
+# página mobile usa (`app/build.rs`). Ele só é consumido por testes; o
+# `install_runner` recusa publicar um runner gerado com esse payload.
+#
+# Rodar de dentro de `app/` (`cargo test`, `cargo clippy`) pega esta config.
+# De outra pasta, exporte a variável: `WORKPLOY_TEST_BUILD=1 cargo test`.
+[env]
+WORKPLOY_TEST_BUILD = "1"

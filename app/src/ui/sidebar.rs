@@ -1,0 +1,1036 @@
+use rune::color::Color;
+use rune::tok::motion;
+use rune::{Cursor, El, Icon, TextStyle, col, el, icon, row, text};
+
+use crate::state::{AppState, NavTarget};
+use crate::ui::components::{health_pulse_dot, phase_spinner};
+use crate::ui::icons;
+use crate::ui::theme::{UiTheme, ty};
+
+const EXPANDED_W: f32 = 248.0;
+const COLLAPSED_W: f32 = 68.0;
+const PILL_INSET: f32 = 10.0;
+const ROW_H: f32 = 34.0;
+const ROW_PITCH: f32 = 38.0;
+const SUB_ROW_H: f32 = 28.0;
+const SUB_ROW_PITCH: f32 = 30.0;
+const SECTION_H: f32 = 24.0;
+/// Largura do alvo de clique da seta de projeto (altura = linha toda).
+const CHEV_HIT_W: f32 = 30.0;
+/// Moldura quadrada que reserva o halo do pulso de saúde (dot de 8 pt,
+/// halo de até 5.5 pt por lado) sem que ele encoste no texto nem na borda.
+const PULSO_FRAME: f32 = 16.0;
+/// Respiro à direita de um pulso dentro da pílula, somado à moldura
+/// (`PULSO_FRAME`) que reserva metade do halo. Com o padding direito da
+/// pílula (12 pt) e o inset dela (10 pt), o halo do pulso (até 12.5 pt do
+/// centro) fica sempre inteiro dentro da sidebar.
+const PULSO_MARGIN_R: f32 = 6.0;
+
+fn resolve_nav_selected_id(s: &AppState, target: &NavTarget, collapsed: bool) -> String {
+    let has_active_binding = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .any(|b| b.enabled);
+    match target {
+        NavTarget::Onboarding => "nav-onboarding".into(),
+        NavTarget::Runs => {
+            if let Some(wf_id) = &s.selected_workflow_id {
+                if !collapsed
+                    && let Some(pid) = &s.selected_project_id
+                    && s.snapshot
+                        .settings
+                        .repo_bindings
+                        .iter()
+                        .find(|b| &b.id == pid)
+                        .is_some_and(|b| {
+                            !s.collapsed_projects.contains(&b.id)
+                                && s.project_workflows(b).iter().any(|w| &w.id == wf_id)
+                        })
+                {
+                    return format!("nav-proj-wf-{pid}-{wf_id}");
+                }
+                if has_active_binding {
+                    if let Some(pid) = &s.selected_project_id
+                        && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+                    {
+                        return format!("nav-proj-{pid}");
+                    }
+                    if !collapsed
+                        && let Some(b) = s
+                            .snapshot
+                            .settings
+                            .repo_bindings
+                            .iter()
+                            .find(|b| {
+                                !s.collapsed_projects.contains(&b.id)
+                                    && s.project_workflows(b).iter().any(|w| &w.id == wf_id)
+                            })
+                    {
+                        return format!("nav-proj-wf-{}-{wf_id}", b.id);
+                    }
+                    return "nav-runs".into();
+                }
+                format!("wf-{wf_id}")
+            } else if let Some(pid) = &s.selected_project_id
+                && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+            {
+                format!("nav-proj-{pid}")
+            } else {
+                "nav-runs".into()
+            }
+        }
+        NavTarget::WorkflowRuns(id) => {
+            if !collapsed
+                && let Some(pid) = &s.selected_project_id
+                && s.snapshot
+                    .settings
+                    .repo_bindings
+                    .iter()
+                    .find(|b| &b.id == pid)
+                    .is_some_and(|b| {
+                        !s.collapsed_projects.contains(&b.id)
+                            && s.project_workflows(b).iter().any(|w| &w.id == id)
+                    })
+            {
+                format!("nav-proj-wf-{pid}-{id}")
+            } else if has_active_binding {
+                if let Some(pid) = &s.selected_project_id
+                    && s.snapshot.settings.repo_bindings.iter().any(|b| &b.id == pid)
+                {
+                    return format!("nav-proj-{pid}");
+                }
+                if !collapsed
+                    && let Some(b) = s
+                        .snapshot
+                        .settings
+                        .repo_bindings
+                        .iter()
+                        .find(|b| {
+                            !s.collapsed_projects.contains(&b.id)
+                                && s.project_workflows(b).iter().any(|w| &w.id == id)
+                        })
+                {
+                    return format!("nav-proj-wf-{}-{id}", b.id);
+                }
+                "nav-runs".into()
+            } else {
+                format!("wf-{id}")
+            }
+        }
+        NavTarget::Approvals => "nav-approvals".into(),
+        NavTarget::Connections => "nav-connections".into(),
+        NavTarget::Settings => "nav-settings".into(),
+        NavTarget::RunDetail { .. } => resolve_nav_selected_id(s, &s.previous_list_nav, collapsed),
+    }
+}
+
+pub fn view(s: &AppState, t: UiTheme) -> El {
+    let w = if s.sidebar_collapsed { COLLAPSED_W } else { EXPANDED_W };
+    let pill_w = w - 2.0 * PILL_INSET;
+    let collapsed = s.sidebar_collapsed;
+
+    let selected_id = resolve_nav_selected_id(s, &s.nav, collapsed);
+
+    let mut y = 4.0f32;
+    // `None` enquanto nenhuma linha da lista for a selecionada: a pílula só
+    // existe se houver uma linha para marcar (ver `management_block`).
+    let mut sel_y: Option<f32> = None;
+    let mut sel_h = ROW_H;
+    let mut items: Vec<El> = Vec::new();
+
+    // 1. Início / Onboarding (apenas na 1ª vez ou quando reaberto manualmente)
+    let show_onboarding_nav = !s.snapshot.settings.onboarding_completed
+        || matches!(s.nav, NavTarget::Onboarding)
+        || (matches!(s.nav, NavTarget::RunDetail { .. })
+            && matches!(s.previous_list_nav, NavTarget::Onboarding));
+    if show_onboarding_nav {
+        let is_onb = selected_id == "nav-onboarding";
+        if is_onb {
+            sel_y = Some(y);
+        }
+        items.push(nav_row(
+            t,
+            "nav-onboarding",
+            "Guia inicial",
+            &icons::HOME,
+            None,
+            is_onb,
+            collapsed,
+            PILL_INSET,
+            y,
+            pill_w,
+            |s: &mut AppState| s.navigate_to(NavTarget::Onboarding),
+        ));
+        y += ROW_PITCH;
+    }
+
+    // 2. Execuções
+    let is_runs = selected_id == "nav-runs";
+    if is_runs {
+        sel_y = Some(y);
+        sel_h = ROW_H;
+    }
+    items.push(nav_row(
+        t,
+        "nav-runs",
+        "Execuções",
+        &icons::LIST,
+        None,
+        is_runs,
+        collapsed,
+        PILL_INSET,
+        y,
+        pill_w,
+        |s: &mut AppState| {
+            s.selected_project_id = None;
+            s.selected_workflow_id = None;
+            s.navigate_to(NavTarget::Runs);
+        },
+    ));
+    y += ROW_PITCH + 8.0;
+
+    // 2.5. Projetos
+    if !s.snapshot.settings.repo_bindings.is_empty() {
+        if !collapsed {
+            items.push(
+                row()
+                    .key("hdr-projs")
+                    .absolute(0.0, y)
+                    .size(w, SECTION_H)
+                    .px(18.0)
+                    .center_y()
+                    .justify_between()
+                    .help("Projetos vinculados ao GitHub. Clique no cabeçalho para expandir ou recolher as receitas de cada projeto.")
+                    .child(
+                        text("PROJETOS")
+                            .font(ty::EYEBROW)
+                            .color(t.text_muted),
+                    ),
+            );
+            y += SECTION_H + 2.0;
+        }
+
+        for b in &s.snapshot.settings.repo_bindings {
+            let proj_key = format!("nav-proj-{}", b.id);
+            let is_proj_sel = selected_id == proj_key;
+            if is_proj_sel {
+                sel_y = Some(y);
+                sel_h = ROW_H;
+            }
+            let bid = b.id.clone();
+            let repo_trim = b.full_name.trim();
+            let run_in_project = |r: &workploy::model::Run| {
+                r.repo_name
+                    .as_deref()
+                    .is_some_and(|rn| rn.eq_ignore_ascii_case(repo_trim))
+                    || (!repo_trim.is_empty() && r.trigger_label.contains(repo_trim))
+            };
+            // Execução ativa mais recente do projeto define o spinner de fase.
+            let active_run = s.snapshot.runs.iter().find(|r| {
+                run_in_project(r)
+                    && matches!(
+                        r.status,
+                        workploy::model::RunStatus::Queued | workploy::model::RunStatus::Running
+                    )
+            });
+            let has_approval = active_run.is_none()
+                && s.snapshot.runs.iter().any(|r| {
+                    run_in_project(r)
+                        && r.status == workploy::model::RunStatus::AwaitingApproval
+                });
+            let expanded = !s.collapsed_projects.contains(&b.id);
+
+            // Espaço à direita: spinner de fase (execução ativa), ponto de
+            // aprovação pendente ou simplesmente o estado do vínculo.
+            let trailing: Option<El> = if let Some(run) = active_run {
+                let kind =
+                    workploy::model::run_phase_spinner_kind(run, &run.workflow_name);
+                Some(phase_spinner(
+                    t,
+                    kind,
+                    15.0,
+                    format!("proj-phase-{}", b.id),
+                ))
+            } else if !collapsed {
+                let dot_col = if has_approval {
+                    t.warning
+                } else if b.enabled {
+                    t.success
+                } else {
+                    t.text_muted
+                };
+                Some(el().size(6.0, 6.0).radius(3.0).fill(dot_col))
+            } else {
+                None
+            };
+
+            if collapsed {
+                // No modo trilho (sidebar recolhida) o cabeçalho continua
+                // levando à página do projeto: não há espaço para receitas.
+                let bid_nav = bid.clone();
+                items.push(nav_row(
+                    t,
+                    proj_key,
+                    b.full_name.clone(),
+                    &icons::BRANCH,
+                    None,
+                    is_proj_sel,
+                    collapsed,
+                    PILL_INSET,
+                    y,
+                    pill_w,
+                    move |s: &mut AppState| {
+                        s.selected_project_id = Some(bid_nav.clone());
+                        s.selected_workflow_id = None;
+                        s.navigate_to(NavTarget::Runs);
+                    },
+                ));
+            } else {
+                // Dois alvos de clique independentes: a seta alterna o
+                // colapso das receitas; o título abre o painel do projeto.
+                let bid_toggle = bid.clone();
+                let bid_open = bid.clone();
+                items.push(project_header_row(
+                    t,
+                    bid.clone(),
+                    b.full_name.clone(),
+                    expanded,
+                    is_proj_sel,
+                    trailing,
+                    PILL_INSET,
+                    y,
+                    pill_w,
+                    move |s: &mut AppState| {
+                        if !s.collapsed_projects.remove(&bid_toggle) {
+                            s.collapsed_projects.insert(bid_toggle.clone());
+                        }
+                    },
+                    move |s: &mut AppState| {
+                        s.selected_project_id = Some(bid_open.clone());
+                        s.selected_workflow_id = None;
+                        s.navigate_to(NavTarget::Runs);
+                    },
+                ));
+            }
+            y += ROW_PITCH;
+
+            let show_sub_wfs = !collapsed && expanded;
+            let mut flow_ys: Vec<f32> = Vec::new();
+            if show_sub_wfs {
+                for wf in s.project_workflows(b) {
+                    let sub_key = format!("nav-proj-wf-{}-{}", b.id, wf.id);
+                    let is_sub_sel = selected_id == sub_key;
+                    if is_sub_sel {
+                        sel_y = Some(y);
+                        sel_h = SUB_ROW_H;
+                    }
+                    let bid_sub = b.id.clone();
+                    let wfid_sub = wf.id.clone();
+                    let wf_name = wf.name.clone();
+                    let ic_col = if is_sub_sel { t.accent } else { t.text_muted };
+                    let fg_col = if is_sub_sel {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    };
+                    // Spinner de fase quando uma execução deste fluxo está ativa
+                    // dentro deste projeto (mesma correspondência por repositório).
+                    let wf_active = s.snapshot.runs.iter().find(|r| {
+                        run_in_project(r)
+                            && r.workflow_id == wf.id
+                            && matches!(
+                                r.status,
+                                workploy::model::RunStatus::Queued
+                                    | workploy::model::RunStatus::Running
+                            )
+                    });
+                    let sub_trailing = wf_active.map(|run| {
+                        let kind =
+                            workploy::model::run_phase_spinner_kind(run, &run.workflow_name);
+                        phase_spinner(
+                            t,
+                            kind,
+                            13.0,
+                            format!("proj-wf-phase-{}-{}", b.id, wf.id),
+                        )
+                    });
+                    let mut sub_row = row()
+                        .key(sub_key)
+                        .role("tab")
+                        .label(format!("{} · {}", b.full_name, wf_name))
+                        .checked(is_sub_sel)
+                        .absolute(PILL_INSET, y)
+                        .size(pill_w, SUB_ROW_H)
+                        .pl(26.0)
+                        .pr(10.0)
+                        .gap(7.0)
+                        .center_y()
+                        .radius(6.0)
+                        .cursor(Cursor::Pointer)
+                        .focusable(true)
+                        .focus_ring(2.0, 2.0, t.accent)
+                        .hover(if is_sub_sel {
+                            Color::TRANSPARENT
+                        } else {
+                            t.hover
+                        })
+                        .press(t.press)
+                        .press_scale(0.98)
+                        .on_press(move |s: &mut AppState| {
+                            s.selected_project_id = Some(bid_sub.clone());
+                            s.selected_workflow_id = Some(wfid_sub.clone());
+                            s.navigate_to(NavTarget::Runs);
+                        })
+                        .child(
+                            icon(icons::workflow_icon(&wf_name), 12.0)
+                                .color(ic_col)
+                                .a11y_hidden(),
+                        )
+                        .child(
+                            text(wf_name)
+                                .font(ty::SMALL)
+                                .color(fg_col)
+                                .grow(1.0)
+                                .shrink()
+                                .truncate()
+                                .a11y_hidden(),
+                        );
+                    if let Some(spinner) = sub_trailing {
+                        sub_row = sub_row.child(spinner);
+                    }
+                    items.push(sub_row);
+                    flow_ys.push(y);
+                    y += SUB_ROW_PITCH;
+                }
+            }
+
+            // Árvore do projeto: linha vertical ligando o projeto às receitas
+            // e um traço horizontal para cada receita (estilo GitHub).
+            if let (Some(&first_fy), Some(&last_fy)) = (flow_ys.first(), flow_ys.last()) {
+                let line_x = PILL_INSET + 14.0;
+                let proj_y = first_fy - ROW_PITCH;
+                let top = proj_y + ROW_H - 6.0;
+                let bottom = last_fy + SUB_ROW_H * 0.5;
+                items.push(
+                    el()
+                        .key(format!("proj-tree-line-{}", b.id))
+                        .absolute(line_x, top)
+                        .size(1.0, (bottom - top).max(1.0))
+                        .fill(t.border_strong),
+                );
+                for (i, fy) in flow_ys.iter().enumerate() {
+                    items.push(
+                        el()
+                            .key(format!("proj-tree-stub-{}-{i}", b.id))
+                            .absolute(line_x, fy + SUB_ROW_H * 0.5 - 0.5)
+                            .size(11.0, 1.0)
+                            .fill(t.border_strong),
+                    );
+                }
+            }
+        }
+    }
+
+    let has_active_binding = s
+        .snapshot
+        .settings
+        .repo_bindings
+        .iter()
+        .any(|b| b.enabled);
+
+    // 3. Receitas de fluxo (visível apenas quando não há nenhum RepoBinding ativo)
+    if !has_active_binding {
+        if !s.snapshot.settings.repo_bindings.is_empty() {
+            y += 8.0;
+        }
+        if !collapsed {
+            items.push(
+                row()
+                    .key("hdr-wfs")
+                    .absolute(0.0, y)
+                    .size(w, SECTION_H)
+                    .px(18.0)
+                    .center_y()
+                    .justify_between()
+                    .help("Receitas reutilizáveis (o que fazer). Onde e quando rodar é definido nos Vínculos em Configurações → GitHub.")
+                    .child(
+                        text("RECEITAS DE FLUXO")
+                            .font(ty::EYEBROW)
+                            .color(t.text_muted),
+                    ),
+            );
+            y += SECTION_H + 2.0;
+        }
+
+        for wf in &s.snapshot.workflows {
+            let key = format!("wf-{}", wf.id);
+            let is_sel = selected_id == key;
+            if is_sel {
+                sel_y = Some(y);
+                sel_h = ROW_H;
+            }
+            let wf_id = wf.id.clone();
+            let count = s
+                .snapshot
+                .runs
+                .iter()
+                .filter(|r| r.workflow_id == wf.id)
+                .count();
+            let badge = (!collapsed && count > 0).then(|| {
+                text(count.to_string())
+                    .font(ty::CAPTION)
+                    .color(if is_sel { t.text_primary } else { t.text_muted })
+            });
+            items.push(nav_row(
+                t,
+                key,
+                wf.name.clone(),
+                &icons::WORKFLOW,
+                badge,
+                is_sel,
+                collapsed,
+                PILL_INSET,
+                y,
+                pill_w,
+                move |s: &mut AppState| {
+                    s.selected_project_id = None;
+                    s.selected_workflow_id = Some(wf_id.clone());
+                    s.navigate_to(NavTarget::WorkflowRuns(wf_id.clone()));
+                },
+            ));
+            y += ROW_PITCH;
+        }
+    }
+
+    // "+ Novo fluxo"
+    let new_wf_help = "Cria uma nova receita de fluxo genérica não vinculada a um projeto.";
+    let new_btn = if collapsed {
+        row()
+            .key("nav-new-wf")
+            .role("button")
+            .label("+ Novo fluxo")
+            .help(new_wf_help)
+            .absolute(PILL_INSET, y + 2.0)
+            .size(pill_w, ROW_H)
+            .center()
+            .radius(6.0)
+            .border(1.0, t.border_subtle)
+            .cursor(Cursor::Pointer)
+            .focusable(true)
+            .focus_ring(2.0, 2.0, t.accent)
+            .hover(t.hover)
+            .press(t.press)
+            .press_scale(0.97)
+            .on_press(|s: &mut AppState| s.open_new_workflow_modal())
+            .child(
+                icon(&icons::WORKFLOW, 14.0)
+                    .color(t.text_secondary)
+                    .a11y_hidden(),
+            )
+    } else {
+        row()
+            .key("nav-new-wf")
+            .role("button")
+            .label("+ Novo fluxo")
+            .help(new_wf_help)
+            .absolute(PILL_INSET, y + 2.0)
+            .size(pill_w, ROW_H)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(6.0)
+            .border(1.0, t.border_subtle)
+            .cursor(Cursor::Pointer)
+            .focusable(true)
+            .focus_ring(2.0, 2.0, t.accent)
+            .hover(t.hover)
+            .press(t.press)
+            .press_scale(0.98)
+            .on_press(|s: &mut AppState| s.open_new_workflow_modal())
+            .child(
+                icon(&icons::WORKFLOW, 13.5)
+                    .color(t.text_secondary)
+                    .a11y_hidden(),
+            )
+            .child(
+                text("+ Novo fluxo")
+                    .font(ty::SMALL_MED)
+                    .color(t.text_secondary)
+                    .a11y_hidden(),
+            )
+    };
+    items.push(new_btn);
+    y += ROW_PITCH + 6.0;
+
+    let mut nav_list = el().key("sidebar-nav-list").w_full().h(y + 4.0);
+    if let Some(sy) = sel_y {
+        nav_list = nav_list.child(
+            el().key("sidebar-selection")
+                .absolute(PILL_INSET, sy)
+                .size(pill_w, sel_h)
+                .radius(6.0)
+                .fill(t.surface_3)
+                .border(1.0, t.border_subtle)
+                .lead(motion::LEAD, motion::DEFAULT),
+        );
+    }
+    let nav_list = nav_list.children(items);
+
+    // 4. Gerenciamento: bloco ancorado na base da sidebar, separado da lista
+    // rolável por um divisor hairline. Nunca sai da tela: se a janela ficar
+    // baixa demais, o próprio bloco rola (nunca corta item).
+    let management = management_block(s, t, selected_id.as_str());
+
+    let header = if collapsed {
+        row()
+            .key("sidebar-header")
+            .w_full()
+            .h(56.0)
+            .center()
+            .child(
+                row()
+                    .key("sidebar-expand")
+                    .role("button")
+                    .label("Expandir menu lateral")
+                    .help("Expandir barra lateral")
+                    .size(34.0, 34.0)
+                    .center()
+                    .radius(6.0)
+                    .fill(t.surface_2)
+                    .cursor(Cursor::Pointer)
+                    .focusable(true)
+                    .focus_ring(2.0, 2.0, t.accent)
+                    .hover(t.hover)
+                    .press(t.press)
+                    .press_scale(0.95)
+                    .on_press(|s: &mut AppState| s.sidebar_collapsed = false)
+                    .child(icon(&icons::SIDEBAR_ICON, 15.0).color(t.text_secondary).a11y_hidden()),
+            )
+    } else {
+        row()
+            .key("sidebar-header")
+            .w_full()
+            .h(56.0)
+            .px(14.0)
+            .center_y()
+            .justify_between()
+            .child(
+                row()
+                    .gap(9.0)
+                    .center_y()
+                    .child(
+                        el().pixels(icons::brand_icon_for_theme(s.dark))
+                            .w(28.0)
+                            .h(28.0)
+                            .radius(6.0),
+                    )
+                    .child(
+                        col()
+                            .child(
+                                text("Workploy")
+                                    .font(TextStyle::new(14.0, 600.0).lh(17.0))
+                                    .color(t.text_primary),
+                            )
+                            .child(
+                                text("Runner local e VPS")
+                                    .font(TextStyle::new(10.5, 500.0).lh(13.0))
+                                    .color(t.text_muted),
+                            ),
+                    ),
+            )
+            .child(
+                row()
+                    .key("sidebar-collapse")
+                    .role("button")
+                    .label("Recolher menu lateral")
+                    .help("Recolher barra lateral")
+                    .size(28.0, 28.0)
+                    .center()
+                    .radius(6.0)
+                    .cursor(Cursor::Pointer)
+                    .focusable(true)
+                    .focus_ring(2.0, 2.0, t.accent)
+                    .hover(t.hover)
+                    .press(t.press)
+                    .press_scale(0.95)
+                    .on_press(|s: &mut AppState| s.sidebar_collapsed = true)
+                    .child(
+                        icon(&icons::SIDEBAR_ICON, 14.0)
+                            .color(t.text_muted)
+                            .a11y_hidden(),
+                    ),
+            )
+    };
+
+    row()
+        .key("sidebar-wrap")
+        .h_full()
+        .motion(motion::DEFAULT)
+        .child(
+            col()
+                .key("sidebar")
+                .w(w)
+                .h_full()
+                .min_h(0.0)
+                .fill(t.bg_shell)
+                .child(header)
+                .child(el().w_full().h(t.hair).fill(t.border_subtle))
+                .child(
+                    col()
+                        .key("sidebar-scroll")
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .w_full()
+                        .scroll(rune::ScrollSpec { stick_bottom: false })
+                        .pt(8.0)
+                        .pb(6.0)
+                        .child(nav_list),
+                )
+                .child(management),
+        )
+        .child(el().key("sidebar-border").w(t.hair).h_full().fill(t.border_subtle))
+}
+
+/// Bloco GERENCIAMENTO preso na base da sidebar.
+///
+/// Vive fora da lista rolável (que fica com Início, Execuções, Projetos,
+/// Receitas de fluxo e "+ Novo fluxo"), então Aprovações, Conexões &
+/// Diagnóstico e Configurações ficam sempre visíveis. Tem pílula de seleção
+/// própria (`sidebar-selection-mgmt`) com o seu próprio `y` local, um divisor
+/// hairline acima e o mesmo inset lateral (`PILL_INSET`) do resto do menu.
+/// Se a altura disponível for menor que o bloco, ele encolhe e rola: os itens
+/// nunca são cortados.
+fn management_block(s: &AppState, t: UiTheme, selected_id: &str) -> El {
+    let collapsed = s.sidebar_collapsed;
+    let w = if collapsed { COLLAPSED_W } else { EXPANDED_W };
+    let pill_w = w - 2.0 * PILL_INSET;
+
+    // Altura do título (só expandida) + 3 linhas, sem folgas surpresa.
+    let content_h = if collapsed { 3.0 * ROW_PITCH } else { SECTION_H + 2.0 + 3.0 * ROW_PITCH };
+    // Espaço reservado ao bloco: divisor hairlines 1 pt + padding interno
+    // (pt 8 + pb 12). O bloco nunca pede mais que isso e o resto da coluna
+    // fica com a lista rolável, que absorve qualquer aperto da janela.
+    let block_h = content_h + 21.0;
+
+    let mut y = 0.0f32;
+    // `None` até uma linha do bloco ser a selecionada: sem isso a pílula fica
+    // em 0.0 e aparece por trás do cabeçalho GERENCIAMENTO, parecendo que o
+    // título é a linha ativa.
+    let mut sel_y: Option<f32> = None;
+    let mut items: Vec<El> = Vec::new();
+
+    if !collapsed {
+        items.push(
+            row()
+                .key("hdr-mgmt")
+                .absolute(0.0, y)
+                .size(w, SECTION_H)
+                .px(18.0)
+                .center_y()
+                .help("Aprovações, conexões e configurações. Tema e animações ficam em Configurações, na aba Aparência.")
+                .child(
+                    text("GERENCIAMENTO")
+                        .font(ty::EYEBROW)
+                        .color(t.text_muted),
+                ),
+        );
+        y += SECTION_H + 2.0;
+    }
+
+    let pending = s.pending_approvals();
+    let is_appr = selected_id == "nav-approvals";
+    if is_appr {
+        sel_y = Some(y);
+    }
+    let appr_badge = (pending > 0 && !collapsed).then(|| {
+        row()
+            .h(20.0)
+            .min_w(22.0)
+            .px(7.0)
+            .center()
+            .radius(10.0)
+            .fill(t.warning_bg)
+            .border(1.0, t.warning.alpha(0.45))
+            .child(
+                text(pending.to_string())
+                    .font(ty::CAPTION)
+                    .color(t.warning),
+            )
+    });
+    items.push(nav_row(
+        t,
+        "nav-approvals",
+        "Aprovações",
+        &icons::CHECKLIST,
+        appr_badge,
+        is_appr,
+        collapsed,
+        PILL_INSET,
+        y,
+        pill_w,
+        |s: &mut AppState| s.navigate_to(NavTarget::Approvals),
+    ));
+    y += ROW_PITCH;
+
+    let is_conn = selected_id == "nav-connections";
+    if is_conn {
+        sel_y = Some(y);
+    }
+    // O pulso de saúde tem halo maior que o próprio recorte (effect_bleed
+    // 4 a 5.5 pt). A moldura de 16 pt centraliza o dot, a margem direita
+    // reserva o resto do halo e o padding direito da pílula (12 pt) mais o
+    // inset dela (10 pt) deixam o halo inteiro dentro da sidebar, com
+    // respiro até o texto à esquerda e até a borda direita.
+    let conn_dot = (!collapsed)
+        .then(|| s.sidebar_connections_indicator())
+        .flatten()
+        .map(|health| {
+            row()
+                .key("sidebar-conn-pulse-frame")
+                .size(PULSO_FRAME, PULSO_FRAME)
+                .mr(PULSO_MARGIN_R)
+                .center()
+                .a11y_hidden()
+                .child(health_pulse_dot(t, health))
+        });
+    items.push(nav_row(
+        t,
+        "nav-connections",
+        "Conexões & Diagnóstico",
+        &icons::ACTIVITY,
+        conn_dot,
+        is_conn,
+        collapsed,
+        PILL_INSET,
+        y,
+        pill_w,
+        |s: &mut AppState| s.navigate_to(NavTarget::Connections),
+    ));
+    y += ROW_PITCH;
+
+    let is_settings = selected_id == "nav-settings";
+    if is_settings {
+        sel_y = Some(y);
+    }
+    items.push(nav_row(
+        t,
+        "nav-settings",
+        "Configurações",
+        &icons::SETTINGS_GEAR,
+        None,
+        is_settings,
+        collapsed,
+        PILL_INSET,
+        y,
+        pill_w,
+        |s: &mut AppState| s.navigate_to(NavTarget::Settings),
+    ));
+
+    let mut track = el().key("sidebar-mgmt-track").w_full().h(content_h);
+    if let Some(sy) = sel_y {
+        track = track.child(
+            el().key("sidebar-selection-mgmt")
+                .absolute(PILL_INSET, sy)
+                .size(pill_w, ROW_H)
+                .radius(6.0)
+                .fill(t.surface_3)
+                .border(1.0, t.border_subtle)
+                .lead(motion::LEAD, motion::DEFAULT),
+        );
+    }
+
+    col()
+        .key("sidebar-mgmt")
+        .shrink()
+        .w_full()
+        .h(block_h)
+        .scroll(rune::ScrollSpec { stick_bottom: false })
+        .pt(8.0)
+        .pb(12.0)
+        .border_sides([t.hair, 0.0, 0.0, 0.0], t.border_subtle)
+        .child(track.children(items))
+}
+
+/// Cabeçalho de projeto da sidebar com dois alvos de clique independentes:
+/// a seta à esquerda (`proj-chevron-{id}`) alterna a expansão das receitas
+/// aninhadas (gira para baixo quando expandida); o título (`proj-title-{id}`)
+/// abre o painel do projeto (Dashboard). À direita do título ficam o spinner
+/// de fase (execução ativa) ou o ponto de status.
+#[allow(clippy::too_many_arguments)]
+fn project_header_row(
+    t: UiTheme,
+    id: impl Into<String>,
+    name: impl Into<String>,
+    expanded: bool,
+    selected: bool,
+    trailing: Option<El>,
+    x: f32,
+    y: f32,
+    w: f32,
+    on_chevron: impl Fn(&mut AppState) + 'static,
+    on_title: impl Fn(&mut AppState) + 'static,
+) -> El {
+    let id = id.into();
+    let name = name.into();
+    let chev = if expanded {
+        &icons::CHEVRON_DOWN
+    } else {
+        &icons::CHEVRON_RIGHT
+    };
+    // Rótulo da seta calculado antes de mover `name` para o título.
+    let chev_label = if expanded {
+        format!("Recolher fluxos de {name}")
+    } else {
+        format!("Expandir fluxos de {name}")
+    };
+    // Três regiões fixas dentro da pílula do projeto, nesta ordem:
+    //   1. a seta de colapso (`CHEV_HIT_W`);
+    //   2. o título, que ocupa o que sobra (grow/shrink/min_w(0.0)) e corta com
+    //      reticências, mostrando o nome completo no balão;
+    //   3. o pulso de fase / ponto de status, com moldura (`PULSO_FRAME`) e
+    //      respiro (`PULSO_MARGIN_R`) reservados.
+    // A 3ª região é irmã da 2ª — nunca filha —, porque um filho de um nó que
+    // cresce/encolhe herda o layout do pai (era isso que empurrava o pulso
+    // para fora da barra quando o nome do projeto era longo).
+    let title_body = row()
+        .key(format!("proj-title-{id}"))
+        .role("tab")
+        .label(name.clone())
+        .checked(selected)
+        // Sem `.help` com o nome aqui: o balão do nome completo vem do texto
+        // via `help_when_truncated` (só aparece quando o nome é cortado). Um
+        // `.help` no cabeçalho criava um segundo balão por cima do primeiro.
+        .help("Abre o resumo, análises e dados do projeto.")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .h(ROW_H)
+        .pl(4.0)
+        .pr(0.0)
+        .gap(6.0)
+        .center_y()
+        .cursor(Cursor::Pointer)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, t.accent)
+        .hover(if selected {
+            Color::TRANSPARENT
+        } else {
+            t.hover
+        })
+        .press(t.press)
+        .press_scale(0.98)
+        .on_press(on_title)
+        .child(
+            text(name.clone())
+                // Projeto = título de primeiro nível: mais forte que as receitas.
+                .font(TextStyle::new(13.5, 600.0).lh(18.0))
+                .color(t.text_primary)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate()
+                .help_when_truncated(name.clone())
+                .a11y_hidden(),
+        );
+    let title_body = title_body.pr(4.0);
+    let mut title = title_body;
+    if let Some(tr) = trailing {
+        // Anel de fase (execução ativa) e ponto de status ganham margem
+        // própria: o anel cresce além do ícone e não pode colar na borda.
+        title = title.child(row().mr(PULSO_MARGIN_R).center_y().child(tr));
+    }
+    row()
+        .key(format!("nav-proj-{id}"))
+        .absolute(x, y)
+        .size(w, ROW_H)
+        .radius(6.0)
+        .child(
+            row()
+                .key(format!("proj-chevron-{id}"))
+                .role("button")
+                .label(chev_label)
+                .expanded(expanded)
+                .help("Expande ou recolhe as receitas deste projeto na barra lateral.")
+                .size(CHEV_HIT_W, ROW_H)
+                .center()
+                .cursor(Cursor::Pointer)
+                .focusable(true)
+                .focus_ring(2.0, 2.0, t.accent)
+                .hover(t.hover)
+                .press(t.press)
+                .press_scale(0.94)
+                .on_press(on_chevron)
+                .child(
+                    icon(chev, 13.0)
+                        .color(if expanded {
+                            t.text_muted
+                        } else {
+                            t.accent
+                        })
+                        .a11y_hidden(),
+                ),
+        )
+        .child(title)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nav_row(
+    t: UiTheme,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    ic: &'static Icon,
+    trailing: Option<El>,
+    selected: bool,
+    collapsed: bool,
+    x: f32,
+    y: f32,
+    w: f32,
+    on_press: impl Fn(&mut AppState) + 'static,
+) -> El {
+    let label = label.into();
+    let ic_col = if selected { t.text_primary } else { t.text_muted };
+    let fg_col = if selected { t.text_primary } else { t.text_secondary };
+    let mut r = row()
+        .key(key)
+        .role("tab")
+        .label(label.clone())
+        .checked(selected)
+        .absolute(x, y)
+        .size(w, ROW_H)
+        .radius(6.0)
+        .cursor(Cursor::Pointer)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, t.accent)
+        .hover(if selected { Color::TRANSPARENT } else { t.hover })
+        .press(t.press)
+        .press_scale(0.98)
+        .on_press(on_press);
+    if collapsed {
+        r = r
+            .help(label)
+            .center()
+            .child(icon(ic, 15.0).color(ic_col).a11y_hidden());
+    } else {
+        r = r
+            .px(10.0)
+            .pr(12.0)
+            .gap(9.0)
+            .center_y()
+            .child(icon(ic, 14.0).color(ic_col).a11y_hidden())
+            .child(
+                text(label)
+                    .font(if selected { ty::BODY_MED } else { ty::BODY })
+                    .color(fg_col)
+                    .grow(1.0)
+                    .shrink()
+                    .truncate()
+                    .a11y_hidden(),
+            );
+        if let Some(tr) = trailing {
+            r = r.child(tr);
+        }
+    }
+    r
+}

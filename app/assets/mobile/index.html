@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#161616">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="format-detection" content="telephone=no">
+  <title>Workploy</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <noscript>
+    <div class="state" style="margin:24px 16px">
+      <p class="state__title">JavaScript está desligado</p>
+      <p class="state__msg">O Workploy mobile precisa de JavaScript para carregar as execuções.</p>
+    </div>
+  </noscript>
+
+  <!-- Tela principal (montada por app.js). A página que o runner serve em /ui. -->
+  <main id="app" class="app" aria-live="off">
+    <div id="screen" class="screen" role="region" aria-label="Conteúdo" tabindex="-1"></div>
+  </main>
+
+  <!-- Barra de navegação inferior: 4 itens (§5.1). -->
+  <nav id="nav" class="bottom-nav" aria-label="Navegação principal"></nav>
+
+  <!-- Botão flutuante (FAB) para disparar fluxo (§8.1). -->
+  <button id="fab" class="fab" type="button" aria-label="Disparar fluxo" hidden>
+    <span class="ico" aria-hidden="true" data-icon="play"></span>
+  </button>
+
+  <!-- Camadas transitórias -->
+  <div id="sheet-host" aria-live="polite"></div>
+  <div id="toast-host" class="toast-host" role="status" aria-live="polite"></div>
+
+  <!-- Fallback: se algo quebrar na inicialização, mostra estado honesto. -->
+  <script>
+    window.setTimeout(function () {
+      var app = document.getElementById('screen');
+      if (app && !app.firstChild) {
+        app.innerHTML =
+          '<div class="state state--error" style="margin-top:24px">' +
+          '<p class="state__title">Não foi possível carregar</p>' +
+          '<p class="state__msg">A página não inicializou. Verifique a conexão e recarregue.</p>' +
+          '</div>';
+      }
+    }, 4000);
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>
